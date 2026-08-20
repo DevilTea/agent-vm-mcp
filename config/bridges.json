@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "bridges": [
+    {
+      "id": "playwright",
+      "enabled": true,
+      "transport": {
+        "type": "stdio",
+        "command": "/opt/playwright-mcp/start.sh",
+        "args": []
+      },
+      "toolPrefix": "",
+      "includeTools": ["browser_*"]
+    }
+  ]
+}

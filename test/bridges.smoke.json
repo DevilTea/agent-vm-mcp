@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "bridges": [
+    {
+      "id": "playwright",
+      "enabled": true,
+      "transport": {
+        "type": "stdio",
+        "command": "/opt/agent-mcp/test/playwright-start-smoke.sh",
+        "args": []
+      },
+      "toolPrefix": "",
+      "includeTools": ["browser_*"]
+    }
+  ]
+}

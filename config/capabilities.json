@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "commands": [
+    { "name": "bash", "category": "shell", "summary": "GNU Bash shell", "versionArgs": ["--version"] },
+    { "name": "git", "category": "vcs", "summary": "Git version control", "versionArgs": ["--version"] },
+    { "name": "gh", "category": "vcs", "summary": "GitHub CLI", "versionArgs": ["--version"] },
+    { "name": "curl", "category": "network", "summary": "HTTP and data transfer client", "versionArgs": ["--version"] },
+    { "name": "wget", "category": "network", "summary": "HTTP/FTP download client", "versionArgs": ["--version"] },
+    { "name": "jq", "category": "text", "summary": "JSON processor", "versionArgs": ["--version"] },
+    { "name": "rg", "category": "text", "summary": "ripgrep recursive text search", "versionArgs": ["--version"] },
+    { "name": "make", "category": "build", "summary": "GNU Make build tool", "versionArgs": ["--version"] },
+    { "name": "gcc", "category": "build", "summary": "GNU C compiler", "versionArgs": ["--version"] },
+    { "name": "g++", "category": "build", "summary": "GNU C++ compiler", "versionArgs": ["--version"] },
+    { "name": "python3", "category": "runtime", "summary": "Python runtime", "versionArgs": ["--version"] },
+    { "name": "node", "category": "runtime", "summary": "Node.js runtime", "versionArgs": ["--version"] },
+    { "name": "pnpm", "category": "runtime", "summary": "pnpm package manager", "versionArgs": ["--version"] },
+    { "name": "tmux", "category": "process", "summary": "Terminal multiplexer", "versionArgs": ["-V"] },
+    { "name": "screen", "category": "process", "summary": "GNU Screen terminal multiplexer", "versionArgs": ["--version"] },
+    { "name": "ssh", "category": "remote", "summary": "OpenSSH client", "versionArgs": ["-V"] },
+    { "name": "scp", "category": "remote", "summary": "OpenSSH secure copy client" },
+    { "name": "rsync", "category": "remote", "summary": "Incremental file transfer utility", "versionArgs": ["--version"] },
+    { "name": "tar", "category": "archive", "summary": "tar archiver", "versionArgs": ["--version"] },
+    { "name": "unzip", "category": "archive", "summary": "ZIP extraction utility", "versionArgs": ["-v"] },
+    { "name": "zip", "category": "archive", "summary": "ZIP creation utility", "versionArgs": ["-v"] },
+    { "name": "systemctl", "category": "system", "summary": "systemd service manager", "versionArgs": ["--version"] },
+    { "name": "journalctl", "category": "system", "summary": "systemd journal query tool", "versionArgs": ["--version"] }
+  ]
+}
