@@ -10,7 +10,29 @@
         "args": []
       },
       "toolPrefix": "",
-      "includeTools": ["browser_*"]
+      "includeTools": [
+        "browser_*"
+      ],
+      "toolAdapters": {
+        "browser_take_screenshot": {
+          "type": "output-directory-artifact",
+          "outputDir": "/home/agent/.local/share/playwright-mcp/output",
+          "extensions": [
+            ".png",
+            ".jpg",
+            ".jpeg",
+            ".webp"
+          ],
+          "pathArgument": "filename",
+          "workingDir": "/opt/playwright-mcp",
+          "mimeTypeArgument": "type",
+          "mimeTypeMap": {
+            "png": "image/png",
+            "jpeg": "image/jpeg",
+            "webp": "image/webp"
+          }
+        }
+      }
     }
   ]
 }

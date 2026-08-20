@@ -13,11 +13,14 @@ MCP server for controlling a dedicated Linux agent VM and forwarding tools from 
 - Bridge tools from upstream MCP servers over stdio or Streamable HTTP.
 - Filter, prefix, and rename bridged tools while rejecting name collisions.
 - Forward Playwright MCP tools through the same MCP endpoint.
+- Present VM files as opaque MCP artifacts with preview/download UI.
+- Automatically attach Playwright screenshots to the conversation and expose images to ChatGPT vision when supported.
 
 ## Native tools
 
 - `exec`
 - `command_info`
+- `present_file`
 - `process_start`
 - `process_read`
 - `process_write`
@@ -53,7 +56,9 @@ The server communicates over stdio.
 
 See [`config/README.md`](config/README.md) for bridge configuration, environment forwarding, and capability discovery details.
 
-The default bridge configuration expects the local Playwright MCP launcher at `/opt/playwright-mcp/start.sh`. Adjust `config/bridges.json` for other deployments.
+The default bridge configuration expects the local Playwright MCP launcher at `/opt/playwright-mcp/start.sh`. Its `browser_take_screenshot` tool is adapted into the generic artifact channel. Adjust `config/bridges.json` for other deployments.
+
+Artifact resources are opaque, process-local references with a 24-hour default TTL and a 50 MiB default size limit. Override these with `AGENT_ARTIFACT_TTL_MS` and `AGENT_ARTIFACT_MAX_BYTES`.
 
 ## Validation
 

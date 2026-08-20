@@ -7,6 +7,10 @@ import * as z from 'zod/v4';
 
 import { McpBridgeManager } from './mcp-bridge.js';
 import { collectCapabilities, inspectCommands } from './capabilities.js';
+import { createBridgeToolAdapterFactory } from './adapters/index.js';
+import { ArtifactStore } from './artifacts/artifact-store.js';
+import { PRESENT_FILE_TOOL } from './artifacts/constants.js';
+import { registerArtifactSystem } from './artifacts/register.js';
 
 const MAX_EXEC_OUTPUT_BYTES = 2 * 1024 * 1024;
 const MAX_PROCESS_STREAM_BYTES = 4 * 1024 * 1024;
@@ -250,6 +254,7 @@ const NATIVE_TOOL_NAMES = new Set([
   'mcp_bridge_status',
   'capabilities',
   'command_info',
+  PRESENT_FILE_TOOL,
 ]);
 
 async function shutdown() {
@@ -270,6 +275,8 @@ async function createServer() {
     name: 'agent-vm-control',
     version: '0.4.0',
   });
+  const artifactStore = new ArtifactStore();
+  await registerArtifactSystem(server, artifactStore);
 
   server.registerTool(
     'exec',
@@ -393,6 +400,7 @@ async function createServer() {
   const bridgeManager = new McpBridgeManager({
     server,
     reservedToolNames: new Set(NATIVE_TOOL_NAMES),
+    adapterFactory: createBridgeToolAdapterFactory({ artifactStore }),
   });
   await bridgeManager.initialize();
   activeBridgeManagers.add(bridgeManager);

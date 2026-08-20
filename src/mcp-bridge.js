@@ -173,13 +173,15 @@ export class McpBridgeManager {
   #server;
   #reservedToolNames;
   #configPath;
+  #adapterFactory;
   #connections = [];
   #status = [];
 
-  constructor({ server, reservedToolNames, configPath }) {
+  constructor({ server, reservedToolNames, configPath, adapterFactory }) {
     this.#server = server;
     this.#reservedToolNames = reservedToolNames;
     this.#configPath = configPath ?? process.env.MCP_BRIDGES_CONFIG ?? DEFAULT_CONFIG_PATH;
+    this.#adapterFactory = adapterFactory;
   }
 
   async initialize() {
@@ -218,7 +220,7 @@ export class McpBridgeManager {
         }
         this.#reservedToolNames.add(exportedName);
 
-        const config = {
+        const baseConfig = {
           ...(tool.title !== undefined ? { title: tool.title } : {}),
           ...(tool.description !== undefined ? { description: tool.description } : {}),
           inputSchema: fromJsonSchema(tool.inputSchema ?? EMPTY_OBJECT_SCHEMA),
@@ -229,9 +231,24 @@ export class McpBridgeManager {
           ...(tool.icons !== undefined ? { icons: tool.icons } : {}),
           ...(tool._meta !== undefined ? { _meta: tool._meta } : {}),
         };
+        const adapter = this.#adapterFactory?.({ bridge, tool, exportedName }) ?? null;
+        const config = adapter?.configureTool
+          ? adapter.configureTool(baseConfig)
+          : baseConfig;
 
         this.#server.registerTool(exportedName, config, async (args, ctx) => {
-          return await client.callTool(
+          let adapterState;
+          if (adapter?.beforeCall) {
+            try {
+              adapterState = await adapter.beforeCall({ args: args ?? {}, ctx });
+            } catch (error) {
+              console.error(
+                `[mcp-bridge] ${bridge.id}.${tool.name}: adapter beforeCall failed: ${error.message}`,
+              );
+            }
+          }
+
+          const result = await client.callTool(
             {
               name: tool.name,
               arguments: args ?? {},
@@ -241,6 +258,21 @@ export class McpBridgeManager {
               toolDefinition: tool,
             },
           );
+
+          if (!adapter?.afterCall) return result;
+          try {
+            return await adapter.afterCall({
+              args: args ?? {},
+              ctx,
+              result,
+              state: adapterState,
+            });
+          } catch (error) {
+            console.error(
+              `[mcp-bridge] ${bridge.id}.${tool.name}: adapter afterCall failed: ${error.message}`,
+            );
+            return result;
+          }
         });
 
         mappings.push({ upstream: tool.name, exported: exportedName });

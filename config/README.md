@@ -21,7 +21,14 @@ A bridge is connected during `agent-mcp` startup; changing the config therefore 
   "toolPrefix": "example_",
   "includeTools": ["*"],
   "excludeTools": [],
-  "renameTools": {}
+  "renameTools": {},
+  "toolAdapters": {
+    "tool_that_writes_a_file": {
+      "type": "output-directory-artifact",
+      "outputDir": "/absolute/output/directory",
+      "extensions": [".png"]
+    }
+  }
 }
 ```
 
@@ -44,6 +51,22 @@ A bridge is connected during `agent-mcp` startup; changing the config therefore 
 
 Tool names must be unique after prefixing/renaming. Startup fails on collisions instead of silently shadowing tools.
 Playwright deliberately uses an empty prefix because its upstream tool names already use the `browser_` namespace.
+
+## Tool result adapters
+
+`toolAdapters` is an optional bridge extension point. An adapter can decorate a forwarded tool definition and observe the call before/after the upstream MCP invocation without changing the bridge transport itself.
+
+`output-directory-artifact` snapshots an output directory before the upstream call, detects the newest created/changed matching file afterward, registers it as an opaque `artifact://agent-vm/<id>` resource, and attaches the generic Artifact Viewer to the tool result. Adapter failures are fail-open: the original upstream tool result is returned unchanged.
+
+Adapter options:
+
+- `outputDir`: required directory used for automatic output discovery.
+- `extensions`: file extensions eligible for directory discovery.
+- `pathArgument`: optional tool argument containing an explicit output filename/path.
+- `workingDir`: base directory for a relative `pathArgument`; defaults to `outputDir`.
+- `mimeTypeArgument` + `mimeTypeMap`: optionally derive a MIME type from a tool argument instead of relying only on filename extension.
+
+The default Playwright bridge applies this adapter only to `browser_take_screenshot`. Playwright writes unnamed screenshots to its configured output directory, while an explicit relative `filename` is resolved against the Playwright MCP working directory; the adapter handles both cases.
 
 # CLI capability discovery
 

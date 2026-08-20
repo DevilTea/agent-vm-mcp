@@ -7,10 +7,36 @@
       "transport": {
         "type": "stdio",
         "command": "/opt/agent-mcp/test/playwright-start-smoke.sh",
-        "args": []
+        "args": [],
+        "env": {
+          "PLAYWRIGHT_MCP_OUTPUT_DIR": "/tmp/agent-mcp-playwright-smoke-output",
+          "PLAYWRIGHT_MCP_WORKING_DIR": "/tmp/agent-mcp-playwright-smoke-working"
+        }
       },
       "toolPrefix": "",
-      "includeTools": ["browser_*"]
+      "includeTools": [
+        "browser_*"
+      ],
+      "toolAdapters": {
+        "browser_take_screenshot": {
+          "type": "output-directory-artifact",
+          "outputDir": "/tmp/agent-mcp-playwright-smoke-output",
+          "extensions": [
+            ".png",
+            ".jpg",
+            ".jpeg",
+            ".webp"
+          ],
+          "pathArgument": "filename",
+          "workingDir": "/tmp/agent-mcp-playwright-smoke-working",
+          "mimeTypeArgument": "type",
+          "mimeTypeMap": {
+            "png": "image/png",
+            "jpeg": "image/jpeg",
+            "webp": "image/webp"
+          }
+        }
+      }
     }
   ]
 }
