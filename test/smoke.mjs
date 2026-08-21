@@ -609,6 +609,12 @@ exec /usr/bin/git "$@"
   if (!capabilityData.runtimes?.some((runtime) => runtime.name === 'node' && runtime.available)) {
     throw new Error('node runtime capability missing');
   }
+  const docker = capabilityData.cli?.categories?.container?.find((command) => command.name === 'docker');
+  if (!docker?.available || !docker.version) throw new Error('docker capability missing');
+  const compose = capabilityData.cli?.probes?.find((probe) => probe.name === 'docker-compose');
+  if (!compose?.available || !compose.version) throw new Error('docker compose capability missing');
+  const buildx = capabilityData.cli?.probes?.find((probe) => probe.name === 'docker-buildx');
+  if (!buildx?.available || !buildx.version) throw new Error('docker buildx capability missing');
 
   const status = await client.callTool({ name: 'mcp_bridge_status', arguments: {} });
   const statusText = status.content?.find((item) => item.type === 'text')?.text ?? '';

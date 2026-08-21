@@ -47,6 +47,14 @@ Additional tools can be exported by configured MCP bridges.
 pnpm install --frozen-lockfile
 ```
 
+For the dedicated Ubuntu Agent VM, provision the container toolchain with:
+
+```bash
+sudo ./scripts/provision-docker.sh
+```
+
+The script installs Ubuntu's `docker.io`, `docker-compose-v2`, and `docker-buildx` packages, enables the Docker service, and grants the dedicated `agent` user access to the local Unix socket through the `docker` group. Existing long-running services or login sessions must be restarted after first adding the group so they inherit the new supplementary group.
+
 ## Run
 
 ```bash

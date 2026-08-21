@@ -75,5 +75,6 @@ The default Playwright bridge applies this adapter only to `browser_take_screens
 - `capabilities` combines runtime detection of this catalog with host, native MCP, persistent-process, and bridge information.
 - `command_info` can inspect any safe command name on `PATH`; commands in the catalog additionally receive category, summary, and version metadata.
 - `versionArgs` are executed directly (without a shell) only for curated entries.
+- Optional `probes` describe curated CLI invocations that are not standalone executables, such as `docker compose version`. Each probe names a real `command` on `PATH` plus direct `args`; `capabilities` reports the probe as available only when that invocation exits successfully. Probes do not change `command_info` semantics or synthesize fake commands on `PATH`.
 - Capability metadata is read on each tool call, so editing `capabilities.json` does not require a service restart. Adding/removing MCP tools still requires one so the MCP tool schema can be rediscovered.
 - Override the catalog path with `AGENT_MCP_CAPABILITIES_CONFIG` when needed.

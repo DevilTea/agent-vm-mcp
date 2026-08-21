@@ -17,6 +17,9 @@ async function loadConfig() {
   if (parsed?.version !== 1 || !Array.isArray(parsed.commands)) {
     throw new Error(`Invalid capability config: ${configPath()}`);
   }
+  if (parsed.probes !== undefined && !Array.isArray(parsed.probes)) {
+    throw new Error(`Invalid capability probes: ${configPath()}`);
+  }
 
   const names = new Set();
   for (const command of parsed.commands) {
@@ -27,6 +30,25 @@ async function loadConfig() {
       throw new Error(`Capability config contains duplicate command ${command.name}`);
     }
     names.add(command.name);
+  }
+
+  const probeNames = new Set();
+  for (const probe of parsed.probes ?? []) {
+    if (
+      !probe ||
+      typeof probe.name !== 'string' ||
+      probe.name.length === 0 ||
+      typeof probe.command !== 'string' ||
+      probe.command.length === 0 ||
+      !Array.isArray(probe.args) ||
+      probe.args.some((arg) => typeof arg !== 'string')
+    ) {
+      throw new Error(`Capability config contains an invalid probe entry: ${configPath()}`);
+    }
+    if (probeNames.has(probe.name)) {
+      throw new Error(`Capability config contains duplicate probe ${probe.name}`);
+    }
+    probeNames.add(probe.name);
   }
 
   return parsed;
@@ -46,7 +68,7 @@ async function findExecutable(name) {
   return null;
 }
 
-function captureVersion(executable, args) {
+function captureInvocation(executable, args) {
   return new Promise((resolve) => {
     const child = spawn(executable, args, {
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -65,7 +87,7 @@ function captureVersion(executable, args) {
     child.stdout.on('data', append);
     child.stderr.on('data', append);
 
-    const finish = () => {
+    const finish = ({ code = null, timedOut = false } = {}) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
@@ -74,17 +96,24 @@ function captureVersion(executable, args) {
         .split(/\r?\n/)
         .map((line) => line.trim())
         .find(Boolean);
-      resolve(firstLine ?? null);
+      resolve({
+        succeeded: !timedOut && code === 0,
+        firstLine: firstLine ?? null,
+      });
     };
 
     const timer = setTimeout(() => {
       child.kill('SIGKILL');
-      finish();
+      finish({ timedOut: true });
     }, VERSION_TIMEOUT_MS);
 
-    child.once('error', finish);
-    child.once('close', finish);
+    child.once('error', () => finish());
+    child.once('close', (code) => finish({ code }));
   });
+}
+
+async function captureVersion(executable, args) {
+  return (await captureInvocation(executable, args)).firstLine;
 }
 
 export async function inspectCommands(names) {
@@ -113,9 +142,32 @@ export async function inspectCommands(names) {
   );
 }
 
+async function inspectProbes(probes) {
+  return await Promise.all(
+    probes.map(async (definition) => {
+      const executable = await findExecutable(definition.command);
+      const result = executable
+        ? await captureInvocation(executable, definition.args)
+        : { succeeded: false, firstLine: null };
+
+      return {
+        name: definition.name,
+        command: definition.command,
+        args: definition.args,
+        available: result.succeeded,
+        path: executable,
+        version: result.succeeded ? result.firstLine : null,
+        category: definition.category ?? null,
+        summary: definition.summary ?? null,
+      };
+    }),
+  );
+}
+
 export async function collectCapabilities({ nativeTools, bridgeStatus }) {
   const config = await loadConfig();
   const commands = await inspectCommands(config.commands.map((command) => command.name));
+  const probes = await inspectProbes(config.probes ?? []);
   const runtimes = commands.filter((command) => command.category === 'runtime');
   const categories = {};
 
@@ -142,6 +194,8 @@ export async function collectCapabilities({ nativeTools, bridgeStatus }) {
       curatedCount: commands.length,
       availableCount: commands.filter((command) => command.available).length,
       categories,
+      probes,
+      availableProbeCount: probes.filter((probe) => probe.available).length,
     },
     mcp: {
       nativeTools: [...nativeTools],

@@ -23,6 +23,11 @@
     { "name": "unzip", "category": "archive", "summary": "ZIP extraction utility", "versionArgs": ["-v"] },
     { "name": "zip", "category": "archive", "summary": "ZIP creation utility", "versionArgs": ["-v"] },
     { "name": "systemctl", "category": "system", "summary": "systemd service manager", "versionArgs": ["--version"] },
-    { "name": "journalctl", "category": "system", "summary": "systemd journal query tool", "versionArgs": ["--version"] }
+    { "name": "journalctl", "category": "system", "summary": "systemd journal query tool", "versionArgs": ["--version"] },
+    { "name": "docker", "category": "container", "summary": "Docker Engine CLI", "versionArgs": ["--version"] }
+  ],
+  "probes": [
+    { "name": "docker-compose", "command": "docker", "args": ["compose", "version"], "category": "container", "summary": "Docker Compose v2 CLI plugin" },
+    { "name": "docker-buildx", "command": "docker", "args": ["buildx", "version"], "category": "container", "summary": "Docker Buildx CLI plugin" }
   ]
 }
