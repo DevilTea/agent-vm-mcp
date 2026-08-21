@@ -8,6 +8,7 @@ MCP server for controlling a dedicated Linux agent VM and forwarding tools from 
 ## Features
 
 - Execute finite shell commands with bounded output, timeouts, and MCP-request cancellation.
+- Read/list files structurally and apply strict unified diffs without fuzzy fallback.
 - Start, rediscover, read, write to, and terminate persistent/interactive processes.
 - Discover curated CLI capabilities available on the VM.
 - Bridge tools from upstream MCP servers over stdio or Streamable HTTP.
@@ -19,6 +20,9 @@ MCP server for controlling a dedicated Linux agent VM and forwarding tools from 
 ## Native tools
 
 - `exec`
+- `read_file`
+- `list_directory`
+- `apply_patch`
 - `import_file`
 - `command_info`
 - `present_file`
@@ -63,6 +67,8 @@ The default bridge configuration expects the local Playwright MCP launcher at `/
 Artifact resources are opaque, process-local references with a 24-hour default TTL and a 50 MiB default size limit. Override these with `AGENT_ARTIFACT_TTL_MS` and `AGENT_ARTIFACT_MAX_BYTES`.
 
 ChatGPT-hosted files can be imported into the VM with `import_file`; file bytes are streamed from the host-provided short-lived URL rather than passed through model context. Imports are limited to 256 MiB by default; override with `AGENT_FILE_IMPORT_MAX_BYTES`. Downloads are written to a same-directory temporary file and only committed after successful completion, so cancellation does not leave a partial destination.
+
+`read_file` and `list_directory` are intentionally bounded, non-search filesystem primitives for high-frequency coding reads. `apply_patch` uses strict `git apply` validation and apply passes: it does not enable recounting, 3-way merge, rejected-hunk files, unsafe paths, whitespace-insensitive context matching, or fuzzy fallback. Applicability failures are zero-write; this is not a claim of cross-file crash-atomic filesystem transactions. Patch validation honors MCP cancellation, while the mutation phase is allowed to finish once launched and is awaited during graceful server shutdown.
 
 Process sessions created by `process_start` are in-memory resources owned by the running `agent-vm-mcp` process. Use `process_list` to rediscover them across MCP client or conversation changes. On graceful server shutdown, running managed process groups receive `SIGTERM` and are escalated to `SIGKILL` after a bounded grace period. Sessions are not recoverable across server restarts; abnormal-exit cleanup belongs to the deployment supervisor/cgroup rather than a persisted PID/PGID registry.
 

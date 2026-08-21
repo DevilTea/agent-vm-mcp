@@ -16,6 +16,7 @@ import { createBridgeToolAdapterFactory } from './adapters/index.js';
 import { ArtifactStore } from './artifacts/artifact-store.js';
 import { PRESENT_FILE_TOOL } from './artifacts/constants.js';
 import { registerArtifactSystem } from './artifacts/register.js';
+import { applyUnifiedPatch, listDirectory, readTextFile, waitForFilesystemMutations } from './filesystem.js';
 
 const MAX_EXEC_OUTPUT_BYTES = 2 * 1024 * 1024;
 const MAX_PROCESS_STREAM_BYTES = 4 * 1024 * 1024;
@@ -336,6 +337,9 @@ async function stopManagedProcesses() {
 const activeBridgeManagers = new Set();
 const NATIVE_TOOL_NAMES = new Set([
   'exec',
+  'read_file',
+  'list_directory',
+  'apply_patch',
   'process_start',
   'process_list',
   'process_read',
@@ -349,6 +353,7 @@ const NATIVE_TOOL_NAMES = new Set([
 ]);
 
 async function shutdown() {
+  await waitForFilesystemMutations();
   await stopManagedProcesses();
   await Promise.allSettled(
     [...activeBridgeManagers].map((manager) => manager.close()),
@@ -389,6 +394,47 @@ async function createServer() {
       }),
     },
     async (args, ctx) => jsonResult(await executeCommand(args, ctx.mcpReq.signal)),
+  );
+
+  server.registerTool(
+    'read_file',
+    {
+      description:
+        'Read a bounded UTF-8 text file or 1-based line range with structured line metadata. Use shell tools for binary or very large files.',
+      inputSchema: z.object({
+        path: z.string().min(1).describe('File path. Relative paths are resolved against cwd.'),
+        cwd: z.string().optional().describe('Base directory. Defaults to the agent user home directory.'),
+        startLine: z.number().int().min(1).default(1).describe('First line to return, using 1-based indexing.'),
+        endLine: z.number().int().min(1).optional().describe('Inclusive last line to return.'),
+      }),
+    },
+    async (args) => jsonResult(await readTextFile(args)),
+  );
+
+  server.registerTool(
+    'list_directory',
+    {
+      description:
+        'List one directory level as deterministic structured name/type entries, including dotfiles. This tool is intentionally non-recursive.',
+      inputSchema: z.object({
+        path: z.string().min(1).default('.').describe('Directory path. Relative paths are resolved against cwd.'),
+        cwd: z.string().optional().describe('Base directory. Defaults to the agent user home directory.'),
+      }),
+    },
+    async (args) => jsonResult(await listDirectory(args)),
+  );
+
+  server.registerTool(
+    'apply_patch',
+    {
+      description:
+        'Apply a strict standard unified diff relative to cwd. All hunks are validated before mutation; context mismatch rejects the entire patch without fuzzy or partial fallback.',
+      inputSchema: z.object({
+        patch: z.string().min(1).describe('Standard unified diff to validate and apply.'),
+        cwd: z.string().optional().describe('Patch root directory. Defaults to the agent user home directory.'),
+      }),
+    },
+    async (args, ctx) => jsonResult(await applyUnifiedPatch(args, ctx.mcpReq.signal)),
   );
 
   server.registerTool(
@@ -627,6 +673,7 @@ async function createServer() {
   server.close = async () => {
     if (closed) return;
     closed = true;
+    await waitForFilesystemMutations();
     await stopManagedProcesses();
     activeBridgeManagers.delete(bridgeManager);
     await bridgeManager.close();

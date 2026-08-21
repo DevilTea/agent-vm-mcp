@@ -17,6 +17,11 @@ const cancelledImportPath = '/tmp/agent-mcp-import-file-cancelled.txt';
 const execCancelPidPath = '/tmp/agent-mcp-exec-cancel.pid';
 const execCancelMarkerPath = '/tmp/agent-mcp-exec-cancel.marker';
 const shutdownProcessPidPath = '/tmp/agent-mcp-shutdown-process.pid';
+const filesystemRoot = `/tmp/agent-mcp-filesystem-smoke-${process.pid}`;
+const filesystemOutsideRoot = `/tmp/agent-mcp-filesystem-outside-${process.pid}`;
+const gitShimDir = `/tmp/agent-mcp-git-shim-${process.pid}`;
+const gitValidationTriggerPath = `/tmp/agent-mcp-git-validation-trigger-${process.pid}`;
+const gitValidationPidPath = `/tmp/agent-mcp-git-validation-pid-${process.pid}`;
 const importPayload = Buffer.from('file ingress smoke\n', 'utf8');
 let importServer;
 let clientClosed = false;
@@ -28,6 +33,7 @@ const transport = new StdioClientTransport({
   cwd: '/home/agent',
   env: {
     ...process.env,
+    PATH: `${gitShimDir}:${process.env.PATH}`,
     MCP_BRIDGES_CONFIG: '/opt/agent-mcp/test/bridges.smoke.json',
   },
   stderr: 'inherit',
@@ -40,6 +46,39 @@ try {
   await fs.rm(execCancelPidPath, { force: true });
   await fs.rm(execCancelMarkerPath, { force: true });
   await fs.rm(shutdownProcessPidPath, { force: true });
+  await fs.rm(filesystemRoot, { recursive: true, force: true });
+  await fs.rm(filesystemOutsideRoot, { recursive: true, force: true });
+  await fs.rm(gitShimDir, { recursive: true, force: true });
+  await fs.rm(gitValidationTriggerPath, { force: true });
+  await fs.rm(gitValidationPidPath, { force: true });
+  await fs.mkdir(filesystemRoot, { recursive: true });
+  await fs.mkdir(filesystemOutsideRoot, { recursive: true });
+  await fs.mkdir(gitShimDir, { recursive: true });
+  const gitShim = `#!/usr/bin/env bash
+set -eu
+checking=0
+for arg in "$@"; do
+  if [[ "$arg" == "--check" ]]; then checking=1; fi
+done
+if [[ "$checking" == "1" && -f "${gitValidationTriggerPath}" ]]; then
+  echo $$ > "${gitValidationPidPath}"
+  sleep 30
+fi
+exec /usr/bin/git "$@"
+`;
+  await fs.writeFile(`${gitShimDir}/git`, gitShim, { mode: 0o755 });
+  await fs.mkdir(`${filesystemRoot}/subdir`);
+  await fs.writeFile(`${filesystemRoot}/a.txt`, 'one\ntwo\nthree\n', 'utf8');
+  await fs.writeFile(`${filesystemRoot}/.hidden`, 'hidden\n', 'utf8');
+  await fs.writeFile(`${filesystemRoot}/binary.bin`, Buffer.from([0xff, 0xfe, 0xfd]));
+  await fs.writeFile(
+    `${filesystemRoot}/large.txt`,
+    Array.from({ length: 400 }, (_, index) => `${String(index).padStart(4, '0')}:${'x'.repeat(1018)}\n`).join(''),
+    'utf8',
+  );
+  await fs.writeFile(`${filesystemOutsideRoot}/outside.txt`, 'outside\n', 'utf8');
+  await fs.symlink('a.txt', `${filesystemRoot}/link.txt`);
+  await fs.symlink(filesystemOutsideRoot, `${filesystemRoot}/outside-link`);
   await client.connect(transport);
 
   const allTools = [];
@@ -53,6 +92,9 @@ try {
   const names = allTools.map((tool) => tool.name);
   const required = [
     'exec',
+    'read_file',
+    'list_directory',
+    'apply_patch',
     'import_file',
     'process_start',
     'process_list',
@@ -72,6 +114,223 @@ try {
   }
   if (names.includes('browser_screenshot_poc')) {
     throw new Error('Legacy browser_screenshot_poc should not be registered');
+  }
+
+  const parseJsonToolResult = (result) => {
+    const text = result.content?.find((item) => item.type === 'text')?.text;
+    if (typeof text !== 'string') throw new Error('Expected JSON text tool result');
+    return JSON.parse(text);
+  };
+  const expectToolFailure = async (name, argumentsValue, options) => {
+    try {
+      const result = await client.callTool({ name, arguments: argumentsValue }, options);
+      if (result.isError) return;
+    } catch {
+      return;
+    }
+    throw new Error(`${name} unexpectedly succeeded`);
+  };
+
+  const rangedRead = parseJsonToolResult(
+    await client.callTool({
+      name: 'read_file',
+      arguments: { path: 'a.txt', cwd: filesystemRoot, startLine: 2, endLine: 3 },
+    }),
+  );
+  if (
+    rangedRead.content !== 'two\nthree\n' ||
+    rangedRead.startLine !== 2 ||
+    rangedRead.endLine !== 3 ||
+    rangedRead.totalLines !== 3 ||
+    rangedRead.truncated
+  ) {
+    throw new Error('read_file ranged read metadata/content failed');
+  }
+
+  const largeRead = parseJsonToolResult(
+    await client.callTool({
+      name: 'read_file',
+      arguments: { path: 'large.txt', cwd: filesystemRoot },
+    }),
+  );
+  if (!largeRead.truncated || !Number.isSafeInteger(largeRead.nextLine) || largeRead.bytes > 256 * 1024) {
+    throw new Error('read_file bounded response metadata failed');
+  }
+  await expectToolFailure('read_file', { path: 'binary.bin', cwd: filesystemRoot });
+  await expectToolFailure('read_file', { path: 'subdir', cwd: filesystemRoot });
+
+  const directory = parseJsonToolResult(
+    await client.callTool({
+      name: 'list_directory',
+      arguments: { path: '.', cwd: filesystemRoot },
+    }),
+  );
+  const expectedDirectoryEntries = [
+    ['.hidden', 'file'],
+    ['a.txt', 'file'],
+    ['binary.bin', 'file'],
+    ['large.txt', 'file'],
+    ['link.txt', 'symlink'],
+    ['outside-link', 'symlink'],
+    ['subdir', 'directory'],
+  ];
+  if (
+    JSON.stringify(directory.entries.map(({ name, type }) => [name, type])) !==
+    JSON.stringify(expectedDirectoryEntries)
+  ) {
+    throw new Error('list_directory deterministic structured listing failed');
+  }
+
+  const exactPatch = `--- a/a.txt
++++ b/a.txt
+@@ -1,3 +1,3 @@
+ one
+-two
++TWO
+ three
+`;
+  const appliedPatch = parseJsonToolResult(
+    await client.callTool({
+      name: 'apply_patch',
+      arguments: { patch: exactPatch, cwd: filesystemRoot },
+    }),
+  );
+  if (
+    (await fs.readFile(`${filesystemRoot}/a.txt`, 'utf8')) !== 'one\nTWO\nthree\n' ||
+    appliedPatch.files.length !== 1 ||
+    appliedPatch.files[0].path !== 'a.txt' ||
+    appliedPatch.files[0].additions !== 1 ||
+    appliedPatch.files[0].deletions !== 1
+  ) {
+    throw new Error('apply_patch exact patch failed');
+  }
+
+  await fs.writeFile(`${filesystemRoot}/offset.txt`, 'zero\none\ntwo\nthree\n', 'utf8');
+  const offsetPatch = `--- a/offset.txt
++++ b/offset.txt
+@@ -1,3 +1,3 @@
+ one
+-two
++TWO
+ three
+`;
+  await expectToolFailure('apply_patch', { patch: offsetPatch, cwd: filesystemRoot });
+  if ((await fs.readFile(`${filesystemRoot}/offset.txt`, 'utf8')) !== 'zero\none\ntwo\nthree\n') {
+    throw new Error('apply_patch offset mismatch modified target');
+  }
+
+  await fs.writeFile(`${filesystemRoot}/multi-a.txt`, 'a1\na2\n', 'utf8');
+  await fs.writeFile(`${filesystemRoot}/multi-b.txt`, 'b1\nb2\n', 'utf8');
+  const multiFailurePatch = `--- a/multi-a.txt
++++ b/multi-a.txt
+@@ -1,2 +1,2 @@
+ a1
+-a2
++A2
+--- a/multi-b.txt
++++ b/multi-b.txt
+@@ -1,2 +1,2 @@
+ WRONG
+-b2
++B2
+`;
+  await expectToolFailure('apply_patch', { patch: multiFailurePatch, cwd: filesystemRoot });
+  if (
+    (await fs.readFile(`${filesystemRoot}/multi-a.txt`, 'utf8')) !== 'a1\na2\n' ||
+    (await fs.readFile(`${filesystemRoot}/multi-b.txt`, 'utf8')) !== 'b1\nb2\n'
+  ) {
+    throw new Error('apply_patch multi-file failure was not zero-write');
+  }
+
+  await fs.writeFile(`${filesystemRoot}/delete.txt`, 'delete-me\n', 'utf8');
+  const createDeletePatch = `--- /dev/null
++++ b/created.txt
+@@ -0,0 +1 @@
++created
+--- a/delete.txt
++++ /dev/null
+@@ -1 +0,0 @@
+-delete-me
+`;
+  await client.callTool({
+    name: 'apply_patch',
+    arguments: { patch: createDeletePatch, cwd: filesystemRoot },
+  });
+  if ((await fs.readFile(`${filesystemRoot}/created.txt`, 'utf8')) !== 'created\n') {
+    throw new Error('apply_patch create failed');
+  }
+  try {
+    await fs.access(`${filesystemRoot}/delete.txt`);
+    throw new Error('apply_patch delete failed');
+  } catch (error) {
+    if (error?.code !== 'ENOENT') throw error;
+  }
+
+  const traversalName = `agent-mcp-traversal-${process.pid}.txt`;
+  const traversalPatch = `--- /dev/null
++++ b/../${traversalName}
+@@ -0,0 +1 @@
++escape
+`;
+  await expectToolFailure('apply_patch', { patch: traversalPatch, cwd: filesystemRoot });
+  try {
+    await fs.access(`/tmp/${traversalName}`);
+    throw new Error('apply_patch traversal escaped cwd');
+  } catch (error) {
+    if (error?.code !== 'ENOENT') throw error;
+  }
+
+  const symlinkEscapePatch = `--- a/outside-link/outside.txt
++++ b/outside-link/outside.txt
+@@ -1 +1 @@
+-outside
++escaped
+`;
+  await expectToolFailure('apply_patch', { patch: symlinkEscapePatch, cwd: filesystemRoot });
+  if ((await fs.readFile(`${filesystemOutsideRoot}/outside.txt`, 'utf8')) !== 'outside\n') {
+    throw new Error('apply_patch followed a symlink outside cwd');
+  }
+
+  await fs.writeFile(`${filesystemRoot}/cancel.txt`, 'before\n', 'utf8');
+  const cancellationPatch = `--- a/cancel.txt
++++ b/cancel.txt
+@@ -1 +1 @@
+-before
++after
+`;
+  await fs.writeFile(gitValidationTriggerPath, '1\n', 'utf8');
+  const patchAbortController = new AbortController();
+  const cancellablePatch = client.callTool(
+    {
+      name: 'apply_patch',
+      arguments: { patch: cancellationPatch, cwd: filesystemRoot },
+    },
+    { signal: patchAbortController.signal },
+  );
+  let validationPid;
+  for (let attempt = 0; attempt < 80; attempt += 1) {
+    try {
+      validationPid = Number((await fs.readFile(gitValidationPidPath, 'utf8')).trim());
+      break;
+    } catch {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+  }
+  if (!Number.isSafeInteger(validationPid)) {
+    throw new Error('apply_patch cancellation validation subprocess did not start');
+  }
+  patchAbortController.abort();
+  let patchWasCancelled = false;
+  try {
+    await cancellablePatch;
+  } catch {
+    patchWasCancelled = true;
+  }
+  if (!patchWasCancelled) throw new Error('apply_patch cancellation did not reject the client call');
+  await fs.rm(gitValidationTriggerPath, { force: true });
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  if ((await fs.readFile(`${filesystemRoot}/cancel.txt`, 'utf8')) !== 'before\n') {
+    throw new Error('apply_patch cancellation during validation mutated target');
   }
 
   const importFileTool = allTools.find((tool) => tool.name === 'import_file');
@@ -519,5 +778,10 @@ try {
   await fs.rm(execCancelPidPath, { force: true });
   await fs.rm(execCancelMarkerPath, { force: true });
   await fs.rm(shutdownProcessPidPath, { force: true });
+  await fs.rm(filesystemRoot, { recursive: true, force: true });
+  await fs.rm(filesystemOutsideRoot, { recursive: true, force: true });
+  await fs.rm(gitShimDir, { recursive: true, force: true });
+  await fs.rm(gitValidationTriggerPath, { force: true });
+  await fs.rm(gitValidationPidPath, { force: true });
   if (importServer) await new Promise((resolve) => importServer.close(resolve));
 }
