@@ -1,0 +1,26 @@
+{
+  "lsp": {
+    "servers": {
+      "typescript": {
+        "registry": "typescript",
+        "profile": "system",
+        "command": "__TYPESCRIPT_LANGUAGE_SERVER__",
+        "args": ["--stdio"],
+        "initializationOptions": {
+          "tsserver": {
+            "fallbackPath": "__TSSERVER__"
+          }
+        }
+      }
+    }
+  },
+  "security": {
+    "allowExternalFiles": false
+  },
+  "downloads": {
+    "enabled": false
+  },
+  "commands": {
+    "enabled": false
+  }
+}

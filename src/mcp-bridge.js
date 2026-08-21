@@ -174,14 +174,16 @@ export class McpBridgeManager {
   #reservedToolNames;
   #configPath;
   #adapterFactory;
+  #policyFactory;
   #connections = [];
   #status = [];
 
-  constructor({ server, reservedToolNames, configPath, adapterFactory }) {
+  constructor({ server, reservedToolNames, configPath, adapterFactory, policyFactory }) {
     this.#server = server;
     this.#reservedToolNames = reservedToolNames;
     this.#configPath = configPath ?? process.env.MCP_BRIDGES_CONFIG ?? DEFAULT_CONFIG_PATH;
     this.#adapterFactory = adapterFactory;
+    this.#policyFactory = policyFactory;
   }
 
   async initialize() {
@@ -232,11 +234,21 @@ export class McpBridgeManager {
           ...(tool._meta !== undefined ? { _meta: tool._meta } : {}),
         };
         const adapter = this.#adapterFactory?.({ bridge, tool, exportedName }) ?? null;
+        const policies = this.#policyFactory?.({ bridge, tool, exportedName }) ?? [];
+        if (!Array.isArray(policies)) {
+          throw new Error(`Call policy factory for bridge ${bridge.id} must return an array.`);
+        }
         const config = adapter?.configureTool
           ? adapter.configureTool(baseConfig)
           : baseConfig;
 
         this.#server.registerTool(exportedName, config, async (args, ctx) => {
+          for (const policy of policies) {
+            if (policy?.beforeCall) {
+              await policy.beforeCall({ args: args ?? {}, ctx, tool, bridge });
+            }
+          }
+
           let adapterState;
           if (adapter?.beforeCall) {
             try {

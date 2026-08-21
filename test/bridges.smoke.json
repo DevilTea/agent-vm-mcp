@@ -37,6 +37,47 @@
           }
         }
       }
+    },
+    {
+      "id": "lsp",
+      "enabled": true,
+      "transport": {
+        "type": "stdio",
+        "command": "/opt/language-server-mcp/start.sh",
+        "args": []
+      },
+      "toolPrefix": "lsp_",
+      "includeTools": [
+        "hover",
+        "signature_help",
+        "declaration",
+        "definition",
+        "type_definition",
+        "implementation",
+        "references",
+        "document_symbols",
+        "workspace_symbols",
+        "diagnostics",
+        "call_hierarchy_prepare",
+        "call_hierarchy_incoming",
+        "call_hierarchy_outgoing",
+        "type_hierarchy_prepare",
+        "type_hierarchy_supertypes",
+        "type_hierarchy_subtypes",
+        "list_servers",
+        "search_servers",
+        "server_status"
+      ],
+      "callPolicies": [
+        {
+          "type": "deny-workspace-config-files",
+          "workspaceRootArgument": "workspaceRoot",
+          "filenames": [
+            ".lsp-mcp.json",
+            ".lsp-mcp.jsonc"
+          ]
+        }
+      ]
     }
   ]
 }

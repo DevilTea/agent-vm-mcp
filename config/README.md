@@ -68,6 +68,41 @@ Adapter options:
 
 The default Playwright bridge applies this adapter only to `browser_take_screenshot`. Playwright writes unnamed screenshots to its configured output directory, while an explicit relative `filename` is resolved against the Playwright MCP working directory; the adapter handles both cases.
 
+## Fail-closed call policies
+
+`callPolicies` are pre-forwarding guardrails. Unlike result adapters, policy failures are **fail-closed**: if a policy rejects or errors, the upstream MCP tool is not invoked.
+
+The `deny-workspace-config-files` policy reads a configured workspace-root argument and rejects the call when any configured plain filename exists directly under that root. The default LSP bridge uses it to reject `.lsp-mcp.json` and `.lsp-mcp.jsonc` before `language-server-mcp` can load project-controlled server commands.
+
+```json
+{
+  "callPolicies": [
+    {
+      "type": "deny-workspace-config-files",
+      "workspaceRootArgument": "workspaceRoot",
+      "filenames": [".lsp-mcp.json", ".lsp-mcp.jsonc"]
+    }
+  ]
+}
+```
+
+This is intentionally separate from `toolAdapters`: adapters decorate observable results and are fail-open, while policies enforce whether a call may reach an upstream server.
+
+## Read-only LSP bridge
+
+The default `lsp` bridge launches `/opt/language-server-mcp/start.sh`, prefixes exported tools with `lsp_`, and forwards only these upstream tools:
+
+- `hover`, `signature_help`
+- `declaration`, `definition`, `type_definition`, `implementation`, `references`
+- `document_symbols`, `workspace_symbols`, `diagnostics`
+- `call_hierarchy_prepare`, `call_hierarchy_incoming`, `call_hierarchy_outgoing`
+- `type_hierarchy_prepare`, `type_hierarchy_supertypes`, `type_hierarchy_subtypes`
+- `list_servers`, `search_servers`, `server_status`
+
+Mutation and unrestricted execution surfaces such as rename/formatting/code actions, raw `request`/`notify`, `execute_command`, completion breadth, and server lifecycle mutation tools are not exported. Workspace-scoped calls retain the upstream `workspaceRoot` argument; `agent-vm-mcp` does not introduce a global active workspace.
+
+The deployment-owned `~/.config/lsp-mcp/config.json` is created by `scripts/provision-lsp.sh`. It disables managed downloads and LSP command execution and keeps external-workspace access disabled. A missing language server therefore fails observably instead of being downloaded automatically. Repository-local LSP MCP configuration is not trusted in this version and is denied by the host-side call policy above.
+
 # CLI capability discovery
 
 `capabilities.json` is the curated, agent-facing CLI catalog. It is intentionally not a dump of every executable on `PATH`.

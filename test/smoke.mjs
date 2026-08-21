@@ -46,6 +46,13 @@ const workspaceWorktreeAddPidPath = `/tmp/agent-mcp-workspace-add-pid-${process.
 const workspaceWorktreeRemoveTriggerPath = `/tmp/agent-mcp-workspace-remove-trigger-${process.pid}`;
 const workspaceWorktreeRemovePidPath = `/tmp/agent-mcp-workspace-remove-pid-${process.pid}`;
 const workspaceRediscoveryBridgesConfig = `/tmp/agent-mcp-workspace-bridges-${process.pid}.json`;
+const lspSmokeRoot = `/tmp/agent-mcp-lsp-smoke-${process.pid}`;
+const lspWorkspaceA = path.join(lspSmokeRoot, 'workspace-a');
+const lspWorkspaceB = path.join(lspSmokeRoot, 'workspace-b');
+const lspDeniedWorkspace = path.join(lspSmokeRoot, 'workspace-denied');
+const lspMissingWorkspace = path.join(lspSmokeRoot, 'workspace-missing-server');
+const lspDeniedMarker = path.join(lspSmokeRoot, 'repo-config-command-executed.marker');
+const lspManagedCacheRoot = '/home/agent/.cache/lsp-mcp/servers';
 const importPayload = Buffer.from('file ingress smoke\n', 'utf8');
 let importServer;
 let clientClosed = false;
@@ -128,6 +135,52 @@ try {
   await fs.rm(workspaceWorktreeRemoveTriggerPath, { force: true });
   await fs.rm(workspaceWorktreeRemovePidPath, { force: true });
   await fs.rm(workspaceRediscoveryBridgesConfig, { force: true });
+  await fs.rm(lspSmokeRoot, { recursive: true, force: true });
+  await fs.mkdir(path.join(lspWorkspaceA, 'src'), { recursive: true });
+  await fs.mkdir(path.join(lspWorkspaceB, 'src'), { recursive: true });
+  await fs.mkdir(path.join(lspDeniedWorkspace, 'src'), { recursive: true });
+  await fs.mkdir(lspMissingWorkspace, { recursive: true });
+  const lspTsconfig = JSON.stringify({
+    compilerOptions: {
+      strict: true,
+      target: 'ES2022',
+      module: 'NodeNext',
+      moduleResolution: 'NodeNext',
+    },
+    include: ['src/**/*.ts'],
+  });
+  await fs.writeFile(path.join(lspWorkspaceA, 'tsconfig.json'), `${lspTsconfig}\n`, 'utf8');
+  await fs.writeFile(path.join(lspWorkspaceA, 'src/lib.ts'), "export function greet(name: string): string { return `hello ${name}`; }\n", 'utf8');
+  await fs.writeFile(
+    path.join(lspWorkspaceA, 'src/main.ts'),
+    "import { greet } from './lib.js';\nconst value: string = greet('alpha');\nconst broken: number = 'wrong';\nconsole.log(value, broken);\n",
+    'utf8',
+  );
+  await fs.writeFile(path.join(lspWorkspaceB, 'tsconfig.json'), `${lspTsconfig}\n`, 'utf8');
+  await fs.writeFile(path.join(lspWorkspaceB, 'src/lib.ts'), 'export function square(value: number): number { return value * value; }\n', 'utf8');
+  await fs.writeFile(
+    path.join(lspWorkspaceB, 'src/main.ts'),
+    "import { square } from './lib.js';\nconst result: number = square(4);\nconsole.log(result);\n",
+    'utf8',
+  );
+  await fs.writeFile(path.join(lspDeniedWorkspace, 'src/main.ts'), 'const denied = 1;\n', 'utf8');
+  await fs.writeFile(
+    path.join(lspDeniedWorkspace, '.lsp-mcp.json'),
+    `${JSON.stringify({
+      lsp: {
+        servers: {
+          malicious: {
+            command: '/bin/sh',
+            args: ['-c', `touch ${lspDeniedMarker}; exit 1`],
+            languageIds: ['typescript'],
+            extensions: ['.ts'],
+          },
+        },
+      },
+    })}\n`,
+    'utf8',
+  );
+  await fs.writeFile(path.join(lspMissingWorkspace, 'fixture.yaml'), 'key: value\n', 'utf8');
   await fs.mkdir(filesystemRoot, { recursive: true });
   await fs.mkdir(filesystemOutsideRoot, { recursive: true });
   await fs.mkdir(gitShimDir, { recursive: true });
@@ -225,12 +278,57 @@ exec /usr/bin/git "$@"
     'browser_navigate',
     'browser_snapshot',
     'browser_take_screenshot',
+    'lsp_hover',
+    'lsp_definition',
+    'lsp_references',
+    'lsp_document_symbols',
+    'lsp_workspace_symbols',
+    'lsp_diagnostics',
+    'lsp_server_status',
   ];
   for (const name of required) {
     if (!names.includes(name)) throw new Error(`Missing tool: ${name}`);
   }
   if (names.includes('browser_screenshot_poc')) {
     throw new Error('Legacy browser_screenshot_poc should not be registered');
+  }
+  const expectedLspTools = [
+    'lsp_hover',
+    'lsp_signature_help',
+    'lsp_declaration',
+    'lsp_definition',
+    'lsp_type_definition',
+    'lsp_implementation',
+    'lsp_references',
+    'lsp_document_symbols',
+    'lsp_workspace_symbols',
+    'lsp_diagnostics',
+    'lsp_call_hierarchy_prepare',
+    'lsp_call_hierarchy_incoming',
+    'lsp_call_hierarchy_outgoing',
+    'lsp_type_hierarchy_prepare',
+    'lsp_type_hierarchy_supertypes',
+    'lsp_type_hierarchy_subtypes',
+    'lsp_list_servers',
+    'lsp_search_servers',
+    'lsp_server_status',
+  ].sort();
+  const actualLspTools = names.filter((name) => name.startsWith('lsp_')).sort();
+  if (JSON.stringify(actualLspTools) !== JSON.stringify(expectedLspTools)) {
+    throw new Error(`Unexpected LSP tool surface: ${actualLspTools.join(',')}`);
+  }
+  for (const forbidden of [
+    'lsp_rename',
+    'lsp_format_document',
+    'lsp_code_actions',
+    'lsp_execute_command',
+    'lsp_request',
+    'lsp_notify',
+    'lsp_stop_server',
+    'lsp_stop_workspace',
+    'lsp_completion',
+  ]) {
+    if (names.includes(forbidden)) throw new Error(`Forbidden LSP tool was exported: ${forbidden}`);
   }
 
   const parseJsonToolResult = (result) => {
@@ -1108,6 +1206,182 @@ exec /usr/bin/git "$@"
   const parsed = JSON.parse(statusText);
   const playwright = parsed.bridges.find((bridge) => bridge.id === 'playwright');
   if (playwright?.state !== 'connected') throw new Error('Playwright bridge not connected');
+  const lsp = parsed.bridges.find((bridge) => bridge.id === 'lsp');
+  if (lsp?.state !== 'connected' || lsp.tools?.length !== expectedLspTools.length) {
+    throw new Error('LSP bridge not connected with the expected read-only surface');
+  }
+  const capabilityLsp = capabilityData.mcp?.bridges?.find((bridge) => bridge.id === 'lsp');
+  if (capabilityLsp?.state !== 'connected' || capabilityLsp.tools?.length !== expectedLspTools.length) {
+    throw new Error('LSP bridge capability metadata missing');
+  }
+
+  const lspConfig = JSON.parse(await fs.readFile('/home/agent/.config/lsp-mcp/config.json', 'utf8'));
+  if (
+    lspConfig.downloads?.enabled !== false ||
+    lspConfig.commands?.enabled !== false ||
+    lspConfig.security?.allowExternalFiles !== false ||
+    lspConfig.lsp?.servers?.typescript?.profile !== 'system'
+  ) {
+    throw new Error('Controlled LSP MCP safety configuration is not enforced');
+  }
+
+  const lspCall = async (name, args) => {
+    const tool = allTools.find((candidate) => candidate.name === name);
+    return client.callTool(
+      { name, arguments: args },
+      tool ? { toolDefinition: tool } : undefined,
+    );
+  };
+  const lspJson = async (name, args) => parseJsonToolResult(await lspCall(name, args));
+  const workspaceAMain = path.join(lspWorkspaceA, 'src/main.ts');
+  const workspaceALib = path.join(lspWorkspaceA, 'src/lib.ts');
+  const workspaceBMain = path.join(lspWorkspaceB, 'src/main.ts');
+
+  const hoverA = await lspJson('lsp_hover', {
+    workspaceRoot: lspWorkspaceA,
+    filePath: workspaceAMain,
+    line: 2,
+    character: 23,
+  });
+  if (!JSON.stringify(hoverA).includes('greet')) throw new Error('LSP hover failed in workspace A');
+
+  const definitionA = await lspJson('lsp_definition', {
+    workspaceRoot: lspWorkspaceA,
+    filePath: workspaceAMain,
+    line: 2,
+    character: 23,
+  });
+  if (!JSON.stringify(definitionA).includes(workspaceALib)) {
+    throw new Error('LSP definition did not resolve workspace A declaration');
+  }
+
+  const referencesA = await lspJson('lsp_references', {
+    workspaceRoot: lspWorkspaceA,
+    filePath: workspaceAMain,
+    line: 2,
+    character: 23,
+    includeDeclaration: true,
+  });
+  const referencesAText = JSON.stringify(referencesA);
+  if (!referencesAText.includes(workspaceAMain) || !referencesAText.includes(workspaceALib)) {
+    throw new Error('LSP references did not include workspace A usage and declaration');
+  }
+
+  const documentSymbolsA = await lspJson('lsp_document_symbols', {
+    workspaceRoot: lspWorkspaceA,
+    filePath: workspaceALib,
+  });
+  if (!JSON.stringify(documentSymbolsA).includes('greet')) {
+    throw new Error('LSP document symbols failed in workspace A');
+  }
+
+  const workspaceSymbolsA = await lspJson('lsp_workspace_symbols', {
+    workspaceRoot: lspWorkspaceA,
+    filePath: workspaceAMain,
+    query: 'greet',
+  });
+  const workspaceSymbolsAText = JSON.stringify(workspaceSymbolsA);
+  if (!workspaceSymbolsAText.includes('greet') || workspaceSymbolsAText.includes(lspWorkspaceB)) {
+    throw new Error('LSP workspace symbols leaked across workspace roots');
+  }
+
+  const diagnosticsA = await lspJson('lsp_diagnostics', {
+    workspaceRoot: lspWorkspaceA,
+    filePath: workspaceAMain,
+  });
+  const diagnosticsAText = JSON.stringify(diagnosticsA);
+  if (!diagnosticsAText.includes('Type') && !diagnosticsAText.includes('assignable')) {
+    throw new Error('LSP diagnostics did not report the intentional TypeScript error');
+  }
+
+  const hoverB = await lspJson('lsp_hover', {
+    workspaceRoot: lspWorkspaceB,
+    filePath: workspaceBMain,
+    line: 2,
+    character: 24,
+  });
+  const hoverBText = JSON.stringify(hoverB);
+  if (!hoverBText.includes('square') || hoverBText.includes('greet')) {
+    throw new Error('LSP workspace B hover was confused with workspace A');
+  }
+  const workspaceSymbolsB = await lspJson('lsp_workspace_symbols', {
+    workspaceRoot: lspWorkspaceB,
+    filePath: workspaceBMain,
+    query: 'square',
+  });
+  const workspaceSymbolsBText = JSON.stringify(workspaceSymbolsB);
+  if (!workspaceSymbolsBText.includes('square') || workspaceSymbolsBText.includes(lspWorkspaceA)) {
+    throw new Error('LSP workspace B symbols were confused with workspace A');
+  }
+
+  await expectToolFailure('lsp_hover', {
+    workspaceRoot: lspDeniedWorkspace,
+    filePath: path.join(lspDeniedWorkspace, 'src/main.ts'),
+    line: 1,
+    character: 7,
+    serverId: 'malicious',
+  });
+  try {
+    await fs.access(lspDeniedMarker);
+    throw new Error('Repo-local LSP config command executed despite host deny policy');
+  } catch (error) {
+    if (error?.code !== 'ENOENT') throw error;
+  }
+
+  await fs.rename(
+    path.join(lspDeniedWorkspace, '.lsp-mcp.json'),
+    path.join(lspDeniedWorkspace, '.lsp-mcp.jsonc'),
+  );
+  await expectToolFailure('lsp_hover', {
+    workspaceRoot: lspDeniedWorkspace,
+    filePath: path.join(lspDeniedWorkspace, 'src/main.ts'),
+    line: 1,
+    character: 7,
+    serverId: 'malicious',
+  });
+  try {
+    await fs.access(lspDeniedMarker);
+    throw new Error('Repo-local JSONC LSP config command executed despite host deny policy');
+  } catch (error) {
+    if (error?.code !== 'ENOENT') throw error;
+  }
+
+  const missingCacheBefore = await fs.readdir(lspManagedCacheRoot).catch((error) => {
+    if (error?.code === 'ENOENT') return [];
+    throw error;
+  });
+  const missingServer = await lspCall('lsp_hover', {
+    workspaceRoot: lspMissingWorkspace,
+    filePath: path.join(lspMissingWorkspace, 'fixture.yaml'),
+    line: 1,
+    character: 1,
+    serverId: 'yaml-language-server',
+  });
+  const missingServerText = missingServer.content
+    ?.filter((item) => item.type === 'text')
+    .map((item) => item.text)
+    .join('\n') ?? '';
+  let missingServerJson = null;
+  try {
+    missingServerJson = JSON.parse(missingServerText);
+  } catch {
+    // A protocol-level error result is also an observable failure path.
+  }
+  const missingServerFailedObservably = Boolean(
+    missingServerJson?.ok === false &&
+    missingServerJson?.results?.acquisition?.ok === false &&
+    /downloads are disabled/i.test(missingServerJson.results.acquisition.error ?? ''),
+  );
+  if (!missingServer.isError && !missingServerFailedObservably) {
+    throw new Error(`Missing LSP server did not fail observably: ${missingServerText}`);
+  }
+  const missingCacheAfter = await fs.readdir(lspManagedCacheRoot).catch((error) => {
+    if (error?.code === 'ENOENT') return [];
+    throw error;
+  });
+  if (JSON.stringify(missingCacheAfter.sort()) !== JSON.stringify(missingCacheBefore.sort())) {
+    throw new Error('Missing LSP server triggered a managed download despite downloads.enabled=false');
+  }
 
   const navigate = await client.callTool({
     name: 'browser_navigate',
@@ -1284,7 +1558,7 @@ exec /usr/bin/git "$@"
   clientClosed = true;
 
   console.log(
-    `PASS tools=${names.length} playwrightForwarded=${playwright.tools.length} artifact=${screenshotArtifact.name}`,
+    `PASS tools=${names.length} playwrightForwarded=${playwright.tools.length} lspForwarded=${lsp.tools.length} artifact=${screenshotArtifact.name}`,
   );
 } finally {
   if (!clientClosed) await client.close();
@@ -1316,5 +1590,6 @@ exec /usr/bin/git "$@"
   await fs.rm(workspaceWorktreeRemoveTriggerPath, { force: true });
   await fs.rm(workspaceWorktreeRemovePidPath, { force: true });
   await fs.rm(workspaceRediscoveryBridgesConfig, { force: true });
+  await fs.rm(lspSmokeRoot, { recursive: true, force: true });
   if (importServer) await new Promise((resolve) => importServer.close(resolve));
 }

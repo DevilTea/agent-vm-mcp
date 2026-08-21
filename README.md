@@ -83,6 +83,18 @@ mise install
 
 Do not make `workspace_create` trust or install project toolchains. A workspace is only repository/worktree lifecycle; toolchain trust and installation remain explicit follow-up actions.
 
+Provision the read-only LSP code-intelligence bridge after mise is available:
+
+```bash
+sudo ./scripts/provision-lsp.sh
+```
+
+The LSP provisioner installs exact mise-owned versions of `language-server-mcp` (`0.3.1`), `typescript-language-server` (`5.3.0`), and TypeScript (`6.0.3`). It writes a controlled launcher at `/opt/language-server-mcp/start.sh` and deployment-owned user configuration at `~/.config/lsp-mcp/config.json`. The launcher pins the control-plane Node runtime instead of resolving through a task workspace. Re-running the provisioner is intended to be idempotent.
+
+The controlled LSP configuration disables managed language-server downloads, disables `workspace/executeCommand`, disallows external-workspace file edits, and configures TypeScript as a manually provisioned system server. Project-local `.lsp-mcp.json` and `.lsp-mcp.jsonc` files are rejected by `agent-vm-mcp` before workspace-scoped LSP calls are forwarded; there is no automatic trust path in this version. Native `apply_patch` remains the mutation mechanism.
+
+Provisioning does not restart `agent-tunnel.service`. After deploying a bridge/config change, restart the service separately and verify `mcp_bridge_status` plus representative `lsp_` calls.
+
 ## Run
 
 ```bash

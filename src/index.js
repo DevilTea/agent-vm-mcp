@@ -13,6 +13,7 @@ import * as z from 'zod/v4';
 import { McpBridgeManager } from './mcp-bridge.js';
 import { collectCapabilities, inspectCommands } from './capabilities.js';
 import { createBridgeToolAdapterFactory } from './adapters/index.js';
+import { createBridgeCallPolicyFactory } from './policies/index.js';
 import { ArtifactStore } from './artifacts/artifact-store.js';
 import { PRESENT_FILE_TOOL } from './artifacts/constants.js';
 import { registerArtifactSystem } from './artifacts/register.js';
@@ -746,6 +747,7 @@ async function createServer() {
     server,
     reservedToolNames: new Set(NATIVE_TOOL_NAMES),
     adapterFactory: createBridgeToolAdapterFactory({ artifactStore }),
+    policyFactory: createBridgeCallPolicyFactory(),
   });
   await bridgeManager.initialize();
   activeBridgeManagers.add(bridgeManager);
