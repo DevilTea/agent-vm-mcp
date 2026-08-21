@@ -40,7 +40,8 @@ require_literal "$x_unit" 'Restart=always'
 
 require_literal "$vnc_unit" 'Wants=agent-browser-x.service'
 require_literal "$vnc_unit" '-listen 127.0.0.1'
-require_literal "$vnc_unit" '-noipv6'
+require_literal "$vnc_unit" '-no6'
+require_literal "$vnc_unit" '-rfbportv6 0'
 require_literal "$vnc_unit" '-rfbport 5900'
 
 require_literal "$novnc_unit" 'Wants=agent-browser-vnc.service'

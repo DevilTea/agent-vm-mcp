@@ -110,7 +110,7 @@ Tailscale is only a stable reachability layer for ordinary OpenSSH. Do not expos
 ssh -L 6080:127.0.0.1:6080 agent@<tailscale-host>
 ```
 
-With that SSH session open, browse to `http://127.0.0.1:6080/vnc.html?autoconnect=true&resize=scale`. `x11vnc` listens only on `127.0.0.1:5900`, websockify listens only on `127.0.0.1:6080`, and X TCP listening is disabled. The noVNC view is the same virtual display containing the Playwright-controlled Chromium instance; it is not a second browser/profile.
+With that SSH session open, browse to `http://127.0.0.1:6080/vnc.html?autoconnect=true&resize=scale`. `x11vnc` listens only on `127.0.0.1:5900`, websockify listens only on `127.0.0.1:6080`, and X TCP listening is disabled. Browser takeover v1 is intentionally IPv4-loopback-only; IPv6 access is unsupported. The noVNC view is the same virtual display containing the Playwright-controlled Chromium instance; it is not a second browser/profile.
 
 Human and automation input are mutually exclusive by contract. Stop issuing `browser_*` interactions while the operator is controlling the noVNC session, then resume automation only after the operator has finished. v1 intentionally has no takeover lock/lease MCP API.
 
