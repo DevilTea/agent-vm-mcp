@@ -15,6 +15,7 @@ MCP server for controlling a dedicated Linux agent VM and forwarding tools from 
 - Bridge tools from upstream MCP servers over stdio or Streamable HTTP.
 - Filter, prefix, and rename bridged tools while rejecting name collisions.
 - Forward Playwright MCP tools through the same MCP endpoint.
+- Run the persistent Playwright browser on a private virtual display that can be viewed through an SSH-forwarded, loopback-only noVNC path.
 - Present VM files as opaque MCP artifacts with preview/download UI.
 - Automatically attach Playwright screenshots to the conversation and expose images to ChatGPT vision when supported.
 
@@ -94,6 +95,24 @@ The LSP provisioner installs exact mise-owned versions of `language-server-mcp` 
 The controlled LSP configuration disables managed language-server downloads, disables `workspace/executeCommand`, disallows external-workspace file edits, and configures TypeScript as a manually provisioned system server. Project-local `.lsp-mcp.json` and `.lsp-mcp.jsonc` files are rejected by `agent-vm-mcp` before workspace-scoped LSP calls are forwarded; there is no automatic trust path in this version. Native `apply_patch` remains the mutation mechanism.
 
 Provisioning does not restart `agent-tunnel.service`. After deploying a bridge/config change, restart the service separately and verify `mcp_bridge_status` plus representative `lsp_` calls.
+
+Provision browser human takeover after Playwright MCP and mise are installed:
+
+```bash
+sudo ./scripts/provision-browser-takeover.sh
+```
+
+The browser takeover provisioner installs a persistent `Xvfb` display, loopback-only `x11vnc` and noVNC/websockify services, and Tailscale. It also writes the production Playwright launcher so the existing persistent profile runs headed on `DISPLAY=:99`, and makes the virtual display a startup dependency of `agent-tunnel.service`. The provisioner starts the display/VNC/noVNC services and `tailscaled`, but deliberately does **not** restart `agent-tunnel.service` or enroll Tailscale.
+
+Tailscale is only a stable reachability layer for ordinary OpenSSH. Do not expose VNC/noVNC with `tailscale serve`, Tailscale SSH, a tailnet listener, a LAN listener, or a public listener. Enroll the VM separately as the operator, then create a normal SSH local forward from the machine where the browser will be viewed:
+
+```bash
+ssh -L 6080:127.0.0.1:6080 agent@<tailscale-host>
+```
+
+With that SSH session open, browse to `http://127.0.0.1:6080/vnc.html?autoconnect=true&resize=scale`. `x11vnc` listens only on `127.0.0.1:5900`, websockify listens only on `127.0.0.1:6080`, and X TCP listening is disabled. The noVNC view is the same virtual display containing the Playwright-controlled Chromium instance; it is not a second browser/profile.
+
+Human and automation input are mutually exclusive by contract. Stop issuing `browser_*` interactions while the operator is controlling the noVNC session, then resume automation only after the operator has finished. v1 intentionally has no takeover lock/lease MCP API.
 
 ## Run
 

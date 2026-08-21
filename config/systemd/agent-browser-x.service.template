@@ -1,0 +1,17 @@
+[Unit]
+Description=Persistent virtual X display for Agent VM browser takeover
+Before=agent-tunnel.service
+
+[Service]
+Type=simple
+User=@AGENT_USER@
+Group=@AGENT_GROUP@
+ExecStartPre=/usr/bin/rm -f /tmp/.X99-lock /tmp/.X11-unix/X99
+ExecStart=/usr/bin/Xvfb :99 -screen 0 1440x900x24 -nolisten tcp -noreset -ac
+ExecStartPost=/usr/bin/timeout 5s /bin/sh -c 'until /usr/bin/xdpyinfo -display :99 >/dev/null 2>&1; do sleep 0.05; done'
+Restart=always
+RestartSec=1s
+TimeoutStartSec=10s
+
+[Install]
+WantedBy=multi-user.target

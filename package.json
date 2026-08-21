@@ -6,7 +6,7 @@
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
     "start": "node src/index.js",
-    "smoke": "node test/smoke.mjs"
+    "smoke": "bash test/browser-takeover-smoke.sh && node test/smoke.mjs"
   },
   "keywords": [],
   "author": "",
