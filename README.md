@@ -19,6 +19,7 @@ MCP server for controlling a dedicated Linux agent VM and forwarding tools from 
 ## Native tools
 
 - `exec`
+- `import_file`
 - `command_info`
 - `present_file`
 - `process_start`
@@ -59,6 +60,8 @@ See [`config/README.md`](config/README.md) for bridge configuration, environment
 The default bridge configuration expects the local Playwright MCP launcher at `/opt/playwright-mcp/start.sh`. Its `browser_take_screenshot` tool is adapted into the generic artifact channel. Adjust `config/bridges.json` for other deployments.
 
 Artifact resources are opaque, process-local references with a 24-hour default TTL and a 50 MiB default size limit. Override these with `AGENT_ARTIFACT_TTL_MS` and `AGENT_ARTIFACT_MAX_BYTES`.
+
+ChatGPT-hosted files can be imported into the VM with `import_file`; file bytes are fetched from the host-provided short-lived URL rather than passed through model context. Imports are limited to 256 MiB by default; override with `AGENT_FILE_IMPORT_MAX_BYTES`.
 
 ## Validation
 

@@ -1,5 +1,7 @@
 import { spawn } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
+import fs from 'node:fs/promises';
+import path from 'node:path';
 
 import { McpServer } from '@modelcontextprotocol/server';
 import { serveStdio } from '@modelcontextprotocol/server/stdio';
@@ -15,6 +17,17 @@ import { registerArtifactSystem } from './artifacts/register.js';
 const MAX_EXEC_OUTPUT_BYTES = 2 * 1024 * 1024;
 const MAX_PROCESS_STREAM_BYTES = 4 * 1024 * 1024;
 const MAX_PROCESS_SESSIONS = 32;
+const DEFAULT_MAX_FILE_IMPORT_BYTES = 256 * 1024 * 1024;
+
+function positiveIntegerFromEnv(name, fallback) {
+  const raw = process.env[name];
+  if (raw === undefined) return fallback;
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value <= 0) throw new Error(`${name} must be a positive safe integer.`);
+  return value;
+}
+
+const MAX_FILE_IMPORT_BYTES = positiveIntegerFromEnv('AGENT_FILE_IMPORT_MAX_BYTES', DEFAULT_MAX_FILE_IMPORT_BYTES);
 
 class BoundedStreamBuffer {
   #buffer = Buffer.alloc(0);
@@ -254,6 +267,7 @@ const NATIVE_TOOL_NAMES = new Set([
   'mcp_bridge_status',
   'capabilities',
   'command_info',
+  'import_file',
   PRESENT_FILE_TOOL,
 ]);
 
@@ -298,6 +312,58 @@ async function createServer() {
       }),
     },
     async (args) => jsonResult(await executeCommand(args)),
+  );
+
+  server.registerTool(
+    'import_file',
+    {
+      description:
+        'Import a ChatGPT-hosted file into the agent VM without routing file bytes through model context.',
+      inputSchema: z.object({
+        file: z.object({
+          download_url: z.string().url(),
+          file_id: z.string().min(1),
+          mime_type: z.string().optional(),
+          file_name: z.string().optional(),
+        }),
+        destination: z.string().min(1).optional(),
+        cwd: z.string().optional(),
+        overwrite: z.boolean().default(false),
+      }),
+      _meta: { 'openai/fileParams': ['file'] },
+    },
+    async ({ file, destination, cwd, overwrite }) => {
+      const response = await fetch(file.download_url, { redirect: 'follow' });
+      if (!response.ok) throw new Error(`Failed to download provided file: HTTP ${response.status}`);
+
+      const contentLengthHeader = response.headers.get('content-length');
+      const contentLength = contentLengthHeader === null ? null : Number(contentLengthHeader);
+      if (contentLength !== null && Number.isFinite(contentLength) && contentLength > MAX_FILE_IMPORT_BYTES) {
+        throw new Error(`Provided file exceeds the ${MAX_FILE_IMPORT_BYTES}-byte import limit.`);
+      }
+
+      const data = Buffer.from(await response.arrayBuffer());
+      if (data.length > MAX_FILE_IMPORT_BYTES) {
+        throw new Error(`Provided file exceeds the ${MAX_FILE_IMPORT_BYTES}-byte import limit.`);
+      }
+
+      const safeName = (file.file_name ?? 'upload.bin').replace(/[^A-Za-z0-9._-]/g, '_');
+      const baseDir = cwd ?? process.env.HOME;
+      const resolvedPath = destination
+        ? path.resolve(baseDir, destination)
+        : path.join(baseDir, 'inbox', `${randomUUID()}-${safeName}`);
+      await fs.mkdir(path.dirname(resolvedPath), { recursive: true });
+      await fs.writeFile(resolvedPath, data, { flag: overwrite ? 'w' : 'wx', mode: 0o600 });
+
+      return jsonResult({
+        fileId: file.file_id,
+        fileName: file.file_name ?? null,
+        mimeType: file.mime_type ?? response.headers.get('content-type'),
+        bytes: data.length,
+        sha256: createHash('sha256').update(data).digest('hex'),
+        path: resolvedPath,
+      });
+    },
   );
 
   server.registerTool(

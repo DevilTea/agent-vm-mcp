@@ -1,4 +1,6 @@
 import { execFile } from 'node:child_process';
+import { createHash } from 'node:crypto';
+import http from 'node:http';
 import fs from 'node:fs/promises';
 import { promisify } from 'node:util';
 
@@ -10,6 +12,9 @@ const artifactMetaKey = 'io.deviltea.agent-vm/artifact';
 const artifactViewerUri = 'ui://agent-vm/artifact-viewer-v12.html';
 const presentFilePath = '/tmp/agent-mcp-present-file-smoke.txt';
 const viewerScriptPath = '/tmp/agent-mcp-artifact-viewer-smoke.mjs';
+const importedFilePath = '/tmp/agent-mcp-import-file-smoke.txt';
+const importPayload = Buffer.from('file ingress smoke\n', 'utf8');
+let importServer;
 const execFileAsync = promisify(execFile);
 const client = new Client({ name: 'agent-mcp-smoke', version: '1.0.0' });
 const transport = new StdioClientTransport({
@@ -25,6 +30,7 @@ const transport = new StdioClientTransport({
 
 try {
   await fs.writeFile(presentFilePath, 'artifact smoke text\nline two\n', 'utf8');
+  await fs.rm(importedFilePath, { force: true });
   await client.connect(transport);
 
   const allTools = [];
@@ -38,6 +44,7 @@ try {
   const names = allTools.map((tool) => tool.name);
   const required = [
     'exec',
+    'import_file',
     'process_start',
     'process_read',
     'process_write',
@@ -55,6 +62,52 @@ try {
   }
   if (names.includes('browser_screenshot_poc')) {
     throw new Error('Legacy browser_screenshot_poc should not be registered');
+  }
+
+  const importFileTool = allTools.find((tool) => tool.name === 'import_file');
+  if (importFileTool?._meta?.['openai/fileParams']?.[0] !== 'file') {
+    throw new Error('import_file fileParams metadata missing');
+  }
+
+  importServer = http.createServer((request, response) => {
+    if (request.url !== '/fixture') {
+      response.writeHead(404).end();
+      return;
+    }
+    response.writeHead(200, {
+      'content-type': 'text/plain',
+      'content-length': String(importPayload.length),
+    });
+    response.end(importPayload);
+  });
+  await new Promise((resolve, reject) => {
+    importServer.once('error', reject);
+    importServer.listen(0, '127.0.0.1', resolve);
+  });
+  const importAddress = importServer.address();
+  if (!importAddress || typeof importAddress === 'string') throw new Error('import_file smoke server failed to listen');
+  const imported = await client.callTool({
+    name: 'import_file',
+    arguments: {
+      file: {
+        download_url: `http://127.0.0.1:${importAddress.port}/fixture`,
+        file_id: 'file-smoke',
+        mime_type: 'text/plain',
+        file_name: 'fixture.txt',
+      },
+      destination: importedFilePath,
+    },
+  });
+  const importedText = imported.content?.find((item) => item.type === 'text')?.text ?? '';
+  const importedResult = JSON.parse(importedText);
+  const expectedImportHash = createHash('sha256').update(importPayload).digest('hex');
+  if (
+    importedResult.path !== importedFilePath ||
+    importedResult.bytes !== importPayload.length ||
+    importedResult.sha256 !== expectedImportHash ||
+    (await fs.readFile(importedFilePath, 'utf8')) !== importPayload.toString('utf8')
+  ) {
+    throw new Error('import_file smoke failed');
   }
 
   const presentFileTool = allTools.find((tool) => tool.name === 'present_file');
@@ -279,4 +332,6 @@ try {
   await client.close();
   await fs.rm(presentFilePath, { force: true });
   await fs.rm(viewerScriptPath, { force: true });
+  await fs.rm(importedFilePath, { force: true });
+  if (importServer) await new Promise((resolve) => importServer.close(resolve));
 }
