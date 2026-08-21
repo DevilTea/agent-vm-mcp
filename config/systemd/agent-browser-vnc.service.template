@@ -8,7 +8,7 @@ Type=simple
 User=@AGENT_USER@
 Group=@AGENT_GROUP@
 Environment=DISPLAY=:99
-ExecStart=/usr/bin/x11vnc -display :99 -listen 127.0.0.1 -rfbport 5900 -forever -shared -nopw -noxdamage
+ExecStart=/usr/bin/x11vnc -display :99 -listen 127.0.0.1 -no6 -rfbport 5900 -forever -shared -nopw -noxdamage
 Restart=always
 RestartSec=1s
 
