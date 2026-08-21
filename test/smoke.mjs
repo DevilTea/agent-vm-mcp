@@ -2,12 +2,23 @@ import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import http from 'node:http';
 import fs from 'node:fs/promises';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 
 import { Client } from '@modelcontextprotocol/client';
 import { StdioClientTransport } from '@modelcontextprotocol/client/stdio';
 
+import { ArtifactStore } from '../src/artifacts/artifact-store.js';
+
 const node = '/home/agent/.local/share/pnpm/bin/node';
+const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const serverEntry = path.join(projectRoot, 'src/index.js');
+const smokeBridgeConfig = `/tmp/agent-mcp-bridges-smoke-${process.pid}.json`;
+const artifactExpiryRoot = `/tmp/agent-mcp-artifact-expiry-${process.pid}`;
+const artifactBorrowedPath = `/tmp/agent-mcp-artifact-borrowed-${process.pid}.txt`;
+const artifactOwnedParent = '/tmp/agent-vm-artifacts';
+const smokeArtifactMaxBytes = 256 * 1024;
 const artifactMetaKey = 'io.deviltea.agent-vm/artifact';
 const artifactViewerUri = 'ui://agent-vm/artifact-viewer-v12.html';
 const presentFilePath = '/tmp/agent-mcp-present-file-smoke.txt';
@@ -42,12 +53,13 @@ const execFileAsync = promisify(execFile);
 const client = new Client({ name: 'agent-mcp-smoke', version: '1.0.0' });
 const transport = new StdioClientTransport({
   command: node,
-  args: ['/opt/agent-mcp/src/index.js'],
+  args: [serverEntry],
   cwd: '/home/agent',
   env: {
     ...process.env,
     PATH: `${gitShimDir}:${process.env.PATH}`,
-    MCP_BRIDGES_CONFIG: '/opt/agent-mcp/test/bridges.smoke.json',
+    MCP_BRIDGES_CONFIG: smokeBridgeConfig,
+    AGENT_ARTIFACT_MAX_BYTES: String(smokeArtifactMaxBytes),
     AGENT_WORKSPACE_ROOT: workspaceRoot,
     AGENT_REPOSITORY_ROOT: repositoryRoot,
   },
@@ -55,6 +67,42 @@ const transport = new StdioClientTransport({
 });
 
 try {
+  const bridgeFixture = (await fs.readFile(path.join(projectRoot, 'test/bridges.smoke.json'), 'utf8')).replace(
+    '/opt/agent-mcp/test/playwright-start-smoke.sh',
+    path.join(projectRoot, 'test/playwright-start-smoke.sh'),
+  );
+  await fs.writeFile(smokeBridgeConfig, bridgeFixture, 'utf8');
+
+  await fs.rm(artifactExpiryRoot, { recursive: true, force: true });
+  await fs.rm(artifactBorrowedPath, { force: true });
+  await fs.writeFile(artifactBorrowedPath, 'borrowed survives expiry\n', 'utf8');
+  const expiryStore = new ArtifactStore({ maxBytes: 1024, ttlMs: 25, ownedRoot: artifactExpiryRoot });
+  const ownedExpiryPath = await expiryStore.createOwnedTempPath('expiry.txt');
+  await fs.writeFile(ownedExpiryPath, 'owned expires\n', 'utf8');
+  const ownedExpiryArtifact = await expiryStore.registerOwnedFile(ownedExpiryPath, { name: 'expiry.txt' });
+  const borrowedExpiryArtifact = await expiryStore.registerFile(artifactBorrowedPath, { name: 'borrowed.txt' });
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  expiryStore.cleanup();
+  await expiryStore.waitForCleanup();
+  for (const artifact of [ownedExpiryArtifact, borrowedExpiryArtifact]) {
+    try {
+      expiryStore.get(artifact.id);
+      throw new Error('expired artifact remained registered');
+    } catch (error) {
+      if (!String(error?.message).includes('Unknown or expired artifact')) throw error;
+    }
+  }
+  try {
+    await fs.access(ownedExpiryPath);
+    throw new Error('owned artifact file survived TTL cleanup');
+  } catch (error) {
+    if (error?.code !== 'ENOENT') throw error;
+  }
+  if ((await fs.readFile(artifactBorrowedPath, 'utf8')) !== 'borrowed survives expiry\n') {
+    throw new Error('artifact expiry deleted a borrowed caller-owned file');
+  }
+  await expiryStore.close();
+
   await fs.writeFile(presentFilePath, 'artifact smoke text\nline two\n', 'utf8');
   await fs.rm(importedFilePath, { force: true });
   await fs.rm(cancelledImportPath, { force: true });
@@ -366,7 +414,7 @@ exec /usr/bin/git "$@"
   const rediscoveryClient = new Client({ name: 'agent-mcp-workspace-rediscovery', version: '1.0.0' });
   const rediscoveryTransport = new StdioClientTransport({
     command: node,
-    args: ['/opt/agent-mcp/src/index.js'],
+    args: [serverEntry],
     cwd: '/home/agent',
     env: {
       ...process.env,
@@ -747,14 +795,125 @@ exec /usr/bin/git "$@"
     throw new Error('import_file cancellation left a temporary file');
   }
 
+  const smallExec = parseJsonToolResult(
+    await client.callTool({
+      name: 'exec',
+      arguments: { command: "printf 'small-out'; printf 'small-err' >&2" },
+    }),
+  );
+  if (
+    smallExec.stdout !== 'small-out' ||
+    smallExec.stderr !== 'small-err' ||
+    smallExec.stdoutBytes !== Buffer.byteLength('small-out') ||
+    smallExec.stderrBytes !== Buffer.byteLength('small-err') ||
+    smallExec.stdoutTruncated ||
+    smallExec.stderrTruncated ||
+    smallExec.stdoutArtifact !== null ||
+    smallExec.stderrArtifact !== null
+  ) {
+    throw new Error('small exec output no longer preserves inline compatibility/metadata');
+  }
+
+  const expectedLargeStdout = `OUT_HEAD\n${'o'.repeat(150_000)}\nOUT_TAIL\n`;
+  const expectedLargeStderr = `ERR_HEAD\n${'e'.repeat(150_000)}\nERR_TAIL\n`;
+  const largeExecResult = await client.callTool({
+    name: 'exec',
+    arguments: {
+      command:
+        `${node} -e "process.stdout.write('OUT_HEAD\\n'+'o'.repeat(150000)+'\\nOUT_TAIL\\n');` +
+        `process.stderr.write('ERR_HEAD\\n'+'e'.repeat(150000)+'\\nERR_TAIL\\n')"`,
+    },
+  });
+  const largeExec = parseJsonToolResult(largeExecResult);
+  if (
+    !largeExec.stdoutTruncated ||
+    !largeExec.stderrTruncated ||
+    largeExec.stdoutBytes !== Buffer.byteLength(expectedLargeStdout) ||
+    largeExec.stderrBytes !== Buffer.byteLength(expectedLargeStderr) ||
+    !largeExec.stdout.startsWith('OUT_HEAD\n') ||
+    !largeExec.stdout.endsWith('\nOUT_TAIL\n') ||
+    !largeExec.stderr.startsWith('ERR_HEAD\n') ||
+    !largeExec.stderr.endsWith('\nERR_TAIL') ||
+    !largeExec.stdout.includes('bytes omitted from inline preview') ||
+    !largeExec.stderr.includes('bytes omitted from inline preview')
+  ) {
+    throw new Error('large exec head/tail preview or observed-byte metadata is incorrect');
+  }
+  if (
+    !largeExec.stdoutArtifact ||
+    !largeExec.stderrArtifact ||
+    largeExec.stdoutArtifact.truncated ||
+    largeExec.stderrArtifact.truncated ||
+    largeExec.stdoutArtifact.observedBytes !== largeExec.stdoutBytes ||
+    largeExec.stderrArtifact.observedBytes !== largeExec.stderrBytes ||
+    largeExec.stdoutArtifact.uri === largeExec.stderrArtifact.uri
+  ) {
+    throw new Error('large exec did not expose independent complete stdout/stderr artifacts');
+  }
+  const largeLinks = largeExecResult.content?.filter((item) => item.type === 'resource_link') ?? [];
+  if (
+    largeLinks.length !== 2 ||
+    !largeLinks.some((item) => item.uri === largeExec.stdoutArtifact.uri) ||
+    !largeLinks.some((item) => item.uri === largeExec.stderrArtifact.uri)
+  ) {
+    throw new Error('large exec artifacts were not exposed as resource links');
+  }
+  const largeStdoutResource = await client.readResource({ uri: largeExec.stdoutArtifact.uri });
+  const largeStderrResource = await client.readResource({ uri: largeExec.stderrArtifact.uri });
+  if (
+    largeStdoutResource.contents?.[0]?.text !== expectedLargeStdout ||
+    largeStderrResource.contents?.[0]?.text !== expectedLargeStderr
+  ) {
+    throw new Error('complete exec artifact round-trip failed');
+  }
+
+  const expectedHardStdout = `HARD_HEAD\n${'z'.repeat(300_000)}\nHARD_TAIL\n`;
+  const hardExecResult = await client.callTool({
+    name: 'exec',
+    arguments: {
+      command: `${node} -e "process.stdout.write('HARD_HEAD\\n'+'z'.repeat(300000)+'\\nHARD_TAIL\\n')"`,
+    },
+  });
+  const hardExec = parseJsonToolResult(hardExecResult);
+  if (
+    !hardExec.stdoutTruncated ||
+    hardExec.stdoutBytes !== Buffer.byteLength(expectedHardStdout) ||
+    !hardExec.stdout.endsWith('\nHARD_TAIL\n') ||
+    !hardExec.stdoutArtifact?.truncated ||
+    hardExec.stdoutArtifact.size !== smokeArtifactMaxBytes ||
+    hardExec.stdoutArtifact.capturedBytes !== smokeArtifactMaxBytes ||
+    hardExec.stdoutArtifact.hardLimitBytes !== smokeArtifactMaxBytes ||
+    hardExec.stdoutArtifact.observedBytes !== hardExec.stdoutBytes ||
+    hardExec.stderrArtifact !== null
+  ) {
+    throw new Error('exec artifact hard-bound metadata/tail preservation is incorrect');
+  }
+  const hardStdoutResource = await client.readResource({ uri: hardExec.stdoutArtifact.uri });
+  if (
+    hardStdoutResource.contents?.[0]?.text?.length !== smokeArtifactMaxBytes ||
+    !hardStdoutResource.contents[0].text.startsWith('HARD_HEAD\n')
+  ) {
+    throw new Error('bounded exec artifact did not retain the expected stream prefix');
+  }
+
   const timeoutExec = await client.callTool({
     name: 'exec',
-    arguments: { command: 'sleep 5', timeoutMs: 1000 },
+    arguments: {
+      command: `${node} -e "process.stdout.write('t'.repeat(150000))"; sleep 5`,
+      timeoutMs: 1000,
+    },
   });
   const timeoutExecText = timeoutExec.content?.find((item) => item.type === 'text')?.text ?? '';
   const timeoutExecResult = JSON.parse(timeoutExecText);
-  if (!timeoutExecResult.timedOut || timeoutExecResult.cancelled) {
-    throw new Error('exec timeout/cancellation diagnostics are incorrect');
+  if (
+    !timeoutExecResult.timedOut ||
+    timeoutExecResult.cancelled ||
+    !timeoutExecResult.stdoutTruncated ||
+    timeoutExecResult.stdoutBytes !== 150_000 ||
+    !timeoutExecResult.stdoutArtifact ||
+    timeoutExecResult.stdoutArtifact.truncated
+  ) {
+    throw new Error('exec timeout/cancellation diagnostics or spill preservation are incorrect');
   }
 
   const execAbortController = new AbortController();
@@ -763,6 +922,7 @@ exec /usr/bin/git "$@"
       name: 'exec',
       arguments: {
         command:
+          `${node} -e "process.stdout.write('c'.repeat(150000))"; ` +
           `trap 'echo terminated > ${execCancelMarkerPath}; exit 0' TERM; ` +
           `echo $$ > ${execCancelPidPath}; while :; do sleep 1; done`,
         timeoutMs: 10_000,
@@ -1056,6 +1216,24 @@ exec /usr/bin/git "$@"
     throw new Error('MCP stdio server PID unavailable for graceful shutdown smoke');
   }
 
+  let serverOwnedDirs = [];
+  try {
+    serverOwnedDirs = (await fs.readdir(artifactOwnedParent)).filter((name) =>
+      name.startsWith(`store-${serverPid}-`),
+    );
+  } catch (error) {
+    if (error?.code !== 'ENOENT') throw error;
+  }
+  if (serverOwnedDirs.length !== 1) {
+    throw new Error('exec-owned artifact store directory was not discoverable before shutdown');
+  }
+  const serverOwnedFiles = await fs.readdir(path.join(artifactOwnedParent, serverOwnedDirs[0]));
+  if (serverOwnedFiles.length !== 4) {
+    throw new Error(
+      `expected exactly four retained exec spill artifacts before shutdown, found ${serverOwnedFiles.length}`,
+    );
+  }
+
   const shutdownStartedAt = Date.now();
   process.kill(serverPid, 'SIGTERM');
 
@@ -1089,6 +1267,12 @@ exec /usr/bin/git "$@"
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
   if (!serverExited) throw new Error('MCP server did not exit after SIGTERM');
+  try {
+    await fs.access(path.join(artifactOwnedParent, serverOwnedDirs[0]));
+    throw new Error('graceful shutdown left exec-owned artifact files behind');
+  } catch (error) {
+    if (error?.code !== 'ENOENT') throw error;
+  }
 
   await client.close();
   clientClosed = true;
@@ -1098,6 +1282,9 @@ exec /usr/bin/git "$@"
   );
 } finally {
   if (!clientClosed) await client.close();
+  await fs.rm(smokeBridgeConfig, { force: true });
+  await fs.rm(artifactExpiryRoot, { recursive: true, force: true });
+  await fs.rm(artifactBorrowedPath, { force: true });
   await fs.rm(presentFilePath, { force: true });
   await fs.rm(viewerScriptPath, { force: true });
   await fs.rm(importedFilePath, { force: true });

@@ -7,7 +7,7 @@ MCP server for controlling a dedicated Linux agent VM and forwarding tools from 
 
 ## Features
 
-- Execute finite shell commands with bounded output, timeouts, and MCP-request cancellation.
+- Execute finite shell commands with bounded head/tail previews, oversized stdout/stderr artifacts, timeouts, and MCP-request cancellation.
 - Read/list files structurally and apply strict unified diffs without fuzzy fallback.
 - Create, rediscover, and explicitly remove isolated Git worktree workspaces backed by shared repository storage.
 - Start, rediscover, read, write to, and terminate persistent/interactive processes.
@@ -76,7 +76,9 @@ See [`config/README.md`](config/README.md) for bridge configuration, environment
 
 The default bridge configuration expects the local Playwright MCP launcher at `/opt/playwright-mcp/start.sh`. Its `browser_take_screenshot` tool is adapted into the generic artifact channel. Adjust `config/bridges.json` for other deployments.
 
-Artifact resources are opaque, process-local references with a 24-hour default TTL and a 50 MiB default size limit. Override these with `AGENT_ARTIFACT_TTL_MS` and `AGENT_ARTIFACT_MAX_BYTES`.
+Artifact resources are opaque, process-local references with a 24-hour default TTL and a 50 MiB default size limit. Override these with `AGENT_ARTIFACT_TTL_MS` and `AGENT_ARTIFACT_MAX_BYTES`. Files registered by callers such as `present_file` remain caller-owned; temporary spill files created by `exec` are artifact-store-owned and are removed on expiry or graceful server shutdown.
+
+Finite `exec` keeps stdout and stderr separate. Streams up to 128 KiB remain inline unchanged; larger streams return a 64 KiB head + 64 KiB tail preview, exact observed-byte counts, and a separate opaque artifact per oversized stream. The artifact contains the complete stream while it fits within `AGENT_ARTIFACT_MAX_BYTES`; if the stream exceeds that hard bound, artifact metadata explicitly reports truncation while the inline preview still preserves the true final 64 KiB. Cancelled requests discard any unpublished spill file rather than leaving an unreachable artifact behind. Persistent `process_*` output keeps its independent bounded ring-buffer semantics.
 
 ChatGPT-hosted files can be imported into the VM with `import_file`; file bytes are streamed from the host-provided short-lived URL rather than passed through model context. Imports are limited to 256 MiB by default; override with `AGENT_FILE_IMPORT_MAX_BYTES`. Downloads are written to a same-directory temporary file and only committed after successful completion, so cancellation does not leave a partial destination.
 

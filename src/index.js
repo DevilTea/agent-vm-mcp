@@ -16,10 +16,10 @@ import { createBridgeToolAdapterFactory } from './adapters/index.js';
 import { ArtifactStore } from './artifacts/artifact-store.js';
 import { PRESENT_FILE_TOOL } from './artifacts/constants.js';
 import { registerArtifactSystem } from './artifacts/register.js';
+import { ExecOutputCapture } from './exec-output.js';
 import { applyUnifiedPatch, listDirectory, readTextFile, waitForFilesystemMutations } from './filesystem.js';
 import { workspaceCreate, workspaceDelete, workspaceList, waitForWorkspaceMutations } from './workspaces.js';
 
-const MAX_EXEC_OUTPUT_BYTES = 2 * 1024 * 1024;
 const MAX_PROCESS_STREAM_BYTES = 4 * 1024 * 1024;
 const MAX_PROCESS_SESSIONS = 32;
 const DEFAULT_MAX_FILE_IMPORT_BYTES = 256 * 1024 * 1024;
@@ -78,17 +78,6 @@ function jsonResult(value) {
   };
 }
 
-function appendLimited(current, chunk, maxBytes) {
-  if (current.length >= maxBytes) {
-    return current;
-  }
-
-  return Buffer.concat([
-    current,
-    chunk.subarray(0, maxBytes - current.length),
-  ]);
-}
-
 function killProcessGroup(child, signal) {
   try {
     process.kill(-child.pid, signal);
@@ -101,86 +90,148 @@ function killProcessGroup(child, signal) {
   }
 }
 
-function executeCommand({ command, cwd, env, timeoutMs }, requestSignal) {
-  return new Promise((resolve) => {
-    const startedAt = Date.now();
-    const child = spawn('/bin/bash', ['-lc', command], {
-      cwd: cwd ?? process.env.HOME,
-      env: {
-        ...process.env,
-        ...env,
-      },
-      detached: true,
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
+async function executeCommand({ command, cwd, env, timeoutMs }, requestSignal, artifactStore) {
+  const startedAt = Date.now();
+  const executionArtifactId = randomUUID();
+  const child = spawn('/bin/bash', ['-lc', command], {
+    cwd: cwd ?? process.env.HOME,
+    env: {
+      ...process.env,
+      ...env,
+    },
+    detached: true,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
 
-    let stdout = Buffer.alloc(0);
-    let stderr = Buffer.alloc(0);
-    let stdoutTruncated = false;
-    let stderrTruncated = false;
-    let timedOut = false;
-    let cancelled = false;
-    let settled = false;
+  const stdoutCapture = new ExecOutputCapture({ artifactStore });
+  const stderrCapture = new ExecOutputCapture({ artifactStore });
+  let timedOut = false;
+  let cancelled = false;
+  let settled = false;
+  let spawnError = null;
 
-    child.stdout.on('data', (chunk) => {
-      if (stdout.length + chunk.length > MAX_EXEC_OUTPUT_BYTES) {
-        stdoutTruncated = true;
-      }
-      stdout = appendLimited(stdout, chunk, MAX_EXEC_OUTPUT_BYTES);
-    });
+  const terminate = (reason) => {
+    if (settled || timedOut || cancelled) return;
+    timedOut = reason === 'timeout';
+    cancelled = reason === 'cancelled';
+    clearTimeout(timeoutTimer);
+    killProcessGroup(child, 'SIGTERM');
+    setTimeout(() => killProcessGroup(child, 'SIGKILL'), 2_000).unref();
+  };
 
-    child.stderr.on('data', (chunk) => {
-      if (stderr.length + chunk.length > MAX_EXEC_OUTPUT_BYTES) {
-        stderrTruncated = true;
-      }
-      stderr = appendLimited(stderr, chunk, MAX_EXEC_OUTPUT_BYTES);
-    });
+  const onAbort = () => terminate('cancelled');
+  const timeoutTimer = setTimeout(() => terminate('timeout'), timeoutMs);
 
-    const terminate = (reason) => {
-      if (settled || timedOut || cancelled) return;
-      timedOut = reason === 'timeout';
-      cancelled = reason === 'cancelled';
-      clearTimeout(timeoutTimer);
-      killProcessGroup(child, 'SIGTERM');
-      setTimeout(() => killProcessGroup(child, 'SIGKILL'), 2_000).unref();
-    };
+  if (requestSignal?.aborted) {
+    terminate('cancelled');
+  } else {
+    requestSignal?.addEventListener('abort', onAbort, { once: true });
+  }
 
-    const onAbort = () => terminate('cancelled');
-
-    const finish = (exitCode, signal, extraError = '') => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timeoutTimer);
-      requestSignal?.removeEventListener('abort', onAbort);
-      resolve({
-        exitCode,
-        signal,
-        timedOut,
-        cancelled,
-        durationMs: Date.now() - startedAt,
-        stdout: stdout.toString('utf8'),
-        stderr: `${stderr.toString('utf8')}${extraError}`.trim(),
-        stdoutTruncated,
-        stderrTruncated,
-      });
-    };
-
-    const timeoutTimer = setTimeout(() => terminate('timeout'), timeoutMs);
-
-    if (requestSignal?.aborted) {
-      terminate('cancelled');
-    } else {
-      requestSignal?.addEventListener('abort', onAbort, { once: true });
-    }
-
+  const closePromise = new Promise((resolve) => {
     child.on('error', (error) => {
-      finish(null, null, `\n${error.stack ?? error.message}`);
+      spawnError = error;
     });
-
     child.on('close', (exitCode, signal) => {
-      finish(exitCode, signal);
+      settled = true;
+      resolve({ exitCode, signal });
     });
   });
+
+  const guardCapture = (promise) =>
+    promise.catch((error) => {
+      killProcessGroup(child, 'SIGKILL');
+      throw error;
+    });
+  const stdoutConsume = guardCapture(stdoutCapture.consume(child.stdout));
+  const stderrConsume = guardCapture(stderrCapture.consume(child.stderr));
+
+  try {
+    const [{ exitCode, signal }] = await Promise.all([
+      closePromise,
+      stdoutConsume,
+      stderrConsume,
+    ]);
+    clearTimeout(timeoutTimer);
+    requestSignal?.removeEventListener('abort', onAbort);
+
+    const publishArtifact = !cancelled && !requestSignal?.aborted;
+    const [stdoutResult, stderrResult] = await Promise.all([
+      stdoutCapture.finalize({
+        name: `exec-${executionArtifactId}-stdout.log`,
+        source: 'exec.stdout',
+        publishArtifact,
+      }),
+      stderrCapture.finalize({
+        name: `exec-${executionArtifactId}-stderr.log`,
+        source: 'exec.stderr',
+        publishArtifact,
+      }),
+    ]);
+
+    const artifactResult = (capture) =>
+      capture.artifact
+        ? {
+            ...capture.artifact,
+            truncated: capture.artifactTruncated,
+            observedBytes: capture.observedBytes,
+            capturedBytes: capture.artifact.size,
+            hardLimitBytes: artifactStore.maxBytes,
+          }
+        : null;
+
+    const extraError = spawnError ? `\n${spawnError.stack ?? spawnError.message}` : '';
+    return {
+      exitCode,
+      signal,
+      timedOut,
+      cancelled,
+      durationMs: Date.now() - startedAt,
+      stdout: stdoutResult.text,
+      stderr: `${stderrResult.text}${extraError}`.trim(),
+      stdoutBytes: stdoutResult.observedBytes,
+      stderrBytes: stderrResult.observedBytes,
+      stdoutTruncated: stdoutResult.inlineTruncated,
+      stderrTruncated: stderrResult.inlineTruncated,
+      stdoutArtifact: artifactResult(stdoutResult),
+      stderrArtifact: artifactResult(stderrResult),
+    };
+  } catch (error) {
+    clearTimeout(timeoutTimer);
+    requestSignal?.removeEventListener('abort', onAbort);
+    killProcessGroup(child, 'SIGKILL');
+    await Promise.allSettled([stdoutConsume, stderrConsume, closePromise]);
+    await Promise.allSettled([stdoutCapture.discard(), stderrCapture.discard()]);
+    throw error;
+  }
+}
+
+function execResult(value) {
+  const content = [
+    {
+      type: 'text',
+      text: JSON.stringify(value, null, 2),
+    },
+  ];
+
+  for (const [stream, artifact] of [
+    ['stdout', value.stdoutArtifact],
+    ['stderr', value.stderrArtifact],
+  ]) {
+    if (!artifact) continue;
+    content.push({
+      type: 'resource_link',
+      uri: artifact.uri,
+      name: artifact.name,
+      mimeType: artifact.mimeType,
+      size: artifact.size,
+      description: artifact.truncated
+        ? `Bounded ${stream} capture; stream exceeded the artifact hard limit.`
+        : `Complete ${stream} capture for truncated inline exec output.`,
+    });
+  }
+
+  return { content };
 }
 
 function pruneFinishedProcesses() {
@@ -336,6 +387,7 @@ async function stopManagedProcesses() {
 }
 
 const activeBridgeManagers = new Set();
+const activeArtifactStores = new Set();
 const NATIVE_TOOL_NAMES = new Set([
   'exec',
   'read_file',
@@ -363,6 +415,9 @@ async function shutdown() {
   await Promise.allSettled(
     [...activeBridgeManagers].map((manager) => manager.close()),
   );
+  await Promise.allSettled(
+    [...activeArtifactStores].map((store) => store.close()),
+  );
 }
 
 for (const signal of ['SIGTERM', 'SIGINT']) {
@@ -377,6 +432,7 @@ async function createServer() {
     version: '0.4.0',
   });
   const artifactStore = new ArtifactStore();
+  activeArtifactStores.add(artifactStore);
   await registerArtifactSystem(server, artifactStore);
 
   server.registerTool(
@@ -384,6 +440,7 @@ async function createServer() {
     {
       description:
         'Execute an arbitrary shell command on the dedicated disposable Linux agent VM. ' +
+        'Oversized stdout/stderr use bounded head/tail previews plus separate artifacts. ' +
         'Use this for commands that complete on their own. For servers, watchers, REPLs, or other long-running/interactive commands, use process_start instead.',
       inputSchema: z.object({
         command: z.string().min(1).describe('Shell command to execute with bash -lc.'),
@@ -398,7 +455,7 @@ async function createServer() {
           .describe('Maximum execution time in milliseconds.'),
       }),
     },
-    async (args, ctx) => jsonResult(await executeCommand(args, ctx.mcpReq.signal)),
+    async (args, ctx) => execResult(await executeCommand(args, ctx.mcpReq.signal, artifactStore)),
   );
 
   server.registerTool(
@@ -727,6 +784,8 @@ async function createServer() {
     await stopManagedProcesses();
     activeBridgeManagers.delete(bridgeManager);
     await bridgeManager.close();
+    activeArtifactStores.delete(artifactStore);
+    await artifactStore.close();
     await originalClose();
   };
 
