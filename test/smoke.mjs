@@ -13,6 +13,9 @@ const artifactViewerUri = 'ui://agent-vm/artifact-viewer-v12.html';
 const presentFilePath = '/tmp/agent-mcp-present-file-smoke.txt';
 const viewerScriptPath = '/tmp/agent-mcp-artifact-viewer-smoke.mjs';
 const importedFilePath = '/tmp/agent-mcp-import-file-smoke.txt';
+const cancelledImportPath = '/tmp/agent-mcp-import-file-cancelled.txt';
+const execCancelPidPath = '/tmp/agent-mcp-exec-cancel.pid';
+const execCancelMarkerPath = '/tmp/agent-mcp-exec-cancel.marker';
 const importPayload = Buffer.from('file ingress smoke\n', 'utf8');
 let importServer;
 const execFileAsync = promisify(execFile);
@@ -31,6 +34,9 @@ const transport = new StdioClientTransport({
 try {
   await fs.writeFile(presentFilePath, 'artifact smoke text\nline two\n', 'utf8');
   await fs.rm(importedFilePath, { force: true });
+  await fs.rm(cancelledImportPath, { force: true });
+  await fs.rm(execCancelPidPath, { force: true });
+  await fs.rm(execCancelMarkerPath, { force: true });
   await client.connect(transport);
 
   const allTools = [];
@@ -46,6 +52,7 @@ try {
     'exec',
     'import_file',
     'process_start',
+    'process_list',
     'process_read',
     'process_write',
     'process_kill',
@@ -70,15 +77,26 @@ try {
   }
 
   importServer = http.createServer((request, response) => {
-    if (request.url !== '/fixture') {
-      response.writeHead(404).end();
+    if (request.url === '/fixture') {
+      response.writeHead(200, {
+        'content-type': 'text/plain',
+        'content-length': String(importPayload.length),
+      });
+      response.end(importPayload);
       return;
     }
-    response.writeHead(200, {
-      'content-type': 'text/plain',
-      'content-length': String(importPayload.length),
-    });
-    response.end(importPayload);
+
+    if (request.url === '/slow-fixture') {
+      response.writeHead(200, { 'content-type': 'application/octet-stream' });
+      const chunk = Buffer.alloc(64 * 1024, 0x61);
+      response.write(chunk);
+      const timer = setInterval(() => response.write(chunk), 50);
+      timer.unref();
+      response.once('close', () => clearInterval(timer));
+      return;
+    }
+
+    response.writeHead(404).end();
   });
   await new Promise((resolve, reject) => {
     importServer.once('error', reject);
@@ -108,6 +126,101 @@ try {
     (await fs.readFile(importedFilePath, 'utf8')) !== importPayload.toString('utf8')
   ) {
     throw new Error('import_file smoke failed');
+  }
+
+  await fs.writeFile(cancelledImportPath, 'preserve-existing-destination\n', 'utf8');
+  const importAbortController = new AbortController();
+  const cancelledImport = client.callTool(
+    {
+      name: 'import_file',
+      arguments: {
+        file: {
+          download_url: `http://127.0.0.1:${importAddress.port}/slow-fixture`,
+          file_id: 'file-cancel-smoke',
+          mime_type: 'application/octet-stream',
+          file_name: 'cancel.bin',
+        },
+        destination: cancelledImportPath,
+        overwrite: true,
+      },
+    },
+    { signal: importAbortController.signal },
+  );
+  await new Promise((resolve) => setTimeout(resolve, 125));
+  importAbortController.abort();
+  let importWasCancelled = false;
+  try {
+    await cancelledImport;
+  } catch {
+    importWasCancelled = true;
+  }
+  if (!importWasCancelled) throw new Error('import_file cancellation did not reject the client call');
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  if ((await fs.readFile(cancelledImportPath, 'utf8')) !== 'preserve-existing-destination\n') {
+    throw new Error('import_file cancellation modified the existing destination');
+  }
+  const cancelledImportTempPrefix = `.${cancelledImportPath.split('/').at(-1)}.import-`;
+  if ((await fs.readdir('/tmp')).some((name) => name.startsWith(cancelledImportTempPrefix))) {
+    throw new Error('import_file cancellation left a temporary file');
+  }
+
+  const timeoutExec = await client.callTool({
+    name: 'exec',
+    arguments: { command: 'sleep 5', timeoutMs: 1000 },
+  });
+  const timeoutExecText = timeoutExec.content?.find((item) => item.type === 'text')?.text ?? '';
+  const timeoutExecResult = JSON.parse(timeoutExecText);
+  if (!timeoutExecResult.timedOut || timeoutExecResult.cancelled) {
+    throw new Error('exec timeout/cancellation diagnostics are incorrect');
+  }
+
+  const execAbortController = new AbortController();
+  const cancellableExec = client.callTool(
+    {
+      name: 'exec',
+      arguments: {
+        command:
+          `trap 'echo terminated > ${execCancelMarkerPath}; exit 0' TERM; ` +
+          `echo $$ > ${execCancelPidPath}; while :; do sleep 1; done`,
+        timeoutMs: 10_000,
+      },
+    },
+    { signal: execAbortController.signal },
+  );
+  let execPid;
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    try {
+      execPid = Number((await fs.readFile(execCancelPidPath, 'utf8')).trim());
+      break;
+    } catch {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+  }
+  if (!Number.isSafeInteger(execPid)) throw new Error('exec cancellation command did not start');
+  execAbortController.abort();
+  let execWasCancelled = false;
+  try {
+    await cancellableExec;
+  } catch {
+    execWasCancelled = true;
+  }
+  if (!execWasCancelled) throw new Error('exec cancellation did not reject the client call');
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    try {
+      await fs.access(execCancelMarkerPath);
+      break;
+    } catch {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+  }
+  if ((await fs.readFile(execCancelMarkerPath, 'utf8')).trim() !== 'terminated') {
+    throw new Error('exec cancellation did not terminate the process group');
+  }
+  try {
+    process.kill(execPid, 0);
+    throw new Error('exec cancellation left the shell process running');
+  } catch (error) {
+    if (error?.code !== 'ESRCH') throw error;
   }
 
   const presentFileTool = allTools.find((tool) => tool.name === 'present_file');
@@ -307,6 +420,11 @@ try {
   });
   const startedText = started.content?.find((item) => item.type === 'text')?.text ?? '';
   const processId = JSON.parse(startedText).processId;
+  const processList = await client.callTool({ name: 'process_list', arguments: {} });
+  const processListText = processList.content?.find((item) => item.type === 'text')?.text ?? '';
+  if (!JSON.parse(processListText).processes.some((process) => process.processId === processId)) {
+    throw new Error('process_list did not rediscover a managed process');
+  }
   await client.callTool({
     name: 'process_write',
     arguments: { processId, input: 'hello', appendNewline: true },
@@ -333,5 +451,8 @@ try {
   await fs.rm(presentFilePath, { force: true });
   await fs.rm(viewerScriptPath, { force: true });
   await fs.rm(importedFilePath, { force: true });
+  await fs.rm(cancelledImportPath, { force: true });
+  await fs.rm(execCancelPidPath, { force: true });
+  await fs.rm(execCancelMarkerPath, { force: true });
   if (importServer) await new Promise((resolve) => importServer.close(resolve));
 }

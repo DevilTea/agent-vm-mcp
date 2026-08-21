@@ -7,8 +7,8 @@ MCP server for controlling a dedicated Linux agent VM and forwarding tools from 
 
 ## Features
 
-- Execute finite shell commands with bounded output and timeouts.
-- Start, read, write to, and terminate persistent/interactive processes.
+- Execute finite shell commands with bounded output, timeouts, and MCP-request cancellation.
+- Start, rediscover, read, write to, and terminate persistent/interactive processes.
 - Discover curated CLI capabilities available on the VM.
 - Bridge tools from upstream MCP servers over stdio or Streamable HTTP.
 - Filter, prefix, and rename bridged tools while rejecting name collisions.
@@ -23,6 +23,7 @@ MCP server for controlling a dedicated Linux agent VM and forwarding tools from 
 - `command_info`
 - `present_file`
 - `process_start`
+- `process_list`
 - `process_read`
 - `process_write`
 - `process_kill`
@@ -61,7 +62,7 @@ The default bridge configuration expects the local Playwright MCP launcher at `/
 
 Artifact resources are opaque, process-local references with a 24-hour default TTL and a 50 MiB default size limit. Override these with `AGENT_ARTIFACT_TTL_MS` and `AGENT_ARTIFACT_MAX_BYTES`.
 
-ChatGPT-hosted files can be imported into the VM with `import_file`; file bytes are fetched from the host-provided short-lived URL rather than passed through model context. Imports are limited to 256 MiB by default; override with `AGENT_FILE_IMPORT_MAX_BYTES`.
+ChatGPT-hosted files can be imported into the VM with `import_file`; file bytes are streamed from the host-provided short-lived URL rather than passed through model context. Imports are limited to 256 MiB by default; override with `AGENT_FILE_IMPORT_MAX_BYTES`. Downloads are written to a same-directory temporary file and only committed after successful completion, so cancellation does not leave a partial destination.
 
 ## Validation
 

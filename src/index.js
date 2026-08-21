@@ -1,7 +1,10 @@
 import { spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
+import { createWriteStream } from 'node:fs';
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { Readable, Transform } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
 
 import { McpServer } from '@modelcontextprotocol/server';
 import { serveStdio } from '@modelcontextprotocol/server/stdio';
@@ -96,7 +99,7 @@ function killProcessGroup(child, signal) {
   }
 }
 
-function executeCommand({ command, cwd, env, timeoutMs }) {
+function executeCommand({ command, cwd, env, timeoutMs }, requestSignal) {
   return new Promise((resolve) => {
     const startedAt = Date.now();
     const child = spawn('/bin/bash', ['-lc', command], {
@@ -114,6 +117,7 @@ function executeCommand({ command, cwd, env, timeoutMs }) {
     let stdoutTruncated = false;
     let stderrTruncated = false;
     let timedOut = false;
+    let cancelled = false;
     let settled = false;
 
     child.stdout.on('data', (chunk) => {
@@ -130,14 +134,27 @@ function executeCommand({ command, cwd, env, timeoutMs }) {
       stderr = appendLimited(stderr, chunk, MAX_EXEC_OUTPUT_BYTES);
     });
 
+    const terminate = (reason) => {
+      if (settled || timedOut || cancelled) return;
+      timedOut = reason === 'timeout';
+      cancelled = reason === 'cancelled';
+      clearTimeout(timeoutTimer);
+      killProcessGroup(child, 'SIGTERM');
+      setTimeout(() => killProcessGroup(child, 'SIGKILL'), 2_000).unref();
+    };
+
+    const onAbort = () => terminate('cancelled');
+
     const finish = (exitCode, signal, extraError = '') => {
       if (settled) return;
       settled = true;
-      clearTimeout(timer);
+      clearTimeout(timeoutTimer);
+      requestSignal?.removeEventListener('abort', onAbort);
       resolve({
         exitCode,
         signal,
         timedOut,
+        cancelled,
         durationMs: Date.now() - startedAt,
         stdout: stdout.toString('utf8'),
         stderr: `${stderr.toString('utf8')}${extraError}`.trim(),
@@ -146,11 +163,13 @@ function executeCommand({ command, cwd, env, timeoutMs }) {
       });
     };
 
-    const timer = setTimeout(() => {
-      timedOut = true;
-      killProcessGroup(child, 'SIGTERM');
-      setTimeout(() => killProcessGroup(child, 'SIGKILL'), 2_000).unref();
-    }, timeoutMs);
+    const timeoutTimer = setTimeout(() => terminate('timeout'), timeoutMs);
+
+    if (requestSignal?.aborted) {
+      terminate('cancelled');
+    } else {
+      requestSignal?.addEventListener('abort', onAbort, { once: true });
+    }
 
     child.on('error', (error) => {
       finish(null, null, `\n${error.stack ?? error.message}`);
@@ -182,10 +201,13 @@ function getProcessSession(processId) {
   return session;
 }
 
-function startPersistentProcess({ command, cwd, env }) {
+function startPersistentProcess({ command, cwd, env }, requestSignal) {
   pruneFinishedProcesses();
   if (processes.size >= MAX_PROCESS_SESSIONS) {
     throw new Error(`Process session limit reached (${MAX_PROCESS_SESSIONS}). Kill or let existing processes exit first.`);
+  }
+  if (requestSignal?.aborted) {
+    throw requestSignal.reason ?? new Error('process_start cancelled before spawn.');
   }
 
   return new Promise((resolve, reject) => {
@@ -211,13 +233,37 @@ function startPersistentProcess({ command, cwd, env }) {
       exitCode: null,
       signal: null,
     };
+    let committed = false;
+    let settled = false;
 
-    const onErrorBeforeSpawn = (error) => {
+    const cleanupPreCommit = () => {
+      requestSignal?.removeEventListener('abort', onAbort);
+    };
+    const rejectBeforeCommit = (error) => {
+      if (settled || committed) return;
+      settled = true;
+      cleanupPreCommit();
       reject(error);
     };
+    const onAbort = () => {
+      if (committed || settled) return;
+      killProcessGroup(child, 'SIGTERM');
+      setTimeout(() => killProcessGroup(child, 'SIGKILL'), 2_000).unref();
+      rejectBeforeCommit(requestSignal.reason ?? new Error('process_start cancelled before registration.'));
+    };
+    const onErrorBeforeSpawn = (error) => rejectBeforeCommit(error);
 
+    requestSignal?.addEventListener('abort', onAbort, { once: true });
     child.once('error', onErrorBeforeSpawn);
     child.once('spawn', () => {
+      if (settled || requestSignal?.aborted) {
+        if (!settled) onAbort();
+        return;
+      }
+
+      committed = true;
+      settled = true;
+      cleanupPreCommit();
       child.off('error', onErrorBeforeSpawn);
       processes.set(session.id, session);
 
@@ -261,6 +307,7 @@ const activeBridgeManagers = new Set();
 const NATIVE_TOOL_NAMES = new Set([
   'exec',
   'process_start',
+  'process_list',
   'process_read',
   'process_write',
   'process_kill',
@@ -311,7 +358,7 @@ async function createServer() {
           .describe('Maximum execution time in milliseconds.'),
       }),
     },
-    async (args) => jsonResult(await executeCommand(args)),
+    async (args, ctx) => jsonResult(await executeCommand(args, ctx.mcpReq.signal)),
   );
 
   server.registerTool(
@@ -332,18 +379,19 @@ async function createServer() {
       }),
       _meta: { 'openai/fileParams': ['file'] },
     },
-    async ({ file, destination, cwd, overwrite }) => {
-      const response = await fetch(file.download_url, { redirect: 'follow' });
+    async ({ file, destination, cwd, overwrite }, ctx) => {
+      const requestSignal = ctx.mcpReq.signal;
+      const response = await fetch(file.download_url, {
+        redirect: 'follow',
+        signal: requestSignal,
+      });
       if (!response.ok) throw new Error(`Failed to download provided file: HTTP ${response.status}`);
+      if (response.body === null) throw new Error('Provided file download returned no response body.');
 
       const contentLengthHeader = response.headers.get('content-length');
       const contentLength = contentLengthHeader === null ? null : Number(contentLengthHeader);
       if (contentLength !== null && Number.isFinite(contentLength) && contentLength > MAX_FILE_IMPORT_BYTES) {
-        throw new Error(`Provided file exceeds the ${MAX_FILE_IMPORT_BYTES}-byte import limit.`);
-      }
-
-      const data = Buffer.from(await response.arrayBuffer());
-      if (data.length > MAX_FILE_IMPORT_BYTES) {
+        await response.body.cancel();
         throw new Error(`Provided file exceeds the ${MAX_FILE_IMPORT_BYTES}-byte import limit.`);
       }
 
@@ -352,15 +400,50 @@ async function createServer() {
       const resolvedPath = destination
         ? path.resolve(baseDir, destination)
         : path.join(baseDir, 'inbox', `${randomUUID()}-${safeName}`);
-      await fs.mkdir(path.dirname(resolvedPath), { recursive: true });
-      await fs.writeFile(resolvedPath, data, { flag: overwrite ? 'w' : 'wx', mode: 0o600 });
+      const parentDir = path.dirname(resolvedPath);
+      await fs.mkdir(parentDir, { recursive: true });
+
+      const tempPath = path.join(parentDir, `.${path.basename(resolvedPath)}.import-${randomUUID()}`);
+      const hash = createHash('sha256');
+      let bytes = 0;
+      const limiter = new Transform({
+        transform(chunk, _encoding, callback) {
+          bytes += chunk.length;
+          if (bytes > MAX_FILE_IMPORT_BYTES) {
+            callback(new Error(`Provided file exceeds the ${MAX_FILE_IMPORT_BYTES}-byte import limit.`));
+            return;
+          }
+          hash.update(chunk);
+          callback(null, chunk);
+        },
+      });
+
+      try {
+        await pipeline(
+          Readable.fromWeb(response.body),
+          limiter,
+          createWriteStream(tempPath, { flags: 'wx', mode: 0o600 }),
+          { signal: requestSignal },
+        );
+        requestSignal.throwIfAborted();
+
+        if (overwrite) {
+          await fs.rename(tempPath, resolvedPath);
+        } else {
+          await fs.link(tempPath, resolvedPath);
+          await fs.unlink(tempPath);
+        }
+      } catch (error) {
+        await fs.rm(tempPath, { force: true }).catch(() => {});
+        throw error;
+      }
 
       return jsonResult({
         fileId: file.file_id,
         fileName: file.file_name ?? null,
         mimeType: file.mime_type ?? response.headers.get('content-type'),
-        bytes: data.length,
-        sha256: createHash('sha256').update(data).digest('hex'),
+        bytes,
+        sha256: hash.digest('hex'),
         path: resolvedPath,
       });
     },
@@ -393,10 +476,24 @@ async function createServer() {
         env: z.record(z.string(), z.string()).optional().describe('Additional environment variables.'),
       }),
     },
-    async (args) => {
-      const session = await startPersistentProcess(args);
+    async (args, ctx) => {
+      const session = await startPersistentProcess(args, ctx.mcpReq.signal);
       return jsonResult(processSummary(session));
     },
+  );
+
+  server.registerTool(
+    'process_list',
+    {
+      description:
+        'List process sessions created by process_start so persistent processes can be rediscovered across MCP client or conversation changes.',
+    },
+    async () =>
+      jsonResult({
+        processes: [...processes.values()]
+          .sort((a, b) => a.startedAt - b.startedAt)
+          .map((session) => processSummary(session)),
+      }),
   );
 
   server.registerTool(
