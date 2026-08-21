@@ -9,6 +9,7 @@ MCP server for controlling a dedicated Linux agent VM and forwarding tools from 
 
 - Execute finite shell commands with bounded output, timeouts, and MCP-request cancellation.
 - Read/list files structurally and apply strict unified diffs without fuzzy fallback.
+- Create, rediscover, and explicitly remove isolated Git worktree workspaces backed by shared repository storage.
 - Start, rediscover, read, write to, and terminate persistent/interactive processes.
 - Discover curated CLI capabilities available on the VM.
 - Bridge tools from upstream MCP servers over stdio or Streamable HTTP.
@@ -23,6 +24,9 @@ MCP server for controlling a dedicated Linux agent VM and forwarding tools from 
 - `read_file`
 - `list_directory`
 - `apply_patch`
+- `workspace_create`
+- `workspace_list`
+- `workspace_delete`
 - `import_file`
 - `command_info`
 - `present_file`
@@ -77,6 +81,14 @@ Artifact resources are opaque, process-local references with a 24-hour default T
 ChatGPT-hosted files can be imported into the VM with `import_file`; file bytes are streamed from the host-provided short-lived URL rather than passed through model context. Imports are limited to 256 MiB by default; override with `AGENT_FILE_IMPORT_MAX_BYTES`. Downloads are written to a same-directory temporary file and only committed after successful completion, so cancellation does not leave a partial destination.
 
 `read_file` and `list_directory` are intentionally bounded, non-search filesystem primitives for high-frequency coding reads. `apply_patch` uses strict `git apply` validation and apply passes: it does not enable recounting, 3-way merge, rejected-hunk files, unsafe paths, whitespace-insensitive context matching, or fuzzy fallback. Applicability failures are zero-write; this is not a claim of cross-file crash-atomic filesystem transactions. Patch validation honors MCP cancellation, while the mutation phase is allowed to finish once launched and is awaited during graceful server shutdown.
+
+Managed workspaces use shared bare Git repository stores plus isolated Git worktrees. `workspace_create` creates a detached worktree for both default and explicit revisions, returning an immutable server-generated workspace ID and a path that existing tools can use as `cwd`. `workspace_list` reconstructs state from the managed filesystem layout and Git worktree metadata rather than an MCP-local registry. `workspace_delete` refuses dirty worktrees unless `force: true` is explicit and never implicitly removes branches, repository caches, processes, or containers.
+
+The default managed roots are `~/.local/share/agent-vm/repositories` for shared bare repositories and `~/workspaces` for worktrees. Deployments/tests may override them with `AGENT_REPOSITORY_ROOT` and `AGENT_WORKSPACE_ROOT`. Repository authentication stays with normal Git mechanisms such as `gh auth git-credential` or SSH; HTTP(S) clone URLs containing embedded userinfo, query parameters, or fragments are rejected so credentials are not persisted in repository config. `workspace_list` also redacts those URL components if an origin is later changed out-of-band.
+
+Git worktrees are **working-tree isolation, not full-clone isolation**. Each workspace has its own working tree, index, and `HEAD`, while objects, refs/branches, tags, remotes, repository-level config, and stash remain shared within the repository store. Lifecycle operations are serialized per repository; Git remains authoritative for branch/worktree locking and out-of-band shell operations.
+
+Workspace creation owns repository bootstrap/fetch and worktree creation only. It does not install dependencies, create task branches, commit/stash changes, start processes, manage containers, or bootstrap projects. Creation cancellation cleans pre-commit partial work; once destructive `workspace_delete` removal begins, request cancellation no longer interrupts that mutation and graceful server shutdown waits for it to finish.
 
 Process sessions created by `process_start` are in-memory resources owned by the running `agent-vm-mcp` process. Use `process_list` to rediscover them across MCP client or conversation changes. On graceful server shutdown, running managed process groups receive `SIGTERM` and are escalated to `SIGKILL` after a bounded grace period. Sessions are not recoverable across server restarts; abnormal-exit cleanup belongs to the deployment supervisor/cgroup rather than a persisted PID/PGID registry.
 

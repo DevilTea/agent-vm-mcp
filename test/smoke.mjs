@@ -22,6 +22,19 @@ const filesystemOutsideRoot = `/tmp/agent-mcp-filesystem-outside-${process.pid}`
 const gitShimDir = `/tmp/agent-mcp-git-shim-${process.pid}`;
 const gitValidationTriggerPath = `/tmp/agent-mcp-git-validation-trigger-${process.pid}`;
 const gitValidationPidPath = `/tmp/agent-mcp-git-validation-pid-${process.pid}`;
+const workspaceRoot = `/tmp/agent-mcp-workspaces-${process.pid}`;
+const repositoryRoot = `/tmp/agent-mcp-repositories-${process.pid}`;
+const workspaceSeedRoot = `/tmp/agent-mcp-workspace-seed-${process.pid}`;
+const workspaceOrigin = `/tmp/agent-mcp-workspace-origin-${process.pid}.git`;
+const workspaceCancelOrigin = `/tmp/agent-mcp-workspace-cancel-origin-${process.pid}.git`;
+const workspaceConcurrencyTriggerPath = `/tmp/agent-mcp-workspace-concurrency-${process.pid}`;
+const workspaceConcurrencyLockDir = `/tmp/agent-mcp-workspace-concurrency-lock-${process.pid}`;
+const workspaceConcurrencyOverlapPath = `/tmp/agent-mcp-workspace-concurrency-overlap-${process.pid}`;
+const workspaceWorktreeAddTriggerPath = `/tmp/agent-mcp-workspace-add-trigger-${process.pid}`;
+const workspaceWorktreeAddPidPath = `/tmp/agent-mcp-workspace-add-pid-${process.pid}`;
+const workspaceWorktreeRemoveTriggerPath = `/tmp/agent-mcp-workspace-remove-trigger-${process.pid}`;
+const workspaceWorktreeRemovePidPath = `/tmp/agent-mcp-workspace-remove-pid-${process.pid}`;
+const workspaceRediscoveryBridgesConfig = `/tmp/agent-mcp-workspace-bridges-${process.pid}.json`;
 const importPayload = Buffer.from('file ingress smoke\n', 'utf8');
 let importServer;
 let clientClosed = false;
@@ -35,6 +48,8 @@ const transport = new StdioClientTransport({
     ...process.env,
     PATH: `${gitShimDir}:${process.env.PATH}`,
     MCP_BRIDGES_CONFIG: '/opt/agent-mcp/test/bridges.smoke.json',
+    AGENT_WORKSPACE_ROOT: workspaceRoot,
+    AGENT_REPOSITORY_ROOT: repositoryRoot,
   },
   stderr: 'inherit',
 });
@@ -51,6 +66,19 @@ try {
   await fs.rm(gitShimDir, { recursive: true, force: true });
   await fs.rm(gitValidationTriggerPath, { force: true });
   await fs.rm(gitValidationPidPath, { force: true });
+  await fs.rm(workspaceRoot, { recursive: true, force: true });
+  await fs.rm(repositoryRoot, { recursive: true, force: true });
+  await fs.rm(workspaceSeedRoot, { recursive: true, force: true });
+  await fs.rm(workspaceOrigin, { recursive: true, force: true });
+  await fs.rm(workspaceCancelOrigin, { recursive: true, force: true });
+  await fs.rm(workspaceConcurrencyTriggerPath, { force: true });
+  await fs.rm(workspaceConcurrencyLockDir, { recursive: true, force: true });
+  await fs.rm(workspaceConcurrencyOverlapPath, { force: true });
+  await fs.rm(workspaceWorktreeAddTriggerPath, { force: true });
+  await fs.rm(workspaceWorktreeAddPidPath, { force: true });
+  await fs.rm(workspaceWorktreeRemoveTriggerPath, { force: true });
+  await fs.rm(workspaceWorktreeRemovePidPath, { force: true });
+  await fs.rm(workspaceRediscoveryBridgesConfig, { force: true });
   await fs.mkdir(filesystemRoot, { recursive: true });
   await fs.mkdir(filesystemOutsideRoot, { recursive: true });
   await fs.mkdir(gitShimDir, { recursive: true });
@@ -63,6 +91,28 @@ done
 if [[ "$checking" == "1" && -f "${gitValidationTriggerPath}" ]]; then
   echo $$ > "${gitValidationPidPath}"
   sleep 30
+fi
+args=" $* "
+if [[ -f "${workspaceConcurrencyTriggerPath}" && "$args" == *" fetch "* ]]; then
+  if ! mkdir "${workspaceConcurrencyLockDir}" 2>/dev/null; then
+    echo overlap > "${workspaceConcurrencyOverlapPath}"
+    exit 97
+  fi
+  sleep 0.2
+  set +e
+  /usr/bin/git "$@"
+  status=$?
+  set -e
+  rmdir "${workspaceConcurrencyLockDir}" 2>/dev/null || true
+  exit $status
+fi
+if [[ -f "${workspaceWorktreeAddTriggerPath}" && "$args" == *" worktree add "* ]]; then
+  echo $$ > "${workspaceWorktreeAddPidPath}"
+  sleep 30
+fi
+if [[ -f "${workspaceWorktreeRemoveTriggerPath}" && "$args" == *" worktree remove "* ]]; then
+  echo $$ > "${workspaceWorktreeRemovePidPath}"
+  sleep 0.5
 fi
 exec /usr/bin/git "$@"
 `;
@@ -79,6 +129,21 @@ exec /usr/bin/git "$@"
   await fs.writeFile(`${filesystemOutsideRoot}/outside.txt`, 'outside\n', 'utf8');
   await fs.symlink('a.txt', `${filesystemRoot}/link.txt`);
   await fs.symlink(filesystemOutsideRoot, `${filesystemRoot}/outside-link`);
+  await fs.mkdir(workspaceSeedRoot, { recursive: true });
+  await execFileAsync('/usr/bin/git', ['init', '-b', 'main', workspaceSeedRoot]);
+  await execFileAsync('/usr/bin/git', ['-C', workspaceSeedRoot, 'config', 'user.name', 'Workspace Smoke']);
+  await execFileAsync('/usr/bin/git', ['-C', workspaceSeedRoot, 'config', 'user.email', 'workspace-smoke@example.com']);
+  await fs.writeFile(`${workspaceSeedRoot}/fixture.txt`, 'v1\n', 'utf8');
+  await execFileAsync('/usr/bin/git', ['-C', workspaceSeedRoot, 'add', 'fixture.txt']);
+  await execFileAsync('/usr/bin/git', ['-C', workspaceSeedRoot, 'commit', '-m', 'v1']);
+  await execFileAsync('/usr/bin/git', ['-C', workspaceSeedRoot, 'tag', 'v1']);
+  await fs.writeFile(`${workspaceSeedRoot}/fixture.txt`, 'main\n', 'utf8');
+  await execFileAsync('/usr/bin/git', ['-C', workspaceSeedRoot, 'commit', '-am', 'main']);
+  await execFileAsync('/usr/bin/git', ['init', '--bare', workspaceOrigin]);
+  await execFileAsync('/usr/bin/git', ['-C', workspaceSeedRoot, 'remote', 'add', 'origin', workspaceOrigin]);
+  await execFileAsync('/usr/bin/git', ['-C', workspaceSeedRoot, 'push', 'origin', 'main', '--tags']);
+  await execFileAsync('/usr/bin/git', ['-C', workspaceOrigin, 'symbolic-ref', 'HEAD', 'refs/heads/main']);
+  await execFileAsync('/usr/bin/git', ['clone', '--bare', workspaceOrigin, workspaceCancelOrigin]);
   await client.connect(transport);
 
   const allTools = [];
@@ -95,6 +160,9 @@ exec /usr/bin/git "$@"
     'read_file',
     'list_directory',
     'apply_patch',
+    'workspace_create',
+    'workspace_list',
+    'workspace_delete',
     'import_file',
     'process_start',
     'process_list',
@@ -130,6 +198,259 @@ exec /usr/bin/git "$@"
     }
     throw new Error(`${name} unexpectedly succeeded`);
   };
+
+  await expectToolFailure('workspace_create', {
+    repository: 'https://token@example.com/repository.git',
+  });
+
+  await expectToolFailure('workspace_create', {
+    repository: 'https://example.com/repository.git?token=secret',
+  });
+
+  const defaultWorkspace = parseJsonToolResult(
+    await client.callTool({
+      name: 'workspace_create',
+      arguments: { repository: workspaceOrigin, timeoutMs: 30_000 },
+    }),
+  );
+  if (defaultWorkspace.branch !== null || defaultWorkspace.revision !== 'origin/HEAD') {
+    throw new Error('workspace_create default checkout was not detached at remote HEAD');
+  }
+  if ((await fs.readFile(`${defaultWorkspace.path}/fixture.txt`, 'utf8')) !== 'main\n') {
+    throw new Error('workspace_create default checkout resolved the wrong revision');
+  }
+
+  const tagWorkspace = parseJsonToolResult(
+    await client.callTool({
+      name: 'workspace_create',
+      arguments: { repository: workspaceOrigin, revision: 'v1', timeoutMs: 30_000 },
+    }),
+  );
+  if (tagWorkspace.head === defaultWorkspace.head) {
+    throw new Error('workspace_create explicit tag did not resolve independently from remote HEAD');
+  }
+  if ((await fs.readFile(`${tagWorkspace.path}/fixture.txt`, 'utf8')) !== 'v1\n') {
+    throw new Error('workspace_create tag checkout resolved the wrong content');
+  }
+
+  await fs.writeFile(workspaceConcurrencyTriggerPath, '1\n', 'utf8');
+  const [concurrentResultA, concurrentResultB] = await Promise.all([
+    client.callTool({
+      name: 'workspace_create',
+      arguments: { repository: workspaceOrigin, revision: 'origin/main', timeoutMs: 30_000 },
+    }),
+    client.callTool({
+      name: 'workspace_create',
+      arguments: { repository: workspaceOrigin, revision: defaultWorkspace.head, timeoutMs: 30_000 },
+    }),
+  ]);
+  await fs.rm(workspaceConcurrencyTriggerPath, { force: true });
+  const concurrentWorkspaceA = parseJsonToolResult(concurrentResultA);
+  const concurrentWorkspaceB = parseJsonToolResult(concurrentResultB);
+  if (
+    concurrentWorkspaceA.id === concurrentWorkspaceB.id ||
+    concurrentWorkspaceA.repositoryKey !== defaultWorkspace.repositoryKey ||
+    concurrentWorkspaceB.repositoryKey !== defaultWorkspace.repositoryKey
+  ) {
+    throw new Error('concurrent workspace creation did not reuse the repository store safely');
+  }
+  try {
+    await fs.access(workspaceConcurrencyOverlapPath);
+    throw new Error('same-repository workspace lifecycle operations overlapped despite repository locking');
+  } catch (error) {
+    if (error?.code !== 'ENOENT') throw error;
+  }
+
+  const repositoryEntries = (await fs.readdir(repositoryRoot)).filter((name) => name.endsWith('.git'));
+  if (repositoryEntries.length !== 1) throw new Error('workspace repository store was not deduplicated');
+
+  const sharedRepositoryPath = `${repositoryRoot}/${defaultWorkspace.repositoryKey}.git`;
+  await execFileAsync('/usr/bin/git', [
+    '-C',
+    sharedRepositoryPath,
+    'remote',
+    'set-url',
+    'origin',
+    'https://secret-user:secret-pass@example.com/repository.git?token=secret#fragment',
+  ]);
+  const redactedWorkspaceList = parseJsonToolResult(
+    await client.callTool({ name: 'workspace_list', arguments: {} }),
+  ).workspaces;
+  const redactedWorkspace = redactedWorkspaceList.find((workspace) => workspace.id === defaultWorkspace.id);
+  if (
+    !redactedWorkspace?.repositoryCredentialsRedacted ||
+    redactedWorkspace.repository !== 'https://example.com/repository.git' ||
+    JSON.stringify(redactedWorkspace).includes('secret')
+  ) {
+    throw new Error('workspace_list leaked embedded repository credentials');
+  }
+  await execFileAsync('/usr/bin/git', ['-C', sharedRepositoryPath, 'remote', 'set-url', 'origin', workspaceOrigin]);
+
+  const beforeCancelledAdd = parseJsonToolResult(
+    await client.callTool({ name: 'workspace_list', arguments: {} }),
+  ).workspaces.filter((workspace) => workspace.state === 'ready').length;
+  await fs.writeFile(workspaceWorktreeAddTriggerPath, '1\n', 'utf8');
+  const addAbortController = new AbortController();
+  const cancelledAdd = client.callTool(
+    {
+      name: 'workspace_create',
+      arguments: { repository: workspaceOrigin, timeoutMs: 30_000 },
+    },
+    { signal: addAbortController.signal },
+  );
+  let addPid;
+  for (let attempt = 0; attempt < 80; attempt += 1) {
+    try {
+      addPid = Number((await fs.readFile(workspaceWorktreeAddPidPath, 'utf8')).trim());
+      break;
+    } catch {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+  }
+  if (!Number.isSafeInteger(addPid)) throw new Error('workspace_create cancellation worktree add did not start');
+  addAbortController.abort();
+  let addWasCancelled = false;
+  try {
+    await cancelledAdd;
+  } catch {
+    addWasCancelled = true;
+  }
+  if (!addWasCancelled) throw new Error('workspace_create cancellation did not reject the client call');
+  await fs.rm(workspaceWorktreeAddTriggerPath, { force: true });
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  const afterCancelledAdd = parseJsonToolResult(
+    await client.callTool({ name: 'workspace_list', arguments: {} }),
+  ).workspaces.filter((workspace) => workspace.state === 'ready').length;
+  if (afterCancelledAdd !== beforeCancelledAdd) {
+    throw new Error('workspace_create cancellation left a registered workspace');
+  }
+
+  await fs.writeFile(workspaceConcurrencyTriggerPath, '1\n', 'utf8');
+  const bootstrapAbortController = new AbortController();
+  const cancelledBootstrap = client.callTool(
+    {
+      name: 'workspace_create',
+      arguments: { repository: workspaceCancelOrigin, timeoutMs: 30_000 },
+    },
+    { signal: bootstrapAbortController.signal },
+  );
+  await new Promise((resolve) => setTimeout(resolve, 75));
+  bootstrapAbortController.abort();
+  let bootstrapWasCancelled = false;
+  try {
+    await cancelledBootstrap;
+  } catch {
+    bootstrapWasCancelled = true;
+  }
+  if (!bootstrapWasCancelled) throw new Error('workspace repository bootstrap cancellation did not reject');
+  await fs.rm(workspaceConcurrencyTriggerPath, { force: true });
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  const storesAfterCancelledBootstrap = (await fs.readdir(repositoryRoot)).filter((name) => name.endsWith('.git'));
+  if (storesAfterCancelledBootstrap.length !== 1) {
+    throw new Error('cancelled repository bootstrap published a partial repository store');
+  }
+  if ((await fs.readdir(repositoryRoot)).some((name) => name.startsWith('.tmp-'))) {
+    throw new Error('cancelled repository bootstrap left a temporary repository store');
+  }
+
+  await fs.mkdir(`${workspaceRoot}/ws-invalid-state`);
+  const listedWithInvalid = parseJsonToolResult(
+    await client.callTool({ name: 'workspace_list', arguments: {} }),
+  ).workspaces;
+  if (!listedWithInvalid.some((workspace) => workspace.id === 'ws-invalid-state' && workspace.state === 'invalid')) {
+    throw new Error('workspace_list silently ignored malformed managed state');
+  }
+  await fs.rm(`${workspaceRoot}/ws-invalid-state`, { recursive: true, force: true });
+
+  await fs.writeFile(workspaceRediscoveryBridgesConfig, '{\"version\":1,\"bridges\":[]}\n', 'utf8');
+  const rediscoveryClient = new Client({ name: 'agent-mcp-workspace-rediscovery', version: '1.0.0' });
+  const rediscoveryTransport = new StdioClientTransport({
+    command: node,
+    args: ['/opt/agent-mcp/src/index.js'],
+    cwd: '/home/agent',
+    env: {
+      ...process.env,
+      PATH: `${gitShimDir}:${process.env.PATH}`,
+      MCP_BRIDGES_CONFIG: workspaceRediscoveryBridgesConfig,
+      AGENT_WORKSPACE_ROOT: workspaceRoot,
+      AGENT_REPOSITORY_ROOT: repositoryRoot,
+    },
+    stderr: 'inherit',
+  });
+  try {
+    await rediscoveryClient.connect(rediscoveryTransport);
+    const rediscovered = parseJsonToolResult(
+      await rediscoveryClient.callTool({ name: 'workspace_list', arguments: {} }),
+    ).workspaces.filter((workspace) => workspace.state === 'ready');
+    if (rediscovered.length !== 4 || rediscovered.some((workspace) => workspace.repositoryKey !== defaultWorkspace.repositoryKey)) {
+      throw new Error('workspace_list did not reconstruct durable state in a fresh MCP process');
+    }
+  } finally {
+    await rediscoveryClient.close();
+  }
+
+  await fs.writeFile(`${defaultWorkspace.path}/dirty.txt`, 'dirty\n', 'utf8');
+  await expectToolFailure('workspace_delete', { workspaceId: defaultWorkspace.id });
+  if (!(await fs.stat(defaultWorkspace.path)).isDirectory()) {
+    throw new Error('workspace_delete removed a dirty workspace without force');
+  }
+  parseJsonToolResult(
+    await client.callTool({
+      name: 'workspace_delete',
+      arguments: { workspaceId: defaultWorkspace.id, force: true },
+    }),
+  );
+
+  await fs.writeFile(workspaceWorktreeRemoveTriggerPath, '1\n', 'utf8');
+  const removeAbortController = new AbortController();
+  const cancelledRemove = client.callTool(
+    {
+      name: 'workspace_delete',
+      arguments: { workspaceId: tagWorkspace.id },
+    },
+    { signal: removeAbortController.signal },
+  );
+  let removePid;
+  for (let attempt = 0; attempt < 80; attempt += 1) {
+    try {
+      removePid = Number((await fs.readFile(workspaceWorktreeRemovePidPath, 'utf8')).trim());
+      break;
+    } catch {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+  }
+  if (!Number.isSafeInteger(removePid)) throw new Error('workspace_delete mutation did not start');
+  removeAbortController.abort();
+  let removeResponseCancelled = false;
+  try {
+    await cancelledRemove;
+  } catch {
+    removeResponseCancelled = true;
+  }
+  if (!removeResponseCancelled) throw new Error('workspace_delete cancelled response unexpectedly completed');
+  await fs.rm(workspaceWorktreeRemoveTriggerPath, { force: true });
+  let tagWorkspaceRemoved = false;
+  for (let attempt = 0; attempt < 80; attempt += 1) {
+    try {
+      await fs.access(tagWorkspace.path);
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    } catch (error) {
+      if (error?.code !== 'ENOENT') throw error;
+      tagWorkspaceRemoved = true;
+      break;
+    }
+  }
+  if (!tagWorkspaceRemoved) throw new Error('workspace_delete cancellation interrupted committed removal');
+
+  for (const workspace of [concurrentWorkspaceA, concurrentWorkspaceB]) {
+    parseJsonToolResult(
+      await client.callTool({ name: 'workspace_delete', arguments: { workspaceId: workspace.id } }),
+    );
+  }
+  const finalWorkspaceList = parseJsonToolResult(
+    await client.callTool({ name: 'workspace_list', arguments: {} }),
+  ).workspaces;
+  if (finalWorkspaceList.length !== 0) throw new Error('workspace lifecycle smoke left managed workspaces behind');
 
   const rangedRead = parseJsonToolResult(
     await client.callTool({
@@ -789,5 +1110,18 @@ exec /usr/bin/git "$@"
   await fs.rm(gitShimDir, { recursive: true, force: true });
   await fs.rm(gitValidationTriggerPath, { force: true });
   await fs.rm(gitValidationPidPath, { force: true });
+  await fs.rm(workspaceRoot, { recursive: true, force: true });
+  await fs.rm(repositoryRoot, { recursive: true, force: true });
+  await fs.rm(workspaceSeedRoot, { recursive: true, force: true });
+  await fs.rm(workspaceOrigin, { recursive: true, force: true });
+  await fs.rm(workspaceCancelOrigin, { recursive: true, force: true });
+  await fs.rm(workspaceConcurrencyTriggerPath, { force: true });
+  await fs.rm(workspaceConcurrencyLockDir, { recursive: true, force: true });
+  await fs.rm(workspaceConcurrencyOverlapPath, { force: true });
+  await fs.rm(workspaceWorktreeAddTriggerPath, { force: true });
+  await fs.rm(workspaceWorktreeAddPidPath, { force: true });
+  await fs.rm(workspaceWorktreeRemoveTriggerPath, { force: true });
+  await fs.rm(workspaceWorktreeRemovePidPath, { force: true });
+  await fs.rm(workspaceRediscoveryBridgesConfig, { force: true });
   if (importServer) await new Promise((resolve) => importServer.close(resolve));
 }

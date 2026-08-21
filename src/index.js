@@ -17,6 +17,7 @@ import { ArtifactStore } from './artifacts/artifact-store.js';
 import { PRESENT_FILE_TOOL } from './artifacts/constants.js';
 import { registerArtifactSystem } from './artifacts/register.js';
 import { applyUnifiedPatch, listDirectory, readTextFile, waitForFilesystemMutations } from './filesystem.js';
+import { workspaceCreate, workspaceDelete, workspaceList, waitForWorkspaceMutations } from './workspaces.js';
 
 const MAX_EXEC_OUTPUT_BYTES = 2 * 1024 * 1024;
 const MAX_PROCESS_STREAM_BYTES = 4 * 1024 * 1024;
@@ -340,6 +341,9 @@ const NATIVE_TOOL_NAMES = new Set([
   'read_file',
   'list_directory',
   'apply_patch',
+  'workspace_create',
+  'workspace_list',
+  'workspace_delete',
   'process_start',
   'process_list',
   'process_read',
@@ -354,6 +358,7 @@ const NATIVE_TOOL_NAMES = new Set([
 
 async function shutdown() {
   await waitForFilesystemMutations();
+  await waitForWorkspaceMutations();
   await stopManagedProcesses();
   await Promise.allSettled(
     [...activeBridgeManagers].map((manager) => manager.close()),
@@ -435,6 +440,50 @@ async function createServer() {
       }),
     },
     async (args, ctx) => jsonResult(await applyUnifiedPatch(args, ctx.mcpReq.signal)),
+  );
+
+  server.registerTool(
+    'workspace_create',
+    {
+      description:
+        'Create an isolated managed Git worktree backed by shared repository storage. Returns an immutable workspace ID and path for use as cwd with existing tools.',
+      inputSchema: z.object({
+        repository: z.string().min(1).describe('Git clone source. HTTP(S) URLs must not contain embedded userinfo, query parameters, or fragments; use Git credential helpers instead.'),
+        revision: z.string().min(1).optional().describe('Optional Git commit-ish. Defaults to the remote default branch.'),
+        timeoutMs: z
+          .number()
+          .int()
+          .min(1_000)
+          .max(600_000)
+          .default(120_000)
+          .describe('Maximum time for repository bootstrap/fetch and worktree creation.'),
+      }),
+    },
+    async (args, ctx) => jsonResult(await workspaceCreate(args, ctx.mcpReq.signal)),
+  );
+
+  server.registerTool(
+    'workspace_list',
+    {
+      description:
+        'Rediscover managed Git workspaces from durable filesystem and Git worktree state, including repository, HEAD/branch, and dirty status.',
+    },
+    async () => jsonResult(await workspaceList()),
+  );
+
+  server.registerTool(
+    'workspace_delete',
+    {
+      description:
+        'Remove a managed Git worktree by immutable workspace ID. Dirty workspaces are refused unless force is explicitly true.',
+      inputSchema: z.object({
+        workspaceId: z
+          .string()
+          .regex(/^ws-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i),
+        force: z.boolean().default(false).describe('Discard dirty workspace content when true.'),
+      }),
+    },
+    async (args, ctx) => jsonResult(await workspaceDelete(args, ctx.mcpReq.signal)),
   );
 
   server.registerTool(
@@ -674,6 +723,7 @@ async function createServer() {
     if (closed) return;
     closed = true;
     await waitForFilesystemMutations();
+    await waitForWorkspaceMutations();
     await stopManagedProcesses();
     activeBridgeManagers.delete(bridgeManager);
     await bridgeManager.close();
