@@ -11,7 +11,7 @@ import { StdioClientTransport } from '@modelcontextprotocol/client/stdio';
 
 import { ArtifactStore } from '../src/artifacts/artifact-store.js';
 
-const node = '/home/agent/.local/share/pnpm/bin/node';
+const node = '/home/agent/.local/share/mise/installs/node/24.19.0/bin/node';
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const serverEntry = path.join(projectRoot, 'src/index.js');
 const smokeBridgeConfig = `/tmp/agent-mcp-bridges-smoke-${process.pid}.json`;
@@ -59,6 +59,7 @@ const transport = new StdioClientTransport({
     ...process.env,
     PATH: `${gitShimDir}:${process.env.PATH}`,
     MCP_BRIDGES_CONFIG: smokeBridgeConfig,
+    AGENT_MCP_CAPABILITIES_CONFIG: path.join(projectRoot, 'config/capabilities.json'),
     AGENT_ARTIFACT_MAX_BYTES: String(smokeArtifactMaxBytes),
     AGENT_WORKSPACE_ROOT: workspaceRoot,
     AGENT_REPOSITORY_ROOT: repositoryRoot,
@@ -1071,14 +1072,16 @@ exec /usr/bin/git "$@"
 
   const commandInfo = await client.callTool({
     name: 'command_info',
-    arguments: { names: ['git', 'pnpm', 'definitely-not-an-agent-command'] },
+    arguments: { names: ['git', 'mise', 'pnpm', 'definitely-not-an-agent-command'] },
   });
   const commandInfoText = commandInfo.content?.find((item) => item.type === 'text')?.text ?? '';
   const inspectedCommands = JSON.parse(commandInfoText).commands;
   const git = inspectedCommands.find((command) => command.name === 'git');
+  const mise = inspectedCommands.find((command) => command.name === 'mise');
   const pnpm = inspectedCommands.find((command) => command.name === 'pnpm');
   const missing = inspectedCommands.find((command) => command.name === 'definitely-not-an-agent-command');
   if (!git?.available || !git.curated || !git.version) throw new Error('git command_info failed');
+  if (!mise?.available || !mise.curated || !mise.version) throw new Error('mise command_info failed');
   if (!pnpm?.available || !pnpm.curated || !pnpm.version) throw new Error('pnpm command_info failed');
   if (missing?.available || missing?.curated) throw new Error('missing command_info failed');
 
@@ -1089,6 +1092,9 @@ exec /usr/bin/git "$@"
   if (!capabilityData.mcp?.nativeTools?.includes('present_file')) throw new Error('present_file capability missing');
   if (!capabilityData.runtimes?.some((runtime) => runtime.name === 'node' && runtime.available)) {
     throw new Error('node runtime capability missing');
+  }
+  if (!capabilityData.runtimes?.some((runtime) => runtime.name === 'mise' && runtime.available)) {
+    throw new Error('mise runtime capability missing');
   }
   const docker = capabilityData.cli?.categories?.container?.find((command) => command.name === 'docker');
   if (!docker?.available || !docker.version) throw new Error('docker capability missing');

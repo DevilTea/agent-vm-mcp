@@ -2,9 +2,9 @@
 set -euo pipefail
 
 export HOME=/home/agent
-export PATH=/home/agent/.local/share/pnpm/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export PATH=/home/agent/.local/share/mise/shims:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
-NODE=/home/agent/.local/share/pnpm/bin/node
+NODE=/home/agent/.local/share/mise/installs/node/24.19.0/bin/node
 WORKDIR="$(mktemp -d /tmp/agent-mcp-playwright-smoke.XXXXXX)"
 OUTPUT_DIR="${PLAYWRIGHT_MCP_OUTPUT_DIR:-$WORKDIR/output}"
 WORKING_DIR="${PLAYWRIGHT_MCP_WORKING_DIR:-$WORKDIR/work}"

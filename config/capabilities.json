@@ -12,6 +12,7 @@
     { "name": "gcc", "category": "build", "summary": "GNU C compiler", "versionArgs": ["--version"] },
     { "name": "g++", "category": "build", "summary": "GNU C++ compiler", "versionArgs": ["--version"] },
     { "name": "python3", "category": "runtime", "summary": "Python runtime", "versionArgs": ["--version"] },
+    { "name": "mise", "category": "runtime", "summary": "Versioned developer toolchain manager", "versionArgs": ["--version"] },
     { "name": "node", "category": "runtime", "summary": "Node.js runtime", "versionArgs": ["--version"] },
     { "name": "pnpm", "category": "runtime", "summary": "pnpm package manager", "versionArgs": ["--version"] },
     { "name": "tmux", "category": "process", "summary": "Terminal multiplexer", "versionArgs": ["-V"] },

@@ -42,8 +42,10 @@ Additional tools can be exported by configured MCP bridges.
 
 ## Requirements
 
-- Node.js
-- pnpm 11
+- Node.js 24.19.0
+- pnpm 11.22.0
+
+The dedicated Agent VM provisions both through `mise`; repository-local mise configuration may override the fallback versions only after explicit trust.
 
 ## Install
 
@@ -58,6 +60,28 @@ sudo ./scripts/provision-docker.sh
 ```
 
 The script installs Ubuntu's `docker.io`, `docker-compose-v2`, and `docker-buildx` packages, enables the Docker service, and grants the dedicated `agent` user access to the local Unix socket through the `docker` group. Existing long-running services or login sessions must be restarted after first adding the group so they inherit the new supplementary group.
+
+Provision the versioned developer toolchain with:
+
+```bash
+sudo ./scripts/provision-mise.sh
+```
+
+The mise provisioner installs mise through the Ubuntu-supported PPA path, installs the exact Agent VM fallback versions (Node `24.19.0`, pnpm `11.22.0`), configures non-interactive shims, and migrates the systemd/tunnel/Playwright launch paths away from the legacy pnpm-managed Node executable. It does **not** restart `agent-tunnel.service` because doing so terminates the active MCP connection. Restart and validate the service separately, then remove the old pnpm-managed executable/global Node environment with:
+
+```bash
+sudo ./scripts/provision-mise.sh --cleanup-legacy
+```
+
+The global mise policy enables paranoid trust checking and disables implicit installation and system-runtime fallback. Before provisioning a repository-local mise toolchain, inspect its committed mise files as ordinary repository content, then explicitly trust and install them:
+
+```bash
+mise trust --show
+mise trust ./mise.toml
+mise install
+```
+
+Do not make `workspace_create` trust or install project toolchains. A workspace is only repository/worktree lifecycle; toolchain trust and installation remain explicit follow-up actions.
 
 ## Run
 

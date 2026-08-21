@@ -1,0 +1,9 @@
+[tools]
+node = "24.19.0"
+pnpm = "11.22.0"
+
+[settings]
+paranoid = true
+auto_install = false
+not_found_auto_install = false
+not_found_system_fallback = false
