@@ -295,11 +295,41 @@ function processSummary(session) {
   };
 }
 
-function stopManagedProcesses() {
-  for (const session of processes.values()) {
-    if (session.exitedAt === null) {
-      killProcessGroup(session.child, 'SIGTERM');
-    }
+function waitForProcessExit(session) {
+  if (session.exitedAt !== null) return Promise.resolve();
+  return new Promise((resolve) => session.child.once('close', resolve));
+}
+
+function waitForDelay(ms) {
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    timer.unref();
+  });
+}
+
+async function stopManagedProcesses() {
+  const running = [...processes.values()].filter((session) => session.exitedAt === null);
+  if (running.length === 0) return;
+
+  for (const session of running) {
+    killProcessGroup(session.child, 'SIGTERM');
+  }
+
+  await Promise.race([
+    Promise.all(running.map((session) => waitForProcessExit(session))),
+    waitForDelay(2_000),
+  ]);
+
+  const survivors = running.filter((session) => session.exitedAt === null);
+  for (const session of survivors) {
+    killProcessGroup(session.child, 'SIGKILL');
+  }
+
+  if (survivors.length > 0) {
+    await Promise.race([
+      Promise.all(survivors.map((session) => waitForProcessExit(session))),
+      waitForDelay(500),
+    ]);
   }
 }
 
@@ -319,7 +349,7 @@ const NATIVE_TOOL_NAMES = new Set([
 ]);
 
 async function shutdown() {
-  stopManagedProcesses();
+  await stopManagedProcesses();
   await Promise.allSettled(
     [...activeBridgeManagers].map((manager) => manager.close()),
   );
@@ -597,7 +627,7 @@ async function createServer() {
   server.close = async () => {
     if (closed) return;
     closed = true;
-    stopManagedProcesses();
+    await stopManagedProcesses();
     activeBridgeManagers.delete(bridgeManager);
     await bridgeManager.close();
     await originalClose();

@@ -16,8 +16,10 @@ const importedFilePath = '/tmp/agent-mcp-import-file-smoke.txt';
 const cancelledImportPath = '/tmp/agent-mcp-import-file-cancelled.txt';
 const execCancelPidPath = '/tmp/agent-mcp-exec-cancel.pid';
 const execCancelMarkerPath = '/tmp/agent-mcp-exec-cancel.marker';
+const shutdownProcessPidPath = '/tmp/agent-mcp-shutdown-process.pid';
 const importPayload = Buffer.from('file ingress smoke\n', 'utf8');
 let importServer;
+let clientClosed = false;
 const execFileAsync = promisify(execFile);
 const client = new Client({ name: 'agent-mcp-smoke', version: '1.0.0' });
 const transport = new StdioClientTransport({
@@ -37,6 +39,7 @@ try {
   await fs.rm(cancelledImportPath, { force: true });
   await fs.rm(execCancelPidPath, { force: true });
   await fs.rm(execCancelMarkerPath, { force: true });
+  await fs.rm(shutdownProcessPidPath, { force: true });
   await client.connect(transport);
 
   const allTools = [];
@@ -443,16 +446,78 @@ try {
     arguments: { processId, signal: 'SIGTERM' },
   });
 
+  await client.callTool({
+    name: 'process_start',
+    arguments: {
+      command: `trap '' TERM; echo $$ > ${shutdownProcessPidPath}; while :; do sleep 30; done`,
+    },
+  });
+  let shutdownProcessPid;
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    try {
+      shutdownProcessPid = Number((await fs.readFile(shutdownProcessPidPath, 'utf8')).trim());
+      break;
+    } catch {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+  }
+  if (!Number.isSafeInteger(shutdownProcessPid)) {
+    throw new Error('graceful shutdown smoke process did not start');
+  }
+
+  const serverPid = transport.pid;
+  if (!Number.isSafeInteger(serverPid)) {
+    throw new Error('MCP stdio server PID unavailable for graceful shutdown smoke');
+  }
+
+  const shutdownStartedAt = Date.now();
+  process.kill(serverPid, 'SIGTERM');
+
+  let managedProcessExited = false;
+  for (let attempt = 0; attempt < 70; attempt += 1) {
+    try {
+      process.kill(shutdownProcessPid, 0);
+    } catch (error) {
+      if (error?.code !== 'ESRCH') throw error;
+      managedProcessExited = true;
+      break;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  if (!managedProcessExited) {
+    throw new Error('graceful shutdown left a managed process running');
+  }
+  if (Date.now() - shutdownStartedAt > 3_500) {
+    throw new Error('managed-process graceful shutdown exceeded bounded TERM→KILL window');
+  }
+
+  let serverExited = false;
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    try {
+      process.kill(serverPid, 0);
+    } catch (error) {
+      if (error?.code !== 'ESRCH') throw error;
+      serverExited = true;
+      break;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  if (!serverExited) throw new Error('MCP server did not exit after SIGTERM');
+
+  await client.close();
+  clientClosed = true;
+
   console.log(
     `PASS tools=${names.length} playwrightForwarded=${playwright.tools.length} artifact=${screenshotArtifact.name}`,
   );
 } finally {
-  await client.close();
+  if (!clientClosed) await client.close();
   await fs.rm(presentFilePath, { force: true });
   await fs.rm(viewerScriptPath, { force: true });
   await fs.rm(importedFilePath, { force: true });
   await fs.rm(cancelledImportPath, { force: true });
   await fs.rm(execCancelPidPath, { force: true });
   await fs.rm(execCancelMarkerPath, { force: true });
+  await fs.rm(shutdownProcessPidPath, { force: true });
   if (importServer) await new Promise((resolve) => importServer.close(resolve));
 }
