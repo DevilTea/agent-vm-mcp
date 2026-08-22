@@ -1,12 +1,12 @@
 {
   "name": "agent-mcp",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Agent execution MCP with pluggable upstream MCP bridges",
   "main": "index.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
     "start": "node src/index.js",
-    "smoke": "bash test/browser-takeover-smoke.sh && node test/smoke.mjs"
+    "smoke": "bash test/browser-takeover-smoke.sh && bash test/agent-herdr-deployment-smoke.sh && node test/agents-smoke.mjs && node test/agent-mcp-error-smoke.mjs && node test/smoke.mjs"
   },
   "keywords": [],
   "author": "",

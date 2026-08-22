@@ -11,6 +11,15 @@ import { serveStdio } from '@modelcontextprotocol/server/stdio';
 import * as z from 'zod/v4';
 
 import { McpBridgeManager } from './mcp-bridge.js';
+import {
+  agentCapabilities,
+  agentGet,
+  agentPrompt,
+  agentRead,
+  agentSendKeys,
+  agentStart,
+  agentStop,
+} from './agents.js';
 import { collectCapabilities, inspectCommands } from './capabilities.js';
 import { createBridgeToolAdapterFactory } from './adapters/index.js';
 import { createBridgeCallPolicyFactory } from './policies/index.js';
@@ -397,6 +406,13 @@ const NATIVE_TOOL_NAMES = new Set([
   'workspace_create',
   'workspace_list',
   'workspace_delete',
+  'agent_capabilities',
+  'agent_start',
+  'agent_get',
+  'agent_read',
+  'agent_prompt',
+  'agent_send_keys',
+  'agent_stop',
   'process_start',
   'process_list',
   'process_read',
@@ -430,7 +446,7 @@ for (const signal of ['SIGTERM', 'SIGINT']) {
 async function createServer() {
   const server = new McpServer({
     name: 'agent-vm-control',
-    version: '0.4.0',
+    version: '0.5.0',
   });
   const artifactStore = new ArtifactStore();
   activeArtifactStores.add(artifactStore);
@@ -542,6 +558,121 @@ async function createServer() {
       }),
     },
     async (args, ctx) => jsonResult(await workspaceDelete(args, ctx.mcpReq.signal)),
+  );
+
+  server.registerTool(
+    'agent_capabilities',
+    {
+      description:
+        'Discover the Herdr agent runtime, configured persistent session, installed coding harnesses, active MCP-managed agents, and per-harness installed skills.',
+      inputSchema: z.object({}),
+    },
+    async (_args, ctx) => jsonResult(await agentCapabilities({ signal: ctx.mcpReq.signal })),
+  );
+
+  server.registerTool(
+    'agent_start',
+    {
+      description:
+        'Start a persistent interactive coding agent in a dedicated Herdr workspace. Production persistence requires the separately managed Herdr service; startup trust/auth prompts are reported, never auto-approved.',
+      inputSchema: z.object({
+        harness: z.enum(['codex', 'agy', 'claude']).describe('Coding harness to launch.'),
+        cwd: z.string().min(1).describe('Existing directory to use as the agent workspace.'),
+        model: z.string().min(1).max(128).optional().describe('Optional harness model override.'),
+        effort: z
+          .enum(['low', 'medium', 'high', 'xhigh', 'max', 'ultra'])
+          .optional()
+          .describe('Optional reasoning-effort override; supported values vary by harness.'),
+        timeoutMs: z
+          .number()
+          .int()
+          .min(5_000)
+          .max(300_000)
+          .default(60_000)
+          .describe('Maximum time to wait for interactive harness startup.'),
+      }),
+    },
+    async (args, ctx) => jsonResult(await agentStart(args, ctx.mcpReq.signal)),
+  );
+
+  const agentIdSchema = z
+    .string()
+    .regex(/^agent-[0-9a-f]{26}$/)
+    .describe('MCP-managed persistent agent ID returned by agent_start.');
+
+  server.registerTool(
+    'agent_get',
+    {
+      description:
+        'Inspect one MCP-managed Herdr agent, including lifecycle state and detected interactions that require an orchestration policy decision. requiresDecision means the caller must apply its delegation policy; it does not imply automatic human escalation.',
+      inputSchema: z.object({ agentId: agentIdSchema }),
+    },
+    async (args, ctx) => jsonResult(await agentGet(args, ctx.mcpReq.signal)),
+  );
+
+  server.registerTool(
+    'agent_read',
+    {
+      description:
+        'Read bounded terminal transcript from an MCP-managed Herdr agent. Use recent-unwrapped for orchestration-oriented text inspection.',
+      inputSchema: z.object({
+        agentId: agentIdSchema,
+        source: z
+          .enum(['visible', 'recent', 'recent-unwrapped', 'detection'])
+          .default('recent-unwrapped'),
+        lines: z.number().int().min(1).max(1_000).default(120),
+      }),
+    },
+    async (args, ctx) => jsonResult(await agentRead(args, ctx.mcpReq.signal)),
+  );
+
+  server.registerTool(
+    'agent_prompt',
+    {
+      description:
+        'Submit a task to an MCP-managed coding agent after a positive readiness check. Preflight or pre-spawn rejection is not submitted; timeout/cancellation after Herdr starts is possibly submitted and unsafe to auto-retry.',
+      inputSchema: z.object({
+        agentId: agentIdSchema,
+        task: z.string().min(1).max(100_000).refine((task) => !task.includes('\0'), 'task must not contain NUL characters'),
+        skills: z
+          .array(z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/))
+          .max(16)
+          .default([]),
+        wait: z.boolean().default(true),
+        until: z
+          .array(z.enum(['idle', 'working', 'blocked', 'done', 'unknown']))
+          .max(5)
+          .default([]),
+        timeoutMs: z.number().int().min(1_000).max(600_000).default(120_000),
+      }),
+    },
+    async (args, ctx) => jsonResult(await agentPrompt(args, ctx.mcpReq.signal)),
+  );
+
+  server.registerTool(
+    'agent_send_keys',
+    {
+      description:
+        'Send only bounded control/navigation keys to an MCP-managed agent terminal after the orchestrator has inspected the current interaction and determined the action is authorized under the caller delegation policy. The runtime does not grant approval or decide whether human escalation is required. Arbitrary text must use agent_prompt instead.',
+      inputSchema: z.object({
+        agentId: agentIdSchema,
+        keys: z
+          .array(z.enum(['enter', 'esc', 'up', 'down', 'left', 'right', 'tab', 'backspace']))
+          .min(1)
+          .max(16),
+      }),
+    },
+    async (args, ctx) => jsonResult(await agentSendKeys(args, ctx.mcpReq.signal)),
+  );
+
+  server.registerTool(
+    'agent_stop',
+    {
+      description:
+        'Stop an MCP-managed persistent agent by closing its dedicated Herdr workspace. This terminates that agent terminal without stopping the shared Herdr session or other agents.',
+      inputSchema: z.object({ agentId: agentIdSchema }),
+    },
+    async (args, ctx) => jsonResult(await agentStop(args, ctx.mcpReq.signal)),
   );
 
   server.registerTool(
@@ -795,4 +926,4 @@ async function createServer() {
 }
 
 void serveStdio(createServer);
-console.error('agent-vm-control MCP server v0.4.0 running on stdio');
+console.error('agent-vm-control MCP server v0.5.0 running on stdio');

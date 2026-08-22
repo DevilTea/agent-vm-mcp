@@ -70,6 +70,8 @@ const transport = new StdioClientTransport({
     AGENT_ARTIFACT_MAX_BYTES: String(smokeArtifactMaxBytes),
     AGENT_WORKSPACE_ROOT: workspaceRoot,
     AGENT_REPOSITORY_ROOT: repositoryRoot,
+    AGENT_HERDR_BIN: `/tmp/agent-mcp-missing-herdr-${process.pid}`,
+    AGENT_HERDR_BOOTSTRAP: 'external',
   },
   stderr: 'inherit',
 });
@@ -265,6 +267,13 @@ exec /usr/bin/git "$@"
     'workspace_create',
     'workspace_list',
     'workspace_delete',
+    'agent_capabilities',
+    'agent_start',
+    'agent_get',
+    'agent_read',
+    'agent_prompt',
+    'agent_send_keys',
+    'agent_stop',
     'import_file',
     'process_start',
     'process_list',
@@ -291,6 +300,31 @@ exec /usr/bin/git "$@"
   }
   if (names.includes('browser_screenshot_poc')) {
     throw new Error('Legacy browser_screenshot_poc should not be registered');
+  }
+
+  const toolByName = new Map(allTools.map((tool) => [tool.name, tool]));
+  const agentPromptTool = toolByName.get('agent_prompt');
+  if (!agentPromptTool) throw new Error('agent_prompt schema missing');
+  const agentPromptProperties = agentPromptTool.inputSchema?.properties ?? {};
+  for (const property of ['agentId', 'task', 'skills', 'wait', 'until', 'timeoutMs']) {
+    if (!(property in agentPromptProperties)) throw new Error(`agent_prompt schema missing property: ${property}`);
+  }
+  const agentGetTool = toolByName.get('agent_get');
+  if (!agentGetTool?.description?.includes('delegation policy')) {
+    throw new Error('agent_get description does not delegate interaction decisions to orchestration policy');
+  }
+  const agentSendKeysTool = toolByName.get('agent_send_keys');
+  if (!agentSendKeysTool?.description?.includes('delegation policy')) {
+    throw new Error('agent_send_keys description does not require caller delegation-policy authorization');
+  }
+  if (!agentSendKeysTool.description.includes('does not grant approval')) {
+    throw new Error('agent_send_keys description does not preserve runtime/policy boundary');
+  }
+
+  const agentStartTool = toolByName.get('agent_start');
+  const agentStartProperties = agentStartTool?.inputSchema?.properties ?? {};
+  for (const property of ['harness', 'cwd', 'model', 'effort', 'timeoutMs']) {
+    if (!(property in agentStartProperties)) throw new Error(`agent_start schema missing property: ${property}`);
   }
   const expectedLspTools = [
     'lsp_hover',
@@ -345,6 +379,21 @@ exec /usr/bin/git "$@"
     }
     throw new Error(`${name} unexpectedly succeeded`);
   };
+
+  const agentCapabilitiesResult = parseJsonToolResult(
+    await client.callTool({ name: 'agent_capabilities', arguments: {} }),
+  );
+  if (agentCapabilitiesResult.runtime?.kind !== 'herdr') throw new Error('agent_capabilities runtime kind mismatch');
+  if (agentCapabilitiesResult.runtime.available !== false) throw new Error('missing Herdr should be reported unavailable');
+  if (agentCapabilitiesResult.runtime.error?.code !== 'herdr_unavailable') {
+    throw new Error('missing Herdr did not return structured capability error');
+  }
+  if (agentCapabilitiesResult.runtime.bootstrapMode !== 'external') {
+    throw new Error('agent_capabilities did not expose external bootstrap mode');
+  }
+  if (!Array.isArray(agentCapabilitiesResult.harnesses)) throw new Error('agent_capabilities harnesses missing');
+
+  await expectToolFailure('agent_get', { agentId: 'invalid-agent-id' });
 
   await expectToolFailure('workspace_create', {
     repository: 'https://token@example.com/repository.git',

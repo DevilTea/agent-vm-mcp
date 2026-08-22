@@ -1,6 +1,7 @@
 [tools]
 node = "24.19.0"
 pnpm = "11.22.0"
+herdr = "0.8.2"
 
 [settings]
 paranoid = true

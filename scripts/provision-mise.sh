@@ -45,7 +45,12 @@ mise_data_dir="$agent_home/.local/share/mise"
 mise_shims="$mise_data_dir/shims"
 node_version=24.19.0
 pnpm_version=11.22.0
+herdr_version=0.8.2
+herdr_session=agent-vm-mcp
 node_bin="$mise_data_dir/installs/node/$node_version/bin/node"
+herdr_bin="$mise_data_dir/installs/herdr/$herdr_version/herdr"
+herdr_service_template="$repo_root/config/systemd/agent-herdr.service.template"
+herdr_tunnel_dropin_template="$repo_root/config/systemd/agent-tunnel-herdr.conf.template"
 legacy_pnpm_bin="$agent_home/.local/share/pnpm/bin"
 legacy_node="$legacy_pnpm_bin/node"
 
@@ -77,11 +82,19 @@ run_as_agent() {
     "$@"
 }
 
-run_as_agent /usr/bin/mise install "node@$node_version" "pnpm@$pnpm_version"
+run_as_agent /usr/bin/mise install "node@$node_version" "pnpm@$pnpm_version" "herdr@$herdr_version"
 run_as_agent /usr/bin/mise reshim
 
 if [[ ! -x $node_bin ]]; then
   echo "Pinned mise-managed Node executable is missing: $node_bin" >&2
+  exit 1
+fi
+if [[ ! -x $herdr_bin ]]; then
+  echo "Pinned mise-managed Herdr executable is missing: $herdr_bin" >&2
+  exit 1
+fi
+if [[ ! -r $herdr_service_template || ! -r $herdr_tunnel_dropin_template ]]; then
+  echo "Missing repo-managed Herdr systemd templates." >&2
   exit 1
 fi
 
@@ -127,6 +140,24 @@ replace_literal_if_present \
   "$legacy_node" \
   "$node_bin"
 
+render_systemd_template() {
+  local source=$1
+  local destination=$2
+  AGENT_USER="$agent_user" \
+  AGENT_GROUP="$agent_group" \
+  AGENT_HOME="$agent_home" \
+  MISE_SHIMS="$mise_shims" \
+  HERDR_BIN="$herdr_bin" \
+  HERDR_SESSION="$herdr_session" \
+  python3 "$repo_root/scripts/render-systemd-template.py" "$source" "$destination"
+  chmod 0644 "$destination"
+}
+
+render_systemd_template "$herdr_service_template" /etc/systemd/system/agent-herdr.service
+render_systemd_template \
+  "$herdr_tunnel_dropin_template" \
+  /etc/systemd/system/agent-tunnel.service.d/20-herdr.conf
+
 bashrc="$agent_home/.bashrc"
 if [[ -f $bashrc ]]; then
   AGENT_HOME="$agent_home" python3 - "$bashrc" <<'PY'
@@ -147,9 +178,11 @@ PY
 fi
 
 systemctl daemon-reload
+systemctl enable agent-herdr.service
 
 run_as_agent env PATH="$mise_shims:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" node --version
 run_as_agent env PATH="$mise_shims:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" pnpm --version
+run_as_agent env PATH="$mise_shims:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" herdr --version
 
 if $cleanup_legacy; then
   stale_refs=$(rg -l --fixed-strings "$legacy_pnpm_bin" \
@@ -171,4 +204,5 @@ else
 fi
 
 echo "mise toolchain provisioned for $agent_user."
+echo "Herdr runtime service/drop-in installed; production MCP is configured for external Herdr bootstrap."
 echo "Restart agent-tunnel.service separately to activate the migrated control-plane environment."
