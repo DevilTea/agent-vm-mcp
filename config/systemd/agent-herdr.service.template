@@ -9,7 +9,7 @@ User=@AGENT_USER@
 Group=@AGENT_GROUP@
 Environment=HOME=@AGENT_HOME@
 Environment=XDG_CONFIG_HOME=@AGENT_HOME@/.config
-Environment=PATH=@MISE_SHIMS@:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=PATH=@MISE_SHIMS@:@AGENT_HOME@/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 ExecStart=@HERDR_BIN@ --session @HERDR_SESSION@ server
 Restart=always
 RestartSec=1s

@@ -3,6 +3,7 @@ Requires=agent-herdr.service
 After=agent-herdr.service
 
 [Service]
+Environment=PATH=@MISE_SHIMS@:@AGENT_HOME@/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 Environment=AGENT_HERDR_BOOTSTRAP=external
 Environment=AGENT_HERDR_SESSION=@HERDR_SESSION@
 Environment=AGENT_HERDR_BIN=@HERDR_BIN@

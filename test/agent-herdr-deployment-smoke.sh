@@ -9,9 +9,11 @@ provision="$repo_root/scripts/provision-mise.sh"
 [[ -r $service && -r $dropin ]]
 grep -Fq 'ExecStart=@HERDR_BIN@ --session @HERDR_SESSION@ server' "$service"
 grep -Fq 'Before=agent-tunnel.service' "$service"
+grep -Fq 'Environment=PATH=@MISE_SHIMS@:@AGENT_HOME@/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' "$service"
 grep -Fq 'Requires=agent-herdr.service' "$dropin"
 grep -Fq 'After=agent-herdr.service' "$dropin"
 grep -Fq 'Environment=AGENT_HERDR_BOOTSTRAP=external' "$dropin"
+grep -Fq 'Environment=PATH=@MISE_SHIMS@:@AGENT_HOME@/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' "$dropin"
 grep -Fq 'Environment=AGENT_HERDR_SESSION=@HERDR_SESSION@' "$dropin"
 grep -Fq 'Environment=AGENT_HERDR_BIN=@HERDR_BIN@' "$dropin"
 grep -Fq '/etc/systemd/system/agent-herdr.service' "$provision"
@@ -48,6 +50,9 @@ HERDR_BIN=/home/agent/.local/share/mise/installs/herdr/0.8.2/herdr \
 HERDR_SESSION=agent-vm-mcp \
 python3 "$repo_root/scripts/render-systemd-template.py" \
   "$dropin" "$verify_root/agent-tunnel.service.d/20-herdr.conf"
+
+grep -Fq '/home/agent/.local/bin' "$verify_root/agent-herdr.service"
+grep -Fq '/home/agent/.local/bin' "$verify_root/agent-tunnel.service.d/20-herdr.conf"
 
 printf '%s\n' \
   '[Unit]' \

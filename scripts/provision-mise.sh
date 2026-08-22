@@ -123,7 +123,7 @@ PY
 replace_literal_if_present \
   /etc/systemd/system/agent-tunnel.service \
   "$legacy_pnpm_bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
-  "$mise_shims:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+  "$mise_shims:$agent_home/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 replace_literal_if_present \
   "$agent_home/.config/tunnel-client/agent-01.yaml" \
@@ -133,7 +133,7 @@ replace_literal_if_present \
 replace_literal_if_present \
   /opt/playwright-mcp/start.sh \
   "$legacy_pnpm_bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
-  "$mise_shims:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+  "$mise_shims:$agent_home/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 replace_literal_if_present \
   /opt/playwright-mcp/start.sh \
