@@ -326,6 +326,17 @@ exec /usr/bin/git "$@"
   for (const property of ['harness', 'cwd', 'model', 'effort', 'timeoutMs']) {
     if (!(property in agentStartProperties)) throw new Error(`agent_start schema missing property: ${property}`);
   }
+  if (!agentStartTool?.description?.includes('not exec or process_start')) {
+    throw new Error('agent_start description does not establish the coding-harness lifecycle boundary');
+  }
+  const execTool = toolByName.get('exec');
+  if (!execTool?.description?.includes('use agent_start')) {
+    throw new Error('exec description does not redirect coding-harness work to agent_start');
+  }
+  const processStartTool = toolByName.get('process_start');
+  if (!processStartTool?.description?.includes('use agent_start')) {
+    throw new Error('process_start description does not redirect coding-harness work to agent_start');
+  }
   const expectedLspTools = [
     'lsp_hover',
     'lsp_signature_help',
@@ -1490,6 +1501,34 @@ exec /usr/bin/git "$@"
   const explicitResource = await client.readResource({ uri: explicitArtifact.uri });
   if (!(explicitResource.contents?.[0]?.blob?.length > 100)) {
     throw new Error('Explicit screenshot artifact resource missing');
+  }
+
+  const blockedRawExec = await client.callTool({
+    name: 'exec',
+    arguments: { command: 'env REVIEW=1 codex exec --ephemeral -' },
+  });
+  if (!blockedRawExec.isError) throw new Error('exec unexpectedly allowed raw Codex agent work');
+  const blockedRawExecText = blockedRawExec.content?.find((item) => item.type === 'text')?.text ?? '';
+  if (!blockedRawExecText.includes('agent_start')) {
+    throw new Error('exec raw-harness rejection did not direct the caller to agent_start');
+  }
+
+  const blockedRawProcess = await client.callTool({
+    name: 'process_start',
+    arguments: { command: 'nohup /usr/local/bin/agy --print review &' },
+  });
+  if (!blockedRawProcess.isError) throw new Error('process_start unexpectedly allowed raw Agy agent work');
+  const blockedRawProcessText = blockedRawProcess.content?.find((item) => item.type === 'text')?.text ?? '';
+  if (!blockedRawProcessText.includes('agent_start')) {
+    throw new Error('process_start raw-harness rejection did not direct the caller to agent_start');
+  }
+
+  const harmlessHarnessMention = await client.callTool({
+    name: 'exec',
+    arguments: { command: "printf '%s\\n' 'codex exec --ephemeral'" },
+  });
+  if (harmlessHarnessMention.isError) {
+    throw new Error('exec guard rejected a harmless non-command harness mention');
   }
 
   const started = await client.callTool({

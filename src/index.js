@@ -27,6 +27,7 @@ import { ArtifactStore } from './artifacts/artifact-store.js';
 import { PRESENT_FILE_TOOL } from './artifacts/constants.js';
 import { registerArtifactSystem } from './artifacts/register.js';
 import { ExecOutputCapture } from './exec-output.js';
+import { assertNoRawCodingHarnessLaunch } from './coding-harness-guard.js';
 import { applyUnifiedPatch, listDirectory, readTextFile, waitForFilesystemMutations } from './filesystem.js';
 import { workspaceCreate, workspaceDelete, workspaceList, waitForWorkspaceMutations } from './workspaces.js';
 
@@ -101,6 +102,7 @@ function killProcessGroup(child, signal) {
 }
 
 async function executeCommand({ command, cwd, env, timeoutMs }, requestSignal, artifactStore) {
+  assertNoRawCodingHarnessLaunch(command, 'exec');
   const startedAt = Date.now();
   const executionArtifactId = randomUUID();
   const child = spawn('/bin/bash', ['-lc', command], {
@@ -265,6 +267,7 @@ function getProcessSession(processId) {
 }
 
 function startPersistentProcess({ command, cwd, env }, requestSignal) {
+  assertNoRawCodingHarnessLaunch(command, 'process_start');
   pruneFinishedProcesses();
   if (processes.size >= MAX_PROCESS_SESSIONS) {
     throw new Error(`Process session limit reached (${MAX_PROCESS_SESSIONS}). Kill or let existing processes exit first.`);
@@ -458,7 +461,8 @@ async function createServer() {
       description:
         'Execute an arbitrary shell command on the dedicated disposable Linux agent VM. ' +
         'Oversized stdout/stderr use bounded head/tail previews plus separate artifacts. ' +
-        'Use this for commands that complete on their own. For servers, watchers, REPLs, or other long-running/interactive commands, use process_start instead.',
+        'Use this for commands that complete on their own. For servers, watchers, REPLs, or other long-running/interactive commands, use process_start instead. ' +
+        'Do not launch Codex, Antigravity CLI (agy), or Claude Code agent work through exec; use agent_start so coding agents run in persistent Herdr workspaces. Harmless --help/--version probes remain allowed.',
       inputSchema: z.object({
         command: z.string().min(1).describe('Shell command to execute with bash -lc.'),
         cwd: z.string().optional().describe('Working directory. Defaults to the agent user home directory.'),
@@ -574,7 +578,7 @@ async function createServer() {
     'agent_start',
     {
       description:
-        'Start a persistent interactive coding agent in a dedicated Herdr workspace. Production persistence requires the separately managed Herdr service; startup trust/auth prompts are reported, never auto-approved.',
+        'Start a persistent interactive coding agent in a dedicated Herdr workspace. Use this, not exec or process_start, for coding-harness work; it is required for long-running, parallel, or cross-turn Codex/agy/Claude tasks. Production persistence requires the separately managed Herdr service; startup trust/auth prompts are reported, never auto-approved.',
       inputSchema: z.object({
         harness: z.enum(['codex', 'agy', 'claude']).describe('Coding harness to launch.'),
         cwd: z.string().min(1).describe('Existing directory to use as the agent workspace.'),
@@ -783,7 +787,7 @@ async function createServer() {
     'process_start',
     {
       description:
-        'Start a long-running or interactive shell command and keep it alive across MCP tool calls. Returns a processId for process_read, process_write, and process_kill.',
+        'Start a long-running or interactive non-agent shell command and keep it alive across MCP tool calls. Returns a processId for process_read, process_write, and process_kill. Do not use process_start for Codex, Antigravity CLI (agy), or Claude Code agent work; use agent_start because Herdr provides dedicated parallel workspaces and survives MCP/conversation lifecycle changes.',
       inputSchema: z.object({
         command: z.string().min(1).describe('Shell command to start with bash -lc.'),
         cwd: z.string().optional().describe('Working directory. Defaults to the agent user home directory.'),
