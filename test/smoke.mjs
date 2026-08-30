@@ -273,6 +273,8 @@ exec /usr/bin/git "$@"
     'agent_read',
     'agent_prompt',
     'agent_send_keys',
+    'agent_suspend',
+    'agent_resume',
     'agent_stop',
     'import_file',
     'process_start',
@@ -328,6 +330,12 @@ exec /usr/bin/git "$@"
   }
   if (!agentStartTool?.description?.includes('not exec or process_start')) {
     throw new Error('agent_start description does not establish the coding-harness lifecycle boundary');
+  }
+  if (!toolByName.get('agent_suspend')?.description?.includes('agent_stop')) {
+    throw new Error('agent_suspend description does not distinguish suspend from destructive stop');
+  }
+  if (!toolByName.get('agent_resume')?.description?.includes('same conversation')) {
+    throw new Error('agent_resume description does not promise exact-session continuation');
   }
   const execTool = toolByName.get('exec');
   if (!execTool?.description?.includes('use agent_start')) {

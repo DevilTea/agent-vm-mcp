@@ -10,6 +10,8 @@ import {
   agentSendKeys,
   agentStart,
   agentStop,
+  agentSuspend,
+  agentResume,
 } from '../src/agents.js';
 
 const root = await fs.mkdtemp(path.join(os.tmpdir(), 'agent-vm-agents-smoke-'));
@@ -41,17 +43,22 @@ for (const [name, version] of [
 
 await fs.writeFile(
   statePath,
-  `${JSON.stringify({ running: true, nextWorkspace: 1, workspaces: {}, agents: {} }, null, 2)}\n`,
+  `${JSON.stringify({ running: true, nextWorkspace: 1, workspaces: {}, agents: {}, sessions: {} }, null, 2)}\n`,
   'utf8',
 );
 
 const fakeHerdr = String.raw`#!/usr/bin/env node
 import fs from 'node:fs';
+import path from 'node:path';
 import { spawn } from 'node:child_process';
 
 const statePath = process.env.AGENT_HERDR_FAKE_STATE;
 const readState = () => JSON.parse(fs.readFileSync(statePath, 'utf8'));
-const writeState = (state) => fs.writeFileSync(statePath, JSON.stringify(state, null, 2) + '\n');
+const writeState = (state) => {
+  const temporaryPath = statePath + '.tmp-' + process.pid;
+  fs.writeFileSync(temporaryPath, JSON.stringify(state, null, 2) + '\n');
+  fs.renameSync(temporaryPath, statePath);
+};
 const emit = (id, result) => process.stdout.write(JSON.stringify({ id, result }) + '\n');
 const fail = (code, message) => {
   process.stderr.write(JSON.stringify({ error: { code, message }, id: 'fake' }) + '\n');
@@ -122,7 +129,7 @@ if (args[0] === 'server') {
   const workspaceRecord = { workspace, paneId, tabId, cwd };
   if (state.delayCreateAfterFailure) {
     writeState(state);
-    const delayedCode = "const fs=require('fs');const statePath=process.env.AGENT_DELAY_STATE;const record=JSON.parse(process.env.AGENT_DELAY_RECORD);setTimeout(()=>{const delayedState=JSON.parse(fs.readFileSync(statePath,'utf8'));delayedState.workspaces[record.workspace.workspace_id]=record;fs.writeFileSync(statePath,JSON.stringify(delayedState,null,2)+'\\n');},1250);";
+    const delayedCode = "const fs=require('fs');const statePath=process.env.AGENT_DELAY_STATE;const record=JSON.parse(process.env.AGENT_DELAY_RECORD);setTimeout(()=>{const delayedState=JSON.parse(fs.readFileSync(statePath,'utf8'));delayedState.workspaces[record.workspace.workspace_id]=record;const temporaryPath=statePath+'.tmp-delayed-'+process.pid;fs.writeFileSync(temporaryPath,JSON.stringify(delayedState,null,2)+'\\n');fs.renameSync(temporaryPath,statePath);},1250);";
     const delayed = spawn(process.execPath, ['-e', delayedCode], {
       detached: true,
       stdio: 'ignore',
@@ -166,7 +173,11 @@ if (args[0] === 'server') {
 } else if (args[0] === 'workspace' && args[1] === 'close') {
   const workspaceId = args[2];
   for (const [name, agent] of Object.entries(state.agents)) {
-    if (agent.workspace_id === workspaceId) delete state.agents[name];
+    if (agent.workspace_id === workspaceId) {
+      state.sessions ??= {};
+      state.sessions[agent.native_session_id] = { transcript: agent.transcript };
+      delete state.agents[name];
+    }
   }
   delete state.workspaces[workspaceId];
   writeState(state);
@@ -179,6 +190,31 @@ if (args[0] === 'server') {
   if (!workspace) fail('missing_pane', 'pane not found');
   const separator = args.indexOf('--');
   const launchArgs = separator === -1 ? [] : args.slice(separator + 1);
+  const resumeIndex = launchArgs.findIndex((arg) => arg === 'resume' || arg === '--conversation');
+  const nativeSessionId = resumeIndex === -1
+    ? kind + '-session-' + name
+    : launchArgs[resumeIndex + 1];
+  if (state.emitAmbiguousNativeSessions && kind === 'codex') {
+    const sessionDirectory = path.join(process.env.HOME, '.codex', 'sessions', '2099', '01', '01');
+    fs.mkdirSync(sessionDirectory, { recursive: true });
+    for (const suffix of ['a', 'b']) {
+      const candidateId = 'ambiguous-' + name + '-' + process.pid + '-' + suffix;
+      const candidatePath = path.join(sessionDirectory, candidateId + '.jsonl');
+      fs.writeFileSync(candidatePath, JSON.stringify({
+        type: 'session_meta',
+        payload: { id: candidateId, session_id: candidateId, cwd: workspace.cwd, timestamp: new Date().toISOString() },
+      }) + '\n');
+    }
+  } else if (state.emitSingleNativeSession && kind === 'codex') {
+    const sessionDirectory = path.join(process.env.HOME, '.codex', 'sessions', '2099', '01', '01');
+    fs.mkdirSync(sessionDirectory, { recursive: true });
+    const candidateId = 'single-' + name + '-' + process.pid;
+    fs.writeFileSync(path.join(sessionDirectory, candidateId + '.jsonl'), JSON.stringify({
+      type: 'session_meta',
+      payload: { id: candidateId, session_id: candidateId, cwd: workspace.cwd, timestamp: new Date().toISOString() },
+    }) + '\n');
+  }
+  state.sessions ??= {};
   const agent = {
     agent: kind,
     agent_status: 'idle',
@@ -192,7 +228,8 @@ if (args[0] === 'server') {
     tab_id: workspace.tabId,
     terminal_id: 'term-' + name,
     workspace_id: workspace.workspace.workspace_id,
-    transcript: 'READY',
+    ...(state.omitNativeSessionId ? {} : { native_session_id: nativeSessionId }),
+    transcript: state.sessions[nativeSessionId]?.transcript ?? 'READY',
     launch_args: launchArgs,
     sent_keys: [],
   };
@@ -238,6 +275,8 @@ if (args[0] === 'server') {
   const prompt = args[3];
   agent.transcript += '\n> ' + prompt + '\nFAKE_RESPONSE';
   agent.state_change_seq += 2;
+  state.sessions ??= {};
+  state.sessions[agent.native_session_id] = { transcript: agent.transcript };
   writeState(state);
   if (state.promptFailure === 'after_mutation') fail('agent_prompt_stalled', 'prompt submitted but wait stalled');
   if (state.promptFailure === 'hang_after_mutation') setInterval(() => {}, 60_000);
@@ -667,10 +706,10 @@ try {
     agentId: codex.agent.agentId,
     task: 'FIRST_SERIALIZED_PROMPT',
     wait: true,
-    timeoutMs: 250,
+    timeoutMs: 1_000,
   });
   let firstPromptObserved = false;
-  for (let attempt = 0; attempt < 40; attempt += 1) {
+  for (let attempt = 0; attempt < 120; attempt += 1) {
     await new Promise((resolve) => setTimeout(resolve, 25));
     state = JSON.parse(await fs.readFile(statePath, 'utf8'));
     if (state.agents[codex.agent.agentId].transcript.includes('FIRST_SERIALIZED_PROMPT')) {
@@ -874,6 +913,340 @@ try {
     throw new Error(`Unexpected agy launch args: ${JSON.stringify(agyLaunch)}`);
   }
   await agentStop({ agentId: agy.agent.agentId });
+
+  const resumable = await agentStart({ harness: 'codex', cwd: root, timeoutMs: 10_000 });
+  await agentPrompt({ agentId: resumable.agent.agentId, task: 'PERSIST_THIS_NATIVE_SESSION', timeoutMs: 10_000 });
+  state = JSON.parse(await fs.readFile(statePath, 'utf8'));
+  const resumableRuntimeId = resumable.agent.runtimeAgentId;
+  const resumableWorkspaceId = state.agents[resumableRuntimeId].workspace_id;
+  const resumableNativeSessionId = state.agents[resumableRuntimeId].native_session_id;
+  const suspended = await agentSuspend({ agentId: resumable.agent.agentId });
+  state = JSON.parse(await fs.readFile(statePath, 'utf8'));
+  if (!suspended.suspended || state.agents[resumableRuntimeId] || state.workspaces[resumableWorkspaceId]) {
+    throw new Error('agent_suspend did not close the ephemeral runtime workspace/process');
+  }
+  if (!(await agentSuspend({ agentId: resumable.agent.agentId })).alreadySuspended) {
+    throw new Error('repeated suspend was not idempotent');
+  }
+  const metadataPath = path.join(home, '.local', 'state', 'agent-vm-mcp', 'agents.json');
+  const suspendedMetadata = JSON.parse(await fs.readFile(metadataPath, 'utf8')).agents[resumable.agent.agentId];
+  if (suspendedMetadata.lifecycle !== 'suspended' || suspendedMetadata.nativeSessionId !== resumableNativeSessionId || suspendedMetadata.runtimeAgentId !== null) {
+    throw new Error('agent_suspend did not persist logical/native metadata separately from runtime identity');
+  }
+  const discoveredSuspended = await agentCapabilities();
+  const discoveredRecord = discoveredSuspended.runtime.session.agents.find((agent) => agent.agentId === resumable.agent.agentId);
+  if (!discoveredRecord || discoveredRecord.lifecycle !== 'suspended' || discoveredRecord.nativeSessionId !== resumableNativeSessionId) {
+    throw new Error('agent_capabilities did not discover the suspended logical agent');
+  }
+  const freshAgentsModule = await import(`../src/agents.js?fresh=${Date.now()}`);
+  const freshProcessDiscovery = await freshAgentsModule.agentCapabilities();
+  if (!freshProcessDiscovery.runtime.session.agents.some((agent) => agent.agentId === resumable.agent.agentId && agent.lifecycle === 'suspended')) {
+    throw new Error('durable suspended metadata was not discoverable from a fresh MCP module instance');
+  }
+  const resumed = await agentResume({ agentId: resumable.agent.agentId });
+  if (!resumed.resumed || resumed.agent.runtimeAgentId === resumableRuntimeId || resumed.agent.agentId !== resumable.agent.agentId) {
+    throw new Error('agent_resume did not create a fresh runtime identity for the same logical agent');
+  }
+  state = JSON.parse(await fs.readFile(statePath, 'utf8'));
+  const resumedRuntime = state.agents[resumed.agent.runtimeAgentId];
+  if (!resumedRuntime || JSON.stringify(resumedRuntime.launch_args) !== JSON.stringify(['resume', resumableNativeSessionId]) || !resumedRuntime.transcript.includes('PERSIST_THIS_NATIVE_SESSION')) {
+    throw new Error('agent_resume did not use the same native Codex session or restore its transcript');
+  }
+  resumedRuntime.agent_status = 'working';
+  await fs.writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, 'utf8');
+  try {
+    await agentSuspend({ agentId: resumable.agent.agentId });
+    throw new Error('working agent was unexpectedly suspendable');
+  } catch (error) {
+    if (error?.code !== 'agent_not_suspendable') throw error;
+  }
+  resumedRuntime.agent_status = 'idle';
+  await fs.writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, 'utf8');
+  await agentPrompt({ agentId: resumable.agent.agentId, task: 'CONTINUE_THE_SAME_NATIVE_SESSION', timeoutMs: 10_000 });
+  state = JSON.parse(await fs.readFile(statePath, 'utf8'));
+  if (!state.agents[resumed.agent.runtimeAgentId].transcript.includes('CONTINUE_THE_SAME_NATIVE_SESSION')) {
+    throw new Error('resumed logical agent did not accept continuation');
+  }
+  if (!(await agentSuspend({ agentId: resumable.agent.agentId })).suspended) {
+    throw new Error('suspend after continuation failed');
+  }
+  await agentResume({ agentId: resumable.agent.agentId });
+  const resumedAgain = await agentGet({ agentId: resumable.agent.agentId });
+  await agentStop({ agentId: resumedAgain.agentId });
+
+  const agyResumable = await agentStart({ harness: 'agy', cwd: root, timeoutMs: 10_000 });
+  await agentPrompt({ agentId: agyResumable.agent.agentId, task: 'PERSIST_THIS_AGY_CONVERSATION', timeoutMs: 10_000 });
+  state = JSON.parse(await fs.readFile(statePath, 'utf8'));
+  const agyNativeSessionId = state.agents[agyResumable.agent.runtimeAgentId].native_session_id;
+  await agentSuspend({ agentId: agyResumable.agent.agentId });
+  const agyResumed = await agentResume({ agentId: agyResumable.agent.agentId });
+  state = JSON.parse(await fs.readFile(statePath, 'utf8'));
+  const agyRuntime = state.agents[agyResumed.agent.runtimeAgentId];
+  if (!agyRuntime || JSON.stringify(agyRuntime.launch_args) !== JSON.stringify(['--conversation', agyNativeSessionId]) || !agyRuntime.transcript.includes('PERSIST_THIS_AGY_CONVERSATION')) {
+    throw new Error('agent_resume did not use Agy --conversation with the same native conversation');
+  }
+  await agentStop({ agentId: agyResumable.agent.agentId });
+
+  const discardable = await agentStart({ harness: 'codex', cwd: root, timeoutMs: 10_000 });
+  await agentSuspend({ agentId: discardable.agent.agentId });
+  const discarded = await agentStop({ agentId: discardable.agent.agentId });
+  if (!discarded.stopped || !discarded.discarded || JSON.parse(await fs.readFile(metadataPath, 'utf8')).agents[discardable.agent.agentId]) {
+    throw new Error('agent_stop did not discard suspended logical metadata');
+  }
+
+  const claude = await agentStart({ harness: 'claude', cwd: root, timeoutMs: 10_000 });
+  try {
+    await agentSuspend({ agentId: claude.agent.agentId });
+    throw new Error('Claude suspend unexpectedly claimed native resume support');
+  } catch (error) {
+    if (error?.code !== 'agent_resume_unsupported') throw error;
+  }
+  await agentStop({ agentId: claude.agent.agentId });
+
+  state = JSON.parse(await fs.readFile(statePath, 'utf8'));
+  state.emitAmbiguousNativeSessions = true;
+  state.omitNativeSessionId = true;
+  await fs.writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, 'utf8');
+  const ambiguousOne = await agentStart({ harness: 'codex', cwd: root, timeoutMs: 10_000 });
+  const ambiguousTwo = await agentStart({ harness: 'codex', cwd: root, timeoutMs: 10_000 });
+  state = JSON.parse(await fs.readFile(statePath, 'utf8'));
+  delete state.emitAmbiguousNativeSessions;
+  delete state.omitNativeSessionId;
+  await fs.writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, 'utf8');
+  const ambiguousMetadata = JSON.parse(await fs.readFile(metadataPath, 'utf8')).agents;
+  for (const ambiguous of [ambiguousOne, ambiguousTwo]) {
+    const record = ambiguousMetadata[ambiguous.agent.agentId];
+    if (!record || record.nativeSessionId !== null || record.resumable !== false || record.nativeSessionAttribution !== 'ambiguous') {
+      throw new Error('Ambiguous same-cwd native sessions were incorrectly attributed to a logical agent');
+    }
+    try {
+      await agentSuspend({ agentId: ambiguous.agent.agentId });
+      throw new Error('Ambiguous native session was unexpectedly suspendable');
+    } catch (error) {
+      if (error?.code !== 'agent_native_session_unavailable') throw error;
+    }
+    await agentStop({ agentId: ambiguous.agent.agentId });
+  }
+
+  state = JSON.parse(await fs.readFile(statePath, 'utf8'));
+  state.emitSingleNativeSession = true;
+  state.omitNativeSessionId = true;
+  await fs.writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, 'utf8');
+  const [concurrentOne, concurrentTwo] = await Promise.all([
+    agentStart({ harness: 'codex', cwd: root, timeoutMs: 10_000 }),
+    agentStart({ harness: 'codex', cwd: root, timeoutMs: 10_000 }),
+  ]);
+  state = JSON.parse(await fs.readFile(statePath, 'utf8'));
+  delete state.emitSingleNativeSession;
+  delete state.omitNativeSessionId;
+  await fs.writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, 'utf8');
+  const concurrentNativeIds = [concurrentOne.agent.nativeSessionId, concurrentTwo.agent.nativeSessionId];
+  if (concurrentNativeIds.some((id) => !id) || new Set(concurrentNativeIds).size !== 2 || concurrentOne.agent.nativeSessionAttribution !== 'verified' || concurrentTwo.agent.nativeSessionAttribution !== 'verified') {
+    throw new Error(`Concurrent same-cwd starts did not receive distinct verified native sessions: ${JSON.stringify(concurrentNativeIds)}`);
+  }
+  await agentStop({ agentId: concurrentOne.agent.agentId });
+  await agentStop({ agentId: concurrentTwo.agent.agentId });
+
+  const recoveryIds = [
+    'agent-11111111111111111111111111',
+    'agent-22222222222222222222222222',
+    'agent-33333333333333333333333333',
+    'agent-44444444444444444444444444',
+    'agent-55555555555555555555555555',
+  ];
+  const recoveryRuntimeIds = [
+    'agent-aaaaaaaaaaaaaaaaaaaaaaaaaa',
+    'agent-bbbbbbbbbbbbbbbbbbbbbbbbbb',
+    'agent-cccccccccccccccccccccccccc',
+    'agent-dddddddddddddddddddddddddd',
+    'agent-99999999999999999999999999',
+  ];
+  const recoveryWorkspaceIds = ['recovery-w1', 'recovery-w2', 'recovery-w3', 'recovery-w4', 'recovery-orphan-w5'];
+  const recoveryLifecycle = ['suspending', 'suspending', 'resuming', 'resuming', 'resuming'];
+  const recoveryMetadata = { version: 1, agents: {} };
+  for (let index = 0; index < recoveryIds.length; index += 1) {
+    recoveryMetadata.agents[recoveryIds[index]] = {
+      version: 1,
+      agentId: recoveryIds[index],
+      harness: 'codex',
+      cwd: root,
+      model: null,
+      effort: null,
+      nativeSessionId: `recovery-native-${index}`,
+      nativeSessionAttribution: 'verified',
+      resumable: true,
+      runtimeAgentId: recoveryRuntimeIds[index],
+      runtimeWorkspaceId: recoveryWorkspaceIds[index],
+      lifecycle: recoveryLifecycle[index],
+      updatedAt: new Date().toISOString(),
+    };
+  }
+  state = JSON.parse(await fs.readFile(statePath, 'utf8'));
+  for (const index of [0, 2]) {
+    const workspaceId = recoveryWorkspaceIds[index];
+    const runtimeAgentId = recoveryRuntimeIds[index];
+    state.workspaces[workspaceId] = {
+      workspace: { workspace_id: workspaceId, label: runtimeAgentId, number: 1 },
+      paneId: `${workspaceId}:p1`,
+      tabId: `${workspaceId}:t1`,
+      cwd: root,
+    };
+    state.agents[runtimeAgentId] = {
+      agent: 'codex', agent_status: 'idle', cwd: root, foreground_cwd: root,
+      interactive_ready: true, name: runtimeAgentId, pane_id: `${workspaceId}:p1`,
+      tab_id: `${workspaceId}:t1`, terminal_id: `term-${runtimeAgentId}`,
+      workspace_id: workspaceId, transcript: 'RECOVERY READY', native_session_id: `recovery-native-${index}`,
+    };
+  }
+  state.workspaces[recoveryWorkspaceIds[4]] = {
+    workspace: { workspace_id: recoveryWorkspaceIds[4], label: recoveryRuntimeIds[4], number: 1 },
+    paneId: `${recoveryWorkspaceIds[4]}:p1`, tabId: `${recoveryWorkspaceIds[4]}:t1`, cwd: root,
+  };
+  await fs.writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, 'utf8');
+  await fs.mkdir(path.dirname(metadataPath), { recursive: true });
+  await fs.writeFile(metadataPath, `${JSON.stringify(recoveryMetadata, null, 2)}\n`, 'utf8');
+  const recoveryModule = await import(`../src/agents.js?recovery=${Date.now()}`);
+  const recoveredCapabilities = await recoveryModule.agentCapabilities();
+  const recoveredMetadata = JSON.parse(await fs.readFile(metadataPath, 'utf8')).agents;
+  for (const [index, agentId] of recoveryIds.entries()) {
+    const expectedLifecycle = index === 0 || index === 2 ? 'active' : 'suspended';
+    if (recoveredMetadata[agentId]?.lifecycle !== expectedLifecycle) {
+      throw new Error(`Crash reconciliation did not resolve recovery record ${agentId}`);
+    }
+    const discovered = recoveredCapabilities.runtime.session.agents.find((agent) => agent.agentId === agentId);
+    if (!discovered || discovered.lifecycle !== expectedLifecycle) {
+      throw new Error(`Crash reconciliation did not expose ${agentId} with ${expectedLifecycle} lifecycle`);
+    }
+  }
+  const orphanState = JSON.parse(await fs.readFile(statePath, 'utf8'));
+  if (orphanState.workspaces[recoveryWorkspaceIds[4]] || orphanState.agents[recoveryRuntimeIds[4]]) {
+    throw new Error('Resuming crash reconciliation left the exact orphan workspace behind');
+  }
+  for (const agentId of recoveryIds) await recoveryModule.agentStop({ agentId });
+
+  const legacyId = 'agent-eeeeeeeeeeeeeeeeeeeeeeeeee';
+  const legacyWorkspaceId = 'legacy-workspace';
+  state = JSON.parse(await fs.readFile(statePath, 'utf8'));
+  state.workspaces[legacyWorkspaceId] = {
+    workspace: { workspace_id: legacyWorkspaceId, label: legacyId, number: 1 },
+    paneId: `${legacyWorkspaceId}:p1`, tabId: `${legacyWorkspaceId}:t1`, cwd: root,
+  };
+  state.agents[legacyId] = {
+    agent: 'codex', agent_status: 'idle', cwd: root, foreground_cwd: root,
+    interactive_ready: true, name: legacyId, pane_id: `${legacyWorkspaceId}:p1`,
+    tab_id: `${legacyWorkspaceId}:t1`, terminal_id: `term-${legacyId}`,
+    workspace_id: legacyWorkspaceId, transcript: 'LEGACY READY',
+  };
+  await fs.writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, 'utf8');
+  await fs.rm(metadataPath, { force: true });
+  const legacyModule = await import(`../src/agents.js?legacy=${Date.now()}`);
+  const legacyCapabilities = await legacyModule.agentCapabilities();
+  const legacyDescription = legacyCapabilities.runtime.session.agents.find((agent) => agent.agentId === legacyId);
+  if (!legacyDescription || legacyDescription.lifecycle !== 'active' || legacyDescription.legacy !== true || legacyDescription.resumable !== false) {
+    throw new Error('Legacy active agent was not exposed as active non-resumable metadata');
+  }
+  if ((await legacyModule.agentGet({ agentId: legacyId })).legacy !== true) throw new Error('Legacy agent get behavior was not preserved');
+  if (!(await legacyModule.agentRead({ agentId: legacyId, source: 'visible', lines: 20 })).text.includes('LEGACY READY')) {
+    throw new Error('Legacy agent read behavior was not preserved');
+  }
+  try {
+    await legacyModule.agentSuspend({ agentId: legacyId });
+    throw new Error('Legacy agent was unexpectedly suspendable');
+  } catch (error) {
+    if (error?.code !== 'agent_native_session_unavailable') throw error;
+  }
+  await legacyModule.agentStop({ agentId: legacyId });
+
+  await fs.rm(metadataPath, { force: true });
+  const metadataModuleA = await import(`../src/agents.js?metadata-a=${Date.now()}`);
+  const metadataModuleB = await import(`../src/agents.js?metadata-b=${Date.now()}`);
+  const concurrentMetadataA = {
+    version: 1, agentId: 'agent-f1111111111111111111111111', harness: 'codex', cwd: root,
+    nativeSessionId: 'metadata-native-a', nativeSessionAttribution: 'verified', resumable: true,
+    runtimeAgentId: null, runtimeWorkspaceId: null, lifecycle: 'suspended', updatedAt: new Date().toISOString(),
+  };
+  const concurrentMetadataB = {
+    version: 1, agentId: 'agent-f2222222222222222222222222', harness: 'agy', cwd: root,
+    nativeSessionId: 'metadata-native-b', nativeSessionAttribution: 'verified', resumable: true,
+    runtimeAgentId: null, runtimeWorkspaceId: null, lifecycle: 'suspended', updatedAt: new Date().toISOString(),
+  };
+  await Promise.all([
+    metadataModuleA.__testUpdateAgentMetadata(concurrentMetadataA.agentId, concurrentMetadataA),
+    metadataModuleB.__testUpdateAgentMetadata(concurrentMetadataB.agentId, concurrentMetadataB),
+  ]);
+  const concurrentMetadata = JSON.parse(await fs.readFile(metadataPath, 'utf8')).agents;
+  if (!concurrentMetadata[concurrentMetadataA.agentId] || !concurrentMetadata[concurrentMetadataB.agentId]) {
+    throw new Error('Concurrent fresh-module metadata mutations lost an independent agent record');
+  }
+  const metadataLockPath = `${metadataPath}.lock`;
+  await fs.mkdir(metadataLockPath);
+  const staleLockTime = new Date(Date.now() - 5_000);
+  await fs.utimes(metadataLockPath, staleLockTime, staleLockTime);
+  await metadataModuleA.__testUpdateAgentMetadata('agent-f4444444444444444444444444', {
+    version: 1, agentId: 'agent-f4444444444444444444444', harness: 'codex', cwd: root,
+    nativeSessionId: 'metadata-native-stale-lock', nativeSessionAttribution: 'verified', resumable: true,
+    runtimeAgentId: null, runtimeWorkspaceId: null, lifecycle: 'suspended', updatedAt: new Date().toISOString(),
+  });
+  if (await fs.stat(metadataLockPath).then(() => true, () => false)) throw new Error('Stale metadata lock was not reclaimed');
+  const ambiguousTransitionId = 'agent-f3333333333333333333333333';
+  const ambiguousTransitionRuntimeId = 'agent-ffffffffffffffffffffffffff';
+  const ambiguousTransitionWorkspaceId = 'ambiguous-transition-workspace';
+  await metadataModuleA.__testUpdateAgentMetadata(ambiguousTransitionId, {
+    version: 1, agentId: ambiguousTransitionId, harness: 'codex', cwd: root,
+    nativeSessionId: 'transition-native', nativeSessionAttribution: 'verified', resumable: true,
+    runtimeAgentId: ambiguousTransitionRuntimeId, runtimeWorkspaceId: ambiguousTransitionWorkspaceId,
+    lifecycle: 'suspending', updatedAt: new Date().toISOString(),
+  });
+  state = JSON.parse(await fs.readFile(statePath, 'utf8'));
+  state.workspaces[ambiguousTransitionWorkspaceId] = {
+    workspace: { workspace_id: ambiguousTransitionWorkspaceId, label: 'not-the-recorded-runtime', number: 1 },
+    paneId: `${ambiguousTransitionWorkspaceId}:p1`, tabId: `${ambiguousTransitionWorkspaceId}:t1`, cwd: root,
+  };
+  state.agents[ambiguousTransitionRuntimeId] = {
+    agent: 'codex', agent_status: 'idle', cwd: root, foreground_cwd: root,
+    interactive_ready: true, name: ambiguousTransitionRuntimeId,
+    pane_id: `${ambiguousTransitionWorkspaceId}:p1`, tab_id: `${ambiguousTransitionWorkspaceId}:t1`,
+    terminal_id: `term-${ambiguousTransitionRuntimeId}`, workspace_id: ambiguousTransitionWorkspaceId, transcript: 'AMBIGUOUS',
+  };
+  await fs.writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, 'utf8');
+  try {
+    await metadataModuleA.agentSuspend({ agentId: ambiguousTransitionId });
+    throw new Error('Ambiguous transitional metadata was unexpectedly treated as active');
+  } catch (error) {
+    if (error?.code !== 'agent_invalid_transition') throw error;
+  }
+  try {
+    await metadataModuleA.agentStop({ agentId: ambiguousTransitionId });
+    throw new Error('agent_stop unexpectedly touched ambiguous transitional ownership');
+  } catch (error) {
+    if (error?.code !== 'agent_ambiguous_ownership') throw error;
+  }
+  const orphanStopId = 'agent-f5555555555555555555555555';
+  const orphanStopRuntimeId = 'agent-88888888888888888888888888';
+  const orphanStopWorkspaceId = 'orphan-stop-workspace';
+  await metadataModuleB.__testUpdateAgentMetadata(orphanStopId, {
+    version: 1, agentId: orphanStopId, harness: 'codex', cwd: root,
+    nativeSessionId: 'orphan-stop-native', nativeSessionAttribution: 'verified', resumable: true,
+    runtimeAgentId: orphanStopRuntimeId, runtimeWorkspaceId: orphanStopWorkspaceId,
+    lifecycle: 'resuming', updatedAt: new Date().toISOString(),
+  });
+  state = JSON.parse(await fs.readFile(statePath, 'utf8'));
+  state.workspaces[orphanStopWorkspaceId] = {
+    workspace: { workspace_id: orphanStopWorkspaceId, label: orphanStopRuntimeId, number: 1 },
+    paneId: `${orphanStopWorkspaceId}:p1`, tabId: `${orphanStopWorkspaceId}:t1`, cwd: root,
+  };
+  await fs.writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, 'utf8');
+  const orphanStopped = await metadataModuleA.agentStop({ agentId: orphanStopId });
+  if (!orphanStopped.discarded || JSON.parse(await fs.readFile(metadataPath, 'utf8')).agents[orphanStopId]) {
+    throw new Error('agent_stop did not close and discard an exactly identified orphan transitional workspace');
+  }
+  state = JSON.parse(await fs.readFile(statePath, 'utf8'));
+  if (state.workspaces[orphanStopWorkspaceId]) throw new Error('agent_stop left a transitional orphan workspace behind');
+  state = JSON.parse(await fs.readFile(statePath, 'utf8'));
+  delete state.workspaces[ambiguousTransitionWorkspaceId];
+  delete state.agents[ambiguousTransitionRuntimeId];
+  await fs.writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, 'utf8');
+  await fs.rm(metadataPath, { force: true });
 
   state = JSON.parse(await fs.readFile(statePath, 'utf8'));
   const workspaceCountBeforeMissingWorkspaceId = Object.keys(state.workspaces).length;

@@ -19,6 +19,8 @@ import {
   agentSendKeys,
   agentStart,
   agentStop,
+  agentSuspend,
+  agentResume,
 } from './agents.js';
 import { collectCapabilities, inspectCommands } from './capabilities.js';
 import { createBridgeToolAdapterFactory } from './adapters/index.js';
@@ -415,6 +417,8 @@ const NATIVE_TOOL_NAMES = new Set([
   'agent_read',
   'agent_prompt',
   'agent_send_keys',
+  'agent_suspend',
+  'agent_resume',
   'agent_stop',
   'process_start',
   'process_list',
@@ -568,7 +572,7 @@ async function createServer() {
     'agent_capabilities',
     {
       description:
-        'Discover the Herdr agent runtime, configured persistent session, installed coding harnesses, active MCP-managed agents, and per-harness installed skills.',
+        'Discover the Herdr agent runtime, configured persistent session, installed coding harnesses, active and suspended MCP-managed logical agents, native/runtime IDs, lifecycle states, resumability/legacy status, and per-harness installed skills/resume support.',
       inputSchema: z.object({}),
     },
     async (_args, ctx) => jsonResult(await agentCapabilities({ signal: ctx.mcpReq.signal })),
@@ -670,10 +674,30 @@ async function createServer() {
   );
 
   server.registerTool(
+    'agent_suspend',
+    {
+      description:
+        'Suspend an idle or finished MCP-managed logical agent by closing its dedicated Herdr workspace while retaining a uniquely attributed native harness session ID. Use at a task/turn boundary to release runtime resources; legacy agents and sessions without verified native attribution fail clearly. This is distinct from agent_stop, which discards the logical agent.',
+      inputSchema: z.object({ agentId: agentIdSchema }),
+    },
+    async (args, ctx) => jsonResult(await agentSuspend(args, ctx.mcpReq.signal)),
+  );
+
+  server.registerTool(
+    'agent_resume',
+    {
+      description:
+        'Resume a suspended logical coding-agent session by creating a fresh Herdr workspace and launching the harness with its verified native session/conversation ID. This continues the same conversation; start a new agent for independent work. Fails clearly when native resume is unavailable.',
+      inputSchema: z.object({ agentId: agentIdSchema }),
+    },
+    async (args, ctx) => jsonResult(await agentResume(args, ctx.mcpReq.signal)),
+  );
+
+  server.registerTool(
     'agent_stop',
     {
       description:
-        'Stop an MCP-managed persistent agent by closing its dedicated Herdr workspace. This terminates that agent terminal without stopping the shared Herdr session or other agents.',
+        'Stop an MCP-managed agent with destructive terminal semantics: close its dedicated Herdr workspace when active, or discard its durable logical metadata when suspended. This never stops the shared Herdr session or other agents.',
       inputSchema: z.object({ agentId: agentIdSchema }),
     },
     async (args, ctx) => jsonResult(await agentStop(args, ctx.mcpReq.signal)),
