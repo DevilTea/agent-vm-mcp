@@ -113,3 +113,63 @@ The deployment-owned `~/.config/lsp-mcp/config.json` is created by `scripts/prov
 - Optional `probes` describe curated CLI invocations that are not standalone executables, such as `docker compose version`. Each probe names a real `command` on `PATH` plus direct `args`; `capabilities` reports the probe as available only when that invocation exits successfully. Probes do not change `command_info` semantics or synthesize fake commands on `PATH`.
 - Capability metadata is read on each tool call, so editing `capabilities.json` does not require a service restart. Adding/removing MCP tools still requires one so the MCP tool schema can be rediscovered.
 - Override the catalog path with `AGENT_MCP_CAPABILITIES_CONFIG` when needed.
+
+
+# System maintenance audit
+
+`system-audit.json` drives the read-only `system_audit` native MCP tool. The audit is deliberately split between **automatic discovery** and a small declarative exception map so that adding software to the VM does not require maintaining a second hard-coded checklist.
+
+Automatic discovery covers:
+
+- all installed mise tools from `mise ls --json`, including inactive installed versions; non-`npm:` tools use `mise latest` by default and `npm:<package>` tools use the npm registry;
+- all global npm packages from `npm ls -g --depth=0 --json`, with npm registry latest-version lookup inferred automatically;
+- every CLI declared in `capabilities.json`; coding harness versions come from the existing agent runtime inspection path and are never raw-launched by `system_audit`;
+- executable files in `directExecutableDirs` (by default `~/.local/bin` and `/usr/local/bin`), with obvious backup/temp names ignored;
+- configured important installations, service health, Git repository cleanliness/remote HEAD, APT upgrades, and project dependency drift.
+
+The coverage contract is explicit: any installed discovered item without an inferred source, a configured `latestSources` entry, or a `managedBy` owner is returned in `coverage.untracked`. A new tool therefore cannot silently disappear from maintenance reporting. `coverage.trackedCount`, `updateSourceKnownCount`, `managedElsewhereCount`, and `untrackedCount` make that invariant easy to monitor.
+
+## Adding a future tool
+
+In the common cases, do nothing beyond installing it:
+
+1. A tool installed through mise is discovered automatically.
+2. A package installed globally through npm is discovered automatically.
+3. A new curated CLI added to `capabilities.json` is automatically included.
+4. A custom executable dropped in one of `directExecutableDirs` is automatically included.
+
+Only add an explicit mapping when the audit can see the tool but cannot safely infer how to check its latest release. Put that mapping under `latestSources`; supported source kinds include npm, mise, and GitHub Releases. For example:
+
+```json
+{
+  "latestSources": {
+    "example-cli": {
+      "kind": "github-release",
+      "repo": "owner/example-cli",
+      "stripPrefix": "v"
+    }
+  }
+}
+```
+
+For an important binary outside the automatic directories, add a declarative `installations` entry instead of teaching the audit code about that specific tool:
+
+```json
+{
+  "installations": [
+    {
+      "id": "example-system-cli",
+      "kind": "command",
+      "command": "example-system-cli",
+      "args": ["--version"],
+      "managedBy": "apt/system"
+    }
+  ]
+}
+```
+
+`command` installations explicitly reject `codex`, `agy`, and `claude`; harness inspection remains owned by `agent_capabilities`. `npm-project` installations can represent fixed deployments such as `/opt/playwright-mcp` and automatically infer their npm update source.
+
+`latestSources` overrides inferred sources, which is useful for keeping a pinned major track (for example `node@24` or `pnpm@11`) instead of comparing against an unrelated next major. `coverage.managedElsewhere` can mark a discovered executable as intentionally maintained by another audited surface such as a Git repository.
+
+The tool is fail-soft: registry/network/repository failures are collected in `sourceErrors` and leave the affected item `unknown` rather than aborting the whole audit. `checkLatest: false` skips latest/remote lookups while retaining local inventory and health checks. The audit never installs, upgrades, restarts, fetches Git refs, or otherwise mutates the VM.

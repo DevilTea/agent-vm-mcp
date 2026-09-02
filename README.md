@@ -13,6 +13,7 @@ MCP server for controlling a dedicated Linux agent VM and forwarding tools from 
 - Start, rediscover, read, write to, and terminate persistent/interactive processes.
 - Orchestrate persistent coding-agent sessions through Herdr, including Codex, Antigravity CLI, and Claude Code when installed.
 - Discover curated CLI capabilities available on the VM.
+- Audit VM tool/update coverage, service health, repository freshness, APT updates, and project dependency drift with `system_audit`.
 - Bridge tools from upstream MCP servers over stdio or Streamable HTTP.
 - Filter, prefix, and rename bridged tools while rejecting name collisions.
 - Forward Playwright MCP tools through the same MCP endpoint.
@@ -40,6 +41,7 @@ MCP server for controlling a dedicated Linux agent VM and forwarding tools from 
 - `agent_stop`
 - `import_file`
 - `command_info`
+- `system_audit`
 - `present_file`
 - `process_start`
 - `process_list`
@@ -136,6 +138,7 @@ The server communicates over stdio.
 ## Configuration
 
 - `config/capabilities.json` defines the curated CLI catalog exposed to agents.
+- `config/system-audit.json` defines special update sources, important command-based installations, services, repositories, and projects for the read-only `system_audit` tool.
 - `config/bridges.json` defines upstream MCP servers and forwarded tools.
 - `AGENT_HERDR_SESSION` selects the persistent Herdr session name used by the native agent runtime (default `agent-vm-mcp`).
 - `AGENT_HERDR_BIN` optionally overrides the Herdr executable, primarily for controlled deployment/testing. Bare names resolve through `PATH`; absolute or relative path overrides must resolve to an executable regular file.
@@ -143,6 +146,8 @@ The server communicates over stdio.
 - `AGENT_STATE_DIR` optionally overrides the directory for durable logical-agent metadata (`agents.json`); otherwise `$XDG_STATE_HOME/agent-vm-mcp` or `~/.local/state/agent-vm-mcp` is used.
 
 See [`config/README.md`](config/README.md) for bridge configuration, environment forwarding, and capability discovery details.
+
+`system_audit` is intentionally discovery-first rather than a fixed checklist. It automatically inventories every installed mise tool, global npm package, curated CLI, and executable found in the configured VM-local binary directories. npm and mise entries get inferred latest-version sources automatically. System-path curated commands are treated as APT-managed. A newly discovered custom tool with no safe inferred/configured latest source is never dropped: it appears in `coverage.untracked` until a mapping is added to `config/system-audit.json`. This makes audit coverage degrade visibly instead of silently as the VM grows.
 
 The default bridge configuration connects to the shared Playwright MCP service at `http://localhost:8931/mcp`; the service itself binds only to `127.0.0.1`. Its `browser_take_screenshot` tool is adapted into the generic artifact channel. `/opt/playwright-mcp/start-isolated.sh` remains available for coding harnesses that need a fresh browser without the persistent profile. Adjust `config/bridges.json` for other deployments.
 

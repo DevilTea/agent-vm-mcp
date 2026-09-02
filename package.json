@@ -6,7 +6,7 @@
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
     "start": "node src/index.js",
-    "smoke": "bash test/browser-takeover-smoke.sh && bash test/agent-herdr-deployment-smoke.sh && node test/coding-harness-guard-smoke.mjs && node test/agents-smoke.mjs && node test/agent-mcp-error-smoke.mjs && node test/smoke.mjs"
+    "smoke": "node test/system-audit-smoke.mjs && bash test/browser-takeover-smoke.sh && bash test/agent-herdr-deployment-smoke.sh && node test/coding-harness-guard-smoke.mjs && node test/agents-smoke.mjs && node test/agent-mcp-error-smoke.mjs && node test/smoke.mjs"
   },
   "keywords": [],
   "author": "",

@@ -23,6 +23,7 @@ import {
   agentResume,
 } from './agents.js';
 import { collectCapabilities, inspectCommands } from './capabilities.js';
+import { collectSystemAudit } from './system-audit.js';
 import { createBridgeToolAdapterFactory } from './adapters/index.js';
 import { createBridgeCallPolicyFactory } from './policies/index.js';
 import { ArtifactStore } from './artifacts/artifact-store.js';
@@ -428,6 +429,7 @@ const NATIVE_TOOL_NAMES = new Set([
   'mcp_bridge_status',
   'capabilities',
   'command_info',
+  'system_audit',
   'import_file',
   PRESENT_FILE_TOOL,
 ]);
@@ -910,6 +912,29 @@ async function createServer() {
   });
   await bridgeManager.initialize();
   activeBridgeManagers.add(bridgeManager);
+
+  server.registerTool(
+    'system_audit',
+    {
+      description:
+        'Run a read-only Agent VM maintenance audit: auto-discover managed/custom tools, check update sources, service/repository health, APT updates, and project dependency drift. Unknown newly discovered tools are surfaced in coverage.untracked instead of being silently omitted.',
+      inputSchema: z.object({
+        checkLatest: z
+          .boolean()
+          .default(true)
+          .describe('When true, query configured/inferred latest-version and remote-repository sources. No updates are installed.'),
+      }),
+    },
+    async ({ checkLatest }, ctx) =>
+      jsonResult(
+        await collectSystemAudit({
+          checkLatest,
+          signal: ctx.mcpReq.signal,
+          agentRuntime: await agentCapabilities({ signal: ctx.mcpReq.signal }),
+          bridgeStatus: bridgeManager.status(),
+        }),
+      ),
+  );
 
   server.registerTool(
     'capabilities',

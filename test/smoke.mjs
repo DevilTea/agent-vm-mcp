@@ -285,6 +285,7 @@ exec /usr/bin/git "$@"
     'mcp_bridge_status',
     'capabilities',
     'command_info',
+    'system_audit',
     'present_file',
     'browser_navigate',
     'browser_snapshot',
