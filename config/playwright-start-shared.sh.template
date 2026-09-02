@@ -12,4 +12,7 @@ BROWSER_EXECUTABLE="$($NODE --input-type=module -e "import { chromium } from 'pl
 exec "$NODE" /opt/playwright-mcp/node_modules/@playwright/mcp/cli.js \
   --executable-path "$BROWSER_EXECUTABLE" \
   --user-data-dir "@AGENT_HOME@/.local/share/playwright-mcp/profile" \
-  --output-dir "@AGENT_HOME@/.local/share/playwright-mcp/output"
+  --output-dir "@AGENT_HOME@/.local/share/playwright-mcp/output" \
+  --host 127.0.0.1 \
+  --port 8931 \
+  --shared-browser-context

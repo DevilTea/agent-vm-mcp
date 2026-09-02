@@ -130,15 +130,20 @@ replace_literal_if_present \
   "$legacy_node" \
   "$node_bin"
 
-replace_literal_if_present \
+for playwright_launcher in \
   /opt/playwright-mcp/start.sh \
-  "$legacy_pnpm_bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
-  "$mise_shims:$agent_home/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+  /opt/playwright-mcp/start-shared.sh \
+  /opt/playwright-mcp/start-isolated.sh; do
+  replace_literal_if_present \
+    "$playwright_launcher" \
+    "$legacy_pnpm_bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+    "$mise_shims:$agent_home/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
-replace_literal_if_present \
-  /opt/playwright-mcp/start.sh \
-  "$legacy_node" \
-  "$node_bin"
+  replace_literal_if_present \
+    "$playwright_launcher" \
+    "$legacy_node" \
+    "$node_bin"
+done
 
 render_systemd_template() {
   local source=$1

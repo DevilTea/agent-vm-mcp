@@ -5,9 +5,8 @@
       "id": "playwright",
       "enabled": true,
       "transport": {
-        "type": "stdio",
-        "command": "/opt/playwright-mcp/start.sh",
-        "args": []
+        "type": "streamable-http",
+        "url": "http://localhost:8931/mcp"
       },
       "toolPrefix": "",
       "includeTools": [

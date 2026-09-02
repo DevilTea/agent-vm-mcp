@@ -50,7 +50,7 @@ A bridge is connected during `agent-mcp` startup; changing the config therefore 
 ```
 
 Tool names must be unique after prefixing/renaming. Startup fails on collisions instead of silently shadowing tools.
-Playwright deliberately uses an empty prefix because its upstream tool names already use the `browser_` namespace.
+Playwright deliberately uses an empty prefix because its upstream tool names already use the `browser_` namespace. The production Playwright bridge uses Streamable HTTP at `http://localhost:8931/mcp`; `agent-playwright-shared.service` binds the server to IPv4 loopback and owns the persistent profile independently of `agent-tunnel.service`. Coding harnesses that need a clean browser start `/opt/playwright-mcp/start-isolated.sh` as their own stdio MCP process instead of attaching to the shared profile.
 
 ## Tool result adapters
 

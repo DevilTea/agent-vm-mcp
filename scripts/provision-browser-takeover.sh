@@ -36,14 +36,17 @@ node_version=24.19.0
 mise_data_dir="$agent_home/.local/share/mise"
 mise_shims="$mise_data_dir/shims"
 node_bin="$mise_data_dir/installs/node/$node_version/bin/node"
-playwright_launcher_source="$repo_root/config/playwright-start-headed.sh.template"
+playwright_shared_launcher_source="$repo_root/config/playwright-start-shared.sh.template"
+playwright_isolated_launcher_source="$repo_root/config/playwright-start-isolated.sh.template"
 systemd_template_dir="$repo_root/config/systemd"
 
 for required in \
-  "$playwright_launcher_source" \
+  "$playwright_shared_launcher_source" \
+  "$playwright_isolated_launcher_source" \
   "$systemd_template_dir/agent-browser-x.service.template" \
   "$systemd_template_dir/agent-browser-vnc.service.template" \
   "$systemd_template_dir/agent-browser-novnc.service.template" \
+  "$systemd_template_dir/agent-playwright-shared.service.template" \
   "$systemd_template_dir/agent-tunnel-browser.conf"; do
   if [[ ! -r $required ]]; then
     echo "Missing deployment template: $required" >&2
@@ -125,18 +128,21 @@ PY
 render_template "$systemd_template_dir/agent-browser-x.service.template" /etc/systemd/system/agent-browser-x.service
 render_template "$systemd_template_dir/agent-browser-vnc.service.template" /etc/systemd/system/agent-browser-vnc.service
 render_template "$systemd_template_dir/agent-browser-novnc.service.template" /etc/systemd/system/agent-browser-novnc.service
+render_template "$systemd_template_dir/agent-playwright-shared.service.template" /etc/systemd/system/agent-playwright-shared.service
 
 install -d -m 0755 -o root -g root /etc/systemd/system/agent-tunnel.service.d
 install -m 0644 -o root -g root \
   "$systemd_template_dir/agent-tunnel-browser.conf" \
   /etc/systemd/system/agent-tunnel.service.d/browser-display.conf
 
-render_template "$playwright_launcher_source" /opt/playwright-mcp/start.sh 0755
+render_template "$playwright_shared_launcher_source" /opt/playwright-mcp/start-shared.sh 0755
+render_template "$playwright_isolated_launcher_source" /opt/playwright-mcp/start-isolated.sh 0755
 
 systemctl daemon-reload
 systemctl enable --now agent-browser-x.service
 systemctl enable --now agent-browser-vnc.service
 systemctl enable --now agent-browser-novnc.service
+systemctl enable agent-playwright-shared.service
 systemctl enable --now tailscaled.service
 
 systemctl is-active --quiet agent-browser-x.service
@@ -146,4 +152,5 @@ systemctl is-active --quiet tailscaled.service
 
 echo "Browser takeover dependencies provisioned for $agent_user."
 echo "Tailscale enrollment remains explicit; run tailscale up separately as the operator when ready."
-echo "agent-tunnel.service was not restarted. Restart it separately to activate headed Playwright."
+echo "Shared Playwright MCP was installed and enabled but not started, so the currently running tunnel-owned browser is untouched."
+echo "Restart agent-tunnel.service separately during an idle window; the updated dependency will start agent-playwright-shared.service after the old tunnel-owned browser exits."

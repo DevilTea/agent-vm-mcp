@@ -1,0 +1,21 @@
+[Unit]
+Description=Shared persistent Playwright MCP browser
+Requires=agent-browser-x.service
+After=agent-browser-x.service
+Before=agent-tunnel.service
+
+[Service]
+Type=simple
+User=@AGENT_USER@
+Group=@AGENT_GROUP@
+Environment=HOME=@AGENT_HOME@
+Environment=DISPLAY=:99
+Environment=PATH=@MISE_SHIMS@:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/opt/playwright-mcp/start-shared.sh
+Restart=always
+RestartSec=1s
+TimeoutStopSec=10s
+KillMode=control-group
+
+[Install]
+WantedBy=multi-user.target

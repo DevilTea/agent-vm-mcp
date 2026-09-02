@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+export HOME="@AGENT_HOME@"
+export PATH="@MISE_SHIMS@:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+cd /opt/playwright-mcp
+NODE="@NODE_BIN@"
+BROWSER_EXECUTABLE="$($NODE --input-type=module -e "import { chromium } from 'playwright'; process.stdout.write(chromium.executablePath())")"
+
+exec "$NODE" /opt/playwright-mcp/node_modules/@playwright/mcp/cli.js \
+  --headless \
+  --isolated \
+  --executable-path "$BROWSER_EXECUTABLE" \
+  --output-dir "@AGENT_HOME@/.local/share/playwright-mcp/fresh-output"

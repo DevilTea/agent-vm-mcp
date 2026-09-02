@@ -113,7 +113,7 @@ Provision browser human takeover after Playwright MCP and mise are installed:
 sudo ./scripts/provision-browser-takeover.sh
 ```
 
-The browser takeover provisioner installs a persistent `Xvfb` display, loopback-only `x11vnc` and noVNC/websockify services, and Tailscale. It also writes the production Playwright launcher so the existing persistent profile runs headed on `DISPLAY=:99`, and makes the virtual display a startup dependency of `agent-tunnel.service`. The provisioner starts the display/VNC/noVNC services and `tailscaled`, but deliberately does **not** restart `agent-tunnel.service` or enroll Tailscale.
+The browser takeover provisioner installs a persistent `Xvfb` display, loopback-only `x11vnc` and noVNC/websockify services, Tailscale, a loopback-only shared Playwright MCP service, and a separate fresh-browser launcher. The shared service uses the existing persistent profile, runs headed on `DISPLAY=:99`, listens only on `127.0.0.1:8931`, and enables Playwright MCP's shared browser context so multiple MCP clients can intentionally operate the same logged-in browser state. The fresh launcher uses `--isolated --headless` without a user-data directory, so each stdio client gets a clean disposable browser state. The provisioner starts the display/VNC/noVNC services and `tailscaled`, but only **enables** `agent-playwright-shared.service`; it deliberately does not start that service or restart `agent-tunnel.service`, so provisioning cannot steal the persistent profile from an already-running tunnel-owned Playwright process. Activate the new topology only during an idle window by restarting the tunnel after provisioning.
 
 Tailscale is only a stable reachability layer for ordinary OpenSSH. Do not expose VNC/noVNC with `tailscale serve`, Tailscale SSH, a tailnet listener, a LAN listener, or a public listener. Enroll the VM separately as the operator, then create a normal SSH local forward from the machine where the browser will be viewed:
 
@@ -144,7 +144,9 @@ The server communicates over stdio.
 
 See [`config/README.md`](config/README.md) for bridge configuration, environment forwarding, and capability discovery details.
 
-The default bridge configuration expects the local Playwright MCP launcher at `/opt/playwright-mcp/start.sh`. Its `browser_take_screenshot` tool is adapted into the generic artifact channel. Adjust `config/bridges.json` for other deployments.
+The default bridge configuration connects to the shared Playwright MCP service at `http://localhost:8931/mcp`; the service itself binds only to `127.0.0.1`. Its `browser_take_screenshot` tool is adapted into the generic artifact channel. `/opt/playwright-mcp/start-isolated.sh` remains available for coding harnesses that need a fresh browser without the persistent profile. Adjust `config/bridges.json` for other deployments.
+
+Codex/Agy browser MCP registrations on the dedicated Agent VM are machine-local runtime configuration, not portable dot-agents canonical configuration. Do not add these endpoints to `dot-agents/harnesses/*`. Codex MCP entries may live directly in `~/.codex/config.toml` or, preferably on this VM, in the non-Git `~/.config/dot-agents/overrides/codex.toml`; dot-agents only patches its managed TOML keys and preserves unrelated MCP entries. Antigravity's `~/.gemini/config/mcp_config.json` is outside the dot-agents managed settings surface and is likewise VM-local. Existing harness processes are not restarted when these files are prepared; new sessions pick up the configuration after it is materialized.
 
 Artifact resources are opaque, process-local references with a 24-hour default TTL and a 50 MiB default size limit. Override these with `AGENT_ARTIFACT_TTL_MS` and `AGENT_ARTIFACT_MAX_BYTES`. Files registered by callers such as `present_file` remain caller-owned; temporary spill files created by `exec` are artifact-store-owned and are removed on expiry or graceful server shutdown.
 
