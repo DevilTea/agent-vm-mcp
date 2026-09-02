@@ -4,6 +4,8 @@ set -euo pipefail
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 bridge_config="$repo_root/config/bridges.json"
 shared_launcher="$repo_root/config/playwright-start-shared.sh.template"
+shared_proxy_launcher="$repo_root/config/playwright-start-shared-proxy.sh.template"
+shared_proxy_config="$repo_root/config/playwright-shared-proxy.json"
 isolated_launcher="$repo_root/config/playwright-start-isolated.sh.template"
 x_unit="$repo_root/config/systemd/agent-browser-x.service.template"
 playwright_unit="$repo_root/config/systemd/agent-playwright-shared.service.template"
@@ -43,6 +45,12 @@ require_literal "$shared_launcher" '--shared-browser-context'
 reject_literal "$shared_launcher" '--headless'
 reject_literal "$shared_launcher" '--isolated'
 
+require_literal "$shared_proxy_launcher" '/opt/agent-mcp/src/playwright-shared-stdio-proxy.js'
+require_literal "$shared_proxy_config" '"type": "streamable-http"'
+require_literal "$shared_proxy_config" '"url": "http://localhost:8931/mcp"'
+require_literal "$shared_proxy_config" '"browser_*"'
+reject_literal "$shared_proxy_config" '"type": "stdio"'
+
 require_literal "$isolated_launcher" '--headless'
 require_literal "$isolated_launcher" '--isolated'
 require_literal "$isolated_launcher" '--output-dir "@AGENT_HOME@/.local/share/playwright-mcp/fresh-output"'
@@ -77,6 +85,7 @@ for package in novnc websockify x11-utils x11vnc xvfb tailscale; do
 done
 require_literal "$provisioner" 'systemctl enable --now tailscaled.service'
 require_literal "$provisioner" 'systemctl enable agent-playwright-shared.service'
+require_literal "$provisioner" 'start-shared-proxy.sh'
 reject_literal "$provisioner" 'systemctl enable --now agent-playwright-shared.service'
 if grep -Eq '^[[:space:]]*tailscale[[:space:]]+(up|serve|ssh)([[:space:]]|$)' "$provisioner"; then
   echo "Provisioner must not enroll Tailscale, expose noVNC with tailscale serve, or enable Tailscale SSH." >&2

@@ -37,12 +37,15 @@ mise_data_dir="$agent_home/.local/share/mise"
 mise_shims="$mise_data_dir/shims"
 node_bin="$mise_data_dir/installs/node/$node_version/bin/node"
 playwright_shared_launcher_source="$repo_root/config/playwright-start-shared.sh.template"
+playwright_shared_proxy_launcher_source="$repo_root/config/playwright-start-shared-proxy.sh.template"
 playwright_isolated_launcher_source="$repo_root/config/playwright-start-isolated.sh.template"
 systemd_template_dir="$repo_root/config/systemd"
 
 for required in \
   "$playwright_shared_launcher_source" \
+  "$playwright_shared_proxy_launcher_source" \
   "$playwright_isolated_launcher_source" \
+  "$repo_root/config/playwright-shared-proxy.json" \
   "$systemd_template_dir/agent-browser-x.service.template" \
   "$systemd_template_dir/agent-browser-vnc.service.template" \
   "$systemd_template_dir/agent-browser-novnc.service.template" \
@@ -136,6 +139,7 @@ install -m 0644 -o root -g root \
   /etc/systemd/system/agent-tunnel.service.d/browser-display.conf
 
 render_template "$playwright_shared_launcher_source" /opt/playwright-mcp/start-shared.sh 0755
+render_template "$playwright_shared_proxy_launcher_source" /opt/playwright-mcp/start-shared-proxy.sh 0755
 render_template "$playwright_isolated_launcher_source" /opt/playwright-mcp/start-isolated.sh 0755
 
 systemctl daemon-reload

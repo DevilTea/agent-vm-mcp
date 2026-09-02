@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "bridges": [
+    {
+      "id": "playwright",
+      "enabled": true,
+      "transport": {
+        "type": "streamable-http",
+        "url": "http://localhost:8931/mcp"
+      },
+      "toolPrefix": "",
+      "includeTools": [
+        "browser_*"
+      ]
+    }
+  ]
+}

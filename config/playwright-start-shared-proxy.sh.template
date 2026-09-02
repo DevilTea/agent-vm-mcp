@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+export HOME="@AGENT_HOME@"
+export PATH="@MISE_SHIMS@:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+exec "@NODE_BIN@" /opt/agent-mcp/src/playwright-shared-stdio-proxy.js
