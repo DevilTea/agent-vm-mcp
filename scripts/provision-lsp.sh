@@ -23,7 +23,7 @@ agent_group=$(id -gn "$agent_user")
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 config_template="$repo_root/config/lsp-mcp.json.template"
 
-node_version=24.19.0
+node_version=24.20.0
 lsp_mcp_version=0.3.1
 typescript_language_server_version=5.3.0
 typescript_version=6.0.3

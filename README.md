@@ -55,8 +55,8 @@ Additional tools can be exported by configured MCP bridges.
 
 ## Requirements
 
-- Node.js 24.19.0
-- pnpm 11.22.0
+- Node.js 24.20.0
+- pnpm 11.25.0
 - Herdr 0.8.2
 
 The dedicated Agent VM provisions these through `mise`; repository-local mise configuration may override the fallback versions only after explicit trust. Coding harnesses are optional runtime dependencies: `agent_start` currently supports Codex (`codex`), Antigravity CLI (`agy`), and Claude Code (`claude`) when the corresponding executable is installed.
@@ -81,7 +81,7 @@ Provision the versioned developer toolchain with:
 sudo ./scripts/provision-mise.sh
 ```
 
-The mise provisioner installs mise through the Ubuntu-supported PPA path, installs the exact Agent VM fallback versions (Node `24.19.0`, pnpm `11.22.0`, Herdr `0.8.2`), configures non-interactive shims, and migrates the systemd/tunnel/Playwright launch paths away from the legacy pnpm-managed Node executable. It does **not** restart `agent-tunnel.service` because doing so terminates the active MCP connection. Restart and validate the service separately, then remove the old pnpm-managed executable/global Node environment with:
+The mise provisioner installs mise through the Ubuntu-supported PPA path, installs the exact Agent VM fallback versions (Node `24.20.0`, pnpm `11.25.0`, Herdr `0.8.2`), configures non-interactive shims, and migrates the systemd/tunnel/Playwright launch paths away from the legacy pnpm-managed Node executable. It does **not** restart `agent-tunnel.service` because doing so terminates the active MCP connection. Restart and validate the service separately, then remove the old pnpm-managed executable/global Node environment with:
 
 ```bash
 sudo ./scripts/provision-mise.sh --cleanup-legacy

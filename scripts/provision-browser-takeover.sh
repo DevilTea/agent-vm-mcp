@@ -32,7 +32,7 @@ fi
 agent_home=$(cut -d: -f6 <<<"$agent_passwd")
 agent_group=$(id -gn "$agent_user")
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-node_version=24.19.0
+node_version=24.20.0
 mise_data_dir="$agent_home/.local/share/mise"
 mise_shims="$mise_data_dir/shims"
 node_bin="$mise_data_dir/installs/node/$node_version/bin/node"

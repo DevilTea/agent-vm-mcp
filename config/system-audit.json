@@ -31,14 +31,14 @@
       "kind": "mise",
       "tool": "pnpm@11"
     },
-    "mise": {
-      "kind": "github-release",
-      "repo": "jdx/mise",
-      "stripPrefix": "v"
-    },
     "tailscale": {
       "kind": "github-release",
       "repo": "tailscale/tailscale",
+      "stripPrefix": "v"
+    },
+    "tunnel-client": {
+      "kind": "github-release",
+      "repo": "openai/tunnel-client",
       "stripPrefix": "v"
     }
   },
@@ -88,12 +88,22 @@
       "id": "dot-agents",
       "path": "/home/agent/projects/DevilTea/dot-agents",
       "branch": "main"
+    },
+    {
+      "id": "valchecker",
+      "path": "/home/agent/projects/DevilTea/valchecker",
+      "branch": "main"
     }
   ],
   "projects": [
     {
       "id": "agent-vm-mcp",
       "path": "/home/agent/projects/DevilTea/agent-vm-mcp",
+      "packageManager": "pnpm"
+    },
+    {
+      "id": "valchecker",
+      "path": "/home/agent/projects/DevilTea/valchecker",
       "packageManager": "pnpm"
     }
   ],

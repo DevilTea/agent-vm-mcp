@@ -11,7 +11,7 @@ import { StdioClientTransport } from '@modelcontextprotocol/client/stdio';
 
 import { ArtifactStore } from '../src/artifacts/artifact-store.js';
 
-const node = '/home/agent/.local/share/mise/installs/node/24.19.0/bin/node';
+const node = '/home/agent/.local/share/mise/installs/node/24.20.0/bin/node';
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const serverEntry = path.join(projectRoot, 'src/index.js');
 const smokeBridgeConfig = `/tmp/agent-mcp-bridges-smoke-${process.pid}.json`;
