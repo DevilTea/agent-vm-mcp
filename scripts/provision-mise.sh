@@ -39,7 +39,8 @@ agent_home=$(cut -d: -f6 <<<"$agent_passwd")
 agent_group=$(id -gn "$agent_user")
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 mise_config_source="$repo_root/config/agent-mise.toml"
-mise_config_dir="$agent_home/.config/mise"
+agent_config_root="$agent_home/.config"
+mise_config_dir="$agent_config_root/mise"
 mise_config="$mise_config_dir/config.toml"
 mise_data_dir="$agent_home/.local/share/mise"
 mise_shims="$mise_data_dir/shims"
@@ -68,6 +69,9 @@ if ! grep -RqsE '(^|/)jdxcode/mise' /etc/apt/sources.list /etc/apt/sources.list.
 fi
 apt-get install -y --no-install-recommends mise
 
+# The dedicated agent must own its XDG config root so tools such as Herdr and
+# browser runtimes can create their own sibling configuration directories.
+install -d -m 0755 -o "$agent_user" -g "$agent_group" "$agent_config_root"
 install -d -m 0755 -o "$agent_user" -g "$agent_group" "$mise_config_dir"
 install -m 0644 -o "$agent_user" -g "$agent_group" "$mise_config_source" "$mise_config"
 

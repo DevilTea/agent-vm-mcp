@@ -42,6 +42,10 @@ node_version=24.20.0
 mise_data_dir="$agent_home/.local/share/mise"
 mise_shims="$mise_data_dir/shims"
 node_bin="$mise_data_dir/installs/node/$node_version/bin/node"
+pnpm_bin="$mise_shims/pnpm"
+playwright_install_root=/opt/playwright-mcp
+playwright_manifest_source="$repo_root/config/playwright-mcp/package.json"
+playwright_lock_source="$repo_root/config/playwright-mcp/pnpm-lock.yaml"
 playwright_shared_launcher_source="$repo_root/config/playwright-start-shared.sh.template"
 playwright_shared_proxy_launcher_source="$repo_root/config/playwright-start-shared-proxy.sh.template"
 playwright_isolated_launcher_source="$repo_root/config/playwright-start-isolated.sh.template"
@@ -51,6 +55,8 @@ for required in \
   "$playwright_shared_launcher_source" \
   "$playwright_shared_proxy_launcher_source" \
   "$playwright_isolated_launcher_source" \
+  "$playwright_manifest_source" \
+  "$playwright_lock_source" \
   "$repo_root/config/playwright-shared-proxy.json" \
   "$systemd_template_dir/agent-browser-x.service.template" \
   "$systemd_template_dir/agent-browser-vnc.service.template" \
@@ -62,15 +68,18 @@ for required in \
   fi
 done
 
-if [[ ! -x $node_bin ]]; then
-  echo "Pinned mise-managed Node executable is missing: $node_bin" >&2
+if [[ ! -x $node_bin || ! -x $pnpm_bin ]]; then
+  echo "Pinned mise-managed Node/pnpm executables are missing." >&2
   echo "Run scripts/provision-mise.sh first." >&2
   exit 1
 fi
-if [[ ! -f /opt/playwright-mcp/node_modules/@playwright/mcp/cli.js ]]; then
-  echo "Playwright MCP is not installed at /opt/playwright-mcp." >&2
-  exit 1
-fi
+
+run_as_agent() {
+  runuser -u "$agent_user" -- env \
+    HOME="$agent_home" \
+    PATH="$mise_shims:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+    "$@"
+}
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
@@ -97,6 +106,23 @@ install -m 0644 -o root -g root "$tmp_list" "$tailscale_list"
 
 apt-get update
 apt-get install -y --no-install-recommends tailscale
+
+# Install the pinned Playwright MCP deployment and browser runtime. The tracked
+# manifest + lockfile make this reproducible on a clean Agent VM.
+install -d -m 0755 -o "$agent_user" -g "$agent_group" "$playwright_install_root"
+install -m 0644 -o "$agent_user" -g "$agent_group" "$playwright_manifest_source" "$playwright_install_root/package.json"
+install -m 0644 -o "$agent_user" -g "$agent_group" "$playwright_lock_source" "$playwright_install_root/pnpm-lock.yaml"
+run_as_agent "$pnpm_bin" --dir "$playwright_install_root" install --frozen-lockfile
+
+# Browser shared-library dependencies are machine-wide; install them as root.
+"$node_bin" "$playwright_install_root/node_modules/playwright/cli.js" install-deps chromium
+# Browser binaries belong to the dedicated agent user's Playwright cache.
+run_as_agent "$node_bin" "$playwright_install_root/node_modules/playwright/cli.js" install chromium
+
+if [[ ! -f "$playwright_install_root/node_modules/@playwright/mcp/cli.js" ]]; then
+  echo "Pinned Playwright MCP install did not produce the expected CLI." >&2
+  exit 1
+fi
 
 render_template() {
   local source=$1

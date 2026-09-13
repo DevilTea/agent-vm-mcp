@@ -166,7 +166,7 @@ The scripts currently provision or configure:
 - Docker/Compose/Buildx;
 - mise-managed Node, pnpm, and Herdr plus `agent-herdr.service`;
 - a controlled read-only LSP integration under `/opt/language-server-mcp`;
-- optional persistent Playwright browser/noVNC infrastructure and launchers under `/opt/playwright-mcp`.
+- a pinned Playwright MCP + Chromium deployment under `/opt/playwright-mcp`, plus optional persistent browser/noVNC infrastructure and launchers.
 
 `/opt/agent-vm-mcp` is the canonical deployment path for the optional systemd/browser takeover deployment. `scripts/provision-browser-takeover.sh` intentionally fails unless it is run from that checkout, because the installed shared-browser proxy launcher executes control-plane source from that stable path.
 

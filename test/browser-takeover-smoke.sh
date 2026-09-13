@@ -13,6 +13,8 @@ vnc_unit="$repo_root/config/systemd/agent-browser-vnc.service.template"
 novnc_unit="$repo_root/config/systemd/agent-browser-novnc.service.template"
 tunnel_example="$repo_root/config/examples/systemd/agent-tunnel-browser.conf"
 provisioner="$repo_root/scripts/provision-browser-takeover.sh"
+playwright_manifest="$repo_root/config/playwright-mcp/package.json"
+playwright_lock="$repo_root/config/playwright-mcp/pnpm-lock.yaml"
 
 require_literal() {
   local file=$1
@@ -92,6 +94,13 @@ require_literal "$provisioner" 'systemctl enable agent-playwright-shared.service
 require_literal "$provisioner" 'start-shared-proxy.sh'
 require_literal "$provisioner" 'canonical_control_plane_root=/opt/agent-vm-mcp'
 require_literal "$provisioner" 'if [[ $repo_root != "$canonical_control_plane_root" ]]'
+require_literal "$playwright_manifest" '"@playwright/mcp": "0.0.79"'
+require_literal "$playwright_manifest" '"playwright": "1.63.0-alpha-2026-08-05"'
+require_literal "$provisioner" 'install --frozen-lockfile'
+require_literal "$provisioner" 'install-deps chromium'
+require_literal "$provisioner" 'install chromium'
+require_literal "$provisioner" 'playwright_manifest_source='
+require_literal "$provisioner" 'playwright_lock_source='
 reject_literal "$provisioner" 'systemctl enable --now agent-playwright-shared.service'
 if grep -Eq '^[[:space:]]*tailscale[[:space:]]+(up|serve|ssh)([[:space:]]|$)' "$provisioner"; then
   echo "Provisioner must not enroll Tailscale, expose noVNC with tailscale serve, or enable Tailscale SSH." >&2

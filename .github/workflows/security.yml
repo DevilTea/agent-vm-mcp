@@ -8,6 +8,8 @@ on:
     paths:
       - package.json
       - pnpm-lock.yaml
+      - config/playwright-mcp/package.json
+      - config/playwright-mcp/pnpm-lock.yaml
   push:
     branches:
       - main
@@ -16,6 +18,8 @@ on:
     paths:
       - package.json
       - pnpm-lock.yaml
+      - config/playwright-mcp/package.json
+      - config/playwright-mcp/pnpm-lock.yaml
 
 permissions:
   contents: read
@@ -39,9 +43,16 @@ jobs:
         with:
           node-version: 24.20.0
           cache: pnpm
+          cache-dependency-path: |
+            pnpm-lock.yaml
+            config/playwright-mcp/pnpm-lock.yaml
 
       - name: Install dependencies
-        run: pnpm install --frozen-lockfile
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm --dir config/playwright-mcp install --frozen-lockfile --ignore-scripts
 
       - name: Audit production dependencies
-        run: pnpm audit --prod
+        run: |
+          pnpm audit --prod
+          pnpm --dir config/playwright-mcp audit --prod
