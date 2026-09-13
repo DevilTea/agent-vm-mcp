@@ -10,6 +10,7 @@ import { Client } from '@modelcontextprotocol/client';
 import { StdioClientTransport } from '@modelcontextprotocol/client/stdio';
 
 import { ArtifactStore } from '../src/artifacts/artifact-store.js';
+import { catalogIdentityFromTools } from '../src/server-info.js';
 
 const liveIntegrations = process.env.AGENT_VM_SMOKE_LIVE_INTEGRATIONS === '1';
 const hostKind = process.env.AGENT_MCP_HOST ?? 'generic';
@@ -312,6 +313,7 @@ exec /usr/bin/git "$@"
     'capabilities',
     'command_info',
     'system_audit',
+    'server_info',
     'read_artifact',
     'present_artifact',
     'present_file',
@@ -1299,6 +1301,38 @@ exec /usr/bin/git "$@"
   const binaryResource = await client.readResource({ uri: binaryArtifact.uri });
   if (binaryResource.contents?.[0]?.blob !== Buffer.from([0x00, 0x01, 0x02, 0xff]).toString('base64')) {
     throw new Error('Binary present_file resource round-trip failed');
+  }
+
+  const serverInfoTool = allTools.find((tool) => tool.name === 'server_info');
+  if (!serverInfoTool) throw new Error('server_info tool missing');
+  const serverInfo = parseJsonToolResult(await client.callTool({ name: 'server_info', arguments: {} }));
+  if (
+    serverInfo.server?.name !== 'agent-vm-control' ||
+    serverInfo.server?.version !== '0.5.0' ||
+    typeof serverInfo.server?.startedAt !== 'string' ||
+    typeof serverInfo.server?.pid !== 'number'
+  ) {
+    throw new Error('server_info runtime identity is incomplete');
+  }
+  if (
+    !/^sha256:[0-9a-f]{64}$/.test(serverInfo.catalog?.marker ?? '') ||
+    serverInfo.catalog?.totalToolCount !== allTools.length ||
+    serverInfo.catalog?.hashedToolCount !== allTools.length - 1 ||
+    !Array.isArray(serverInfo.catalog?.toolNames) ||
+    serverInfo.catalog.toolNames.length !== allTools.length ||
+    !serverInfo.catalog.toolNames.includes('server_info')
+  ) {
+    throw new Error('server_info catalog identity is incomplete');
+  }
+  if (!serverInfoTool.description?.includes(serverInfo.catalog.marker)) {
+    throw new Error('server_info tool-definition marker does not match the running catalog marker');
+  }
+  const observedCatalogIdentity = catalogIdentityFromTools(allTools);
+  if (observedCatalogIdentity.hash !== serverInfo.catalog.hash) {
+    throw new Error('server_info catalog hash does not match the actual tools/list projection');
+  }
+  if (serverInfo.server.revision !== null && !/^[0-9a-f]{40}$/i.test(serverInfo.server.revision)) {
+    throw new Error('server_info revision is not a full Git commit hash');
   }
 
   const commandInfoNames = ['git', 'pnpm', 'definitely-not-an-agent-command'];

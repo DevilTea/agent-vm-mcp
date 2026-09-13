@@ -391,6 +391,10 @@ For example, after deploying a new model-only helper such as `read_artifact`, a 
 
 Use the ChatGPT app/action refresh or republish workflow appropriate to the workspace. If Refresh itself succeeds only through `server/discover` but no current `tools/list` is fetched and the new action remains unavailable, capture the tunnel trace rather than changing the MCP server to work around the stale snapshot. This failure boundary has been reported against `tunnel-client` v0.0.14 in upstream issue [#57](https://github.com/openai/tunnel-client/issues/57).
 
+`agent-vm-mcp` also exposes `server_info` for this diagnosis. Its tool description contains a deterministic catalog marker such as `sha256:...`, while a live call returns the marker for the catalog registered by the running process. If the marker in the ChatGPT-visible tool definition differs from `catalog.marker` in the call result, ChatGPT is using a stale action snapshot. The response also includes `catalog.toolNames`, tool counts, and the Git revision captured when the MCP process started.
+
+The first deployment that introduces `server_info` still requires ChatGPT to acquire that action once. After it is present in the approved snapshot, later schema/catalog deployments can use the same stable `server_info` action to distinguish a stale ChatGPT catalog from an outdated or unrestarted VM process.
+
 ### Long stdio calls end in 502 and the tunnel restarts
 
 `tunnel-client` v0.0.11 has a known shared-stdio response-deadline bug. When a command reaches its response deadline, that version can close the process-affine stdio pipes instead of retiring only the timed-out JSON-RPC request. The next write then fails and the whole `tunnel-client` process shuts down. A supervisor such as systemd may restart it a few seconds later, which can make the failure look intermittent.

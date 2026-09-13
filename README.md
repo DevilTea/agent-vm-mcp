@@ -112,6 +112,14 @@ Override them with `AGENT_ARTIFACT_TTL_MS`, `AGENT_ARTIFACT_MAX_BYTES`, and `AGE
 
 Both `read_file` and artifact resource reads enforce their source-size limit during I/O through one opened file descriptor rather than relying on a path-level `stat` followed by an unbounded `readFile`.
 
+## Server and tool-catalog identity
+
+`server_info` reports the identity of the **running MCP process**, including the package version, Git revision captured when that process started, dirty-tree state, host profile, PID, and start time. The revision is intentionally captured at server startup rather than read on every call, so a checkout that has been fast-forwarded before its old process is restarted cannot masquerade as the new deployment.
+
+The same tool reports a deterministic SHA-256 identity for the active MCP action catalog. The hash covers the public tool definitions that matter to a host snapshot—name, title/description, input/output schemas, annotations, icons, execution metadata, and `_meta`—including connected bridge tools. Handler implementation changes alone do not change the catalog hash. `server_info` is excluded from its own hash to avoid self-reference.
+
+The `server_info` tool description embeds the catalog marker that ChatGPT saw when it fetched that tool definition. Compare that embedded marker with `catalog.marker` returned by a live `server_info` call. If they differ, the running server and the host's frozen action snapshot disagree and the app actions should be refreshed. `catalog.toolNames` and the reported counts provide an additional sanity check.
+
 ## Workspaces and Git
 
 `workspace_create` manages a shared bare repository store plus isolated Git worktrees. A workspace has its own working tree, index, and `HEAD`; objects, refs, tags, remotes, repository-level config, and stash remain shared within that repository store.
