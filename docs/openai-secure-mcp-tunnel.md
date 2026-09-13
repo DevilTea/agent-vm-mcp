@@ -382,6 +382,39 @@ $XDG_CONFIG_HOME/agent-vm-mcp/bridges.json
 
 and inspect `mcp_bridge_status`.
 
+### Long stdio calls end in 502 and the tunnel restarts
+
+`tunnel-client` v0.0.11 has a known shared-stdio response-deadline bug. When a command reaches its response deadline, that version can close the process-affine stdio pipes instead of retiring only the timed-out JSON-RPC request. The next write then fails and the whole `tunnel-client` process shuts down. A supervisor such as systemd may restart it a few seconds later, which can make the failure look intermittent.
+
+A characteristic journal sequence is:
+
+```text
+command response deadline reached; dropping without posting a response
+stdio MCP command stdin write failed ... file already closed
+stdio MCP command failed; requesting tunnel-client shutdown
+```
+
+You may also see `MCP connection TTL reached; stopping response forwarding` immediately before the deadline message. At the OpenAI connector boundary, the failed transport can surface to the caller as HTTP 502 even though the MCP tool itself may have finished work locally.
+
+The shared-stdio deadline handling was fixed in v0.0.12 by keeping the child pipes open, retiring the timed-out JSON-RPC ID, and discarding a late response for that ID. Upgrade to v0.0.12 or newer; using the latest stable release is recommended.
+
+Check the installed version:
+
+```bash
+tunnel-client --version
+```
+
+After upgrading and restarting the service, verify that the tunnel remains healthy and does not restart while handling ordinary or long-running tool calls:
+
+```bash
+curl -fsS http://127.0.0.1:8080/readyz
+systemctl show agent-tunnel.service -p MainPID -p NRestarts
+journalctl -u agent-tunnel.service --since today \
+  | grep -E 'response deadline|file already closed|requesting tunnel-client shutdown'
+```
+
+Upstream tracking: [openai/tunnel-client#34](https://github.com/openai/tunnel-client/issues/34).
+
 ### ChatGPT-specific file input metadata is missing
 
 Confirm the MCP child inherited:
