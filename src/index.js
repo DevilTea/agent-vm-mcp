@@ -28,7 +28,7 @@ import { createBridgeToolAdapterFactory, validateBridgeToolAdapters } from './ad
 import { createBridgeCallPolicyFactory, validateBridgeCallPolicies } from './policies/index.js';
 import { ArtifactStore } from './artifacts/artifact-store.js';
 import {
-  ARTIFACT_READ_TOOL,
+  READ_ARTIFACT_TOOL,
   PRESENT_ARTIFACT_TOOL,
   PRESENT_FILE_TOOL,
 } from './artifacts/constants.js';
@@ -412,7 +412,7 @@ const NATIVE_TOOL_NAMES = new Set([
   'command_info',
   'system_audit',
   'import_file',
-  ARTIFACT_READ_TOOL,
+  READ_ARTIFACT_TOOL,
   PRESENT_ARTIFACT_TOOL,
   PRESENT_FILE_TOOL,
 ]);
@@ -450,7 +450,7 @@ async function createServer() {
     {
       description:
         'Execute an arbitrary shell command on the dedicated disposable Linux agent VM. ' +
-        'Oversized stdout/stderr use bounded head/tail previews plus opaque model-only artifacts readable with artifact_read. ' +
+        'Oversized stdout/stderr use bounded head/tail previews plus opaque model-only artifacts readable with read_artifact. ' +
         'Use this for commands that complete on their own. For servers, watchers, REPLs, or other long-running/interactive commands, use process_start instead. ' +
         'Do not launch Codex, Antigravity CLI (agy), or Claude Code agent work through exec; use agent_start so coding agents run in persistent Herdr workspaces. Harmless --help/--version probes remain allowed.',
       inputSchema: z.object({

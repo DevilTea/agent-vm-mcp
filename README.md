@@ -96,7 +96,7 @@ Artifacts use opaque process-local URIs such as:
 artifact://agent-vm/<id>
 ```
 
-Artifact registration and user presentation are separate operations. Tool-generated artifacts such as oversized `exec` stdout/stderr are model/internal references by default: the tool result carries an opaque URI but does **not** attach a user-facing `resource_link`. The model can inspect text artifacts in bounded chunks with `artifact_read`; supported image artifacts can also be returned as standard MCP image content.
+Artifact registration and user presentation are separate operations. Tool-generated artifacts such as oversized `exec` stdout/stderr are model/internal references by default: the tool result carries an opaque URI but does **not** attach a user-facing `resource_link`. The model can inspect text artifacts in bounded chunks with `read_artifact`; supported image artifacts can also be returned as standard MCP image content.
 
 `present_file` explicitly registers and presents a VM file to the user. `present_artifact` explicitly presents an already-registered artifact. Those presentation tools return standard MCP `resource_link` content; small text files are additionally embedded as MCP resource content. Bridge adapters register output artifacts without automatically presenting file links, while image-producing adapters may attach standard MCP `image` content for same-turn model inspection.
 

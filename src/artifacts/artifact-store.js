@@ -282,22 +282,33 @@ export class ArtifactStore {
         throw new Error(`Artifact grew beyond the ${this.#maxBytes}-byte limit: ${id}`);
       }
 
-      const startOffset = Math.min(offset, stat.size);
-      const readBytes = Math.min(maxBytes + 3, stat.size - startOffset);
+      const requestedStartOffset = Math.min(offset, stat.size);
+      const readBytes = Math.min(maxBytes + 3, stat.size - requestedStartOffset);
       const buffer = Buffer.alloc(readBytes);
       let bytesRead = 0;
       while (bytesRead < buffer.length) {
-        const result = await handle.read(buffer, bytesRead, buffer.length - bytesRead, startOffset + bytesRead);
+        const result = await handle.read(
+          buffer,
+          bytesRead,
+          buffer.length - bytesRead,
+          requestedStartOffset + bytesRead,
+        );
         if (result.bytesRead === 0) break;
         bytesRead += result.bytesRead;
       }
 
-      const chunkBytes = completeUtf8PrefixLength(buffer.subarray(0, bytesRead), maxBytes);
+      let boundarySkip = 0;
+      while (boundarySkip < bytesRead && boundarySkip < 3 && isContinuationByte(buffer[boundarySkip])) {
+        boundarySkip += 1;
+      }
+      const startOffset = requestedStartOffset + boundarySkip;
+      const readable = buffer.subarray(boundarySkip, bytesRead);
+      const chunkBytes = completeUtf8PrefixLength(readable, maxBytes);
       const nextOffset = startOffset + chunkBytes;
       return {
         uri: `${ARTIFACT_URI_PREFIX}${artifact.id}`,
         mimeType: artifact.mimeType,
-        text: buffer.subarray(0, chunkBytes).toString('utf8'),
+        text: readable.subarray(0, chunkBytes).toString('utf8'),
         requestedOffset: offset,
         startOffset,
         nextOffset,

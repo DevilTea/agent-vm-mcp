@@ -19,6 +19,8 @@ const serverEntry = path.join(projectRoot, 'src/index.js');
 const smokeBridgeConfig = `/tmp/agent-mcp-bridges-smoke-${process.pid}.json`;
 const artifactExpiryRoot = `/tmp/agent-mcp-artifact-expiry-${process.pid}`;
 const artifactBorrowedPath = `/tmp/agent-mcp-artifact-borrowed-${process.pid}.txt`;
+const artifactUtf8Root = `/tmp/agent-mcp-artifact-utf8-${process.pid}`;
+const artifactUtf8Path = `/tmp/agent-mcp-artifact-utf8-${process.pid}.txt`;
 const artifactOwnedParent = '/tmp/agent-vm-artifacts';
 const smokeArtifactMaxBytes = 256 * 1024;
 const artifactMetaKey = 'io.deviltea.agent-vm/artifact';
@@ -116,6 +118,23 @@ try {
     throw new Error('artifact expiry deleted a borrowed caller-owned file');
   }
   await expiryStore.close();
+
+  await fs.rm(artifactUtf8Root, { recursive: true, force: true });
+  await fs.writeFile(artifactUtf8Path, 'A😀B', 'utf8');
+  const utf8Store = new ArtifactStore({ maxBytes: 1024, ttlMs: 60_000, ownedRoot: artifactUtf8Root });
+  const utf8Artifact = await utf8Store.registerFile(artifactUtf8Path, { name: 'utf8.txt' });
+  const utf8MidCodePoint = await utf8Store.readText(utf8Artifact.id, { offset: 2, maxBytes: 1 });
+  if (
+    utf8MidCodePoint.requestedOffset !== 2 ||
+    utf8MidCodePoint.startOffset !== 5 ||
+    utf8MidCodePoint.text !== 'B' ||
+    utf8MidCodePoint.nextOffset !== 6 ||
+    !utf8MidCodePoint.done
+  ) {
+    throw new Error('Artifact UTF-8 range read did not advance an in-code-point offset safely');
+  }
+  await utf8Store.close();
+  await fs.rm(artifactUtf8Path, { force: true });
 
   await fs.writeFile(presentFilePath, 'artifact smoke text\nline two\n', 'utf8');
   await fs.writeFile(presentBinaryPath, Buffer.from([0x00, 0x01, 0x02, 0xff]));
@@ -293,7 +312,7 @@ exec /usr/bin/git "$@"
     'capabilities',
     'command_info',
     'system_audit',
-    'artifact_read',
+    'read_artifact',
     'present_artifact',
     'present_file',
     ...(liveIntegrations
@@ -1004,13 +1023,13 @@ exec /usr/bin/git "$@"
     throw new Error('small exec output no longer preserves inline compatibility/metadata');
   }
 
-  const expectedLargeStdout = `OUT_HEAD\n${'o'.repeat(150_000)}\nOUT_TAIL\n`;
+  const expectedLargeStdout = `BEGIN_ARTIFACT_TEST\n${'o'.repeat(200_000)}\nEND_ARTIFACT_TEST\n`;
   const expectedLargeStderr = `ERR_HEAD\n${'e'.repeat(150_000)}\nERR_TAIL\n`;
   const largeExecResult = await client.callTool({
     name: 'exec',
     arguments: {
       command:
-        `${node} -e "process.stdout.write('OUT_HEAD\\n'+'o'.repeat(150000)+'\\nOUT_TAIL\\n');` +
+        `${node} -e "process.stdout.write('BEGIN_ARTIFACT_TEST\\n'+'o'.repeat(200000)+'\\nEND_ARTIFACT_TEST\\n');` +
         `process.stderr.write('ERR_HEAD\\n'+'e'.repeat(150000)+'\\nERR_TAIL\\n')"`,
     },
   });
@@ -1020,8 +1039,8 @@ exec /usr/bin/git "$@"
     !largeExec.stderrTruncated ||
     largeExec.stdoutBytes !== Buffer.byteLength(expectedLargeStdout) ||
     largeExec.stderrBytes !== Buffer.byteLength(expectedLargeStderr) ||
-    !largeExec.stdout.startsWith('OUT_HEAD\n') ||
-    !largeExec.stdout.endsWith('\nOUT_TAIL\n') ||
+    !largeExec.stdout.startsWith('BEGIN_ARTIFACT_TEST\n') ||
+    !largeExec.stdout.endsWith('\nEND_ARTIFACT_TEST\n') ||
     !largeExec.stderr.startsWith('ERR_HEAD\n') ||
     !largeExec.stderr.endsWith('\nERR_TAIL') ||
     !largeExec.stdout.includes('bytes omitted from inline preview') ||
@@ -1044,21 +1063,42 @@ exec /usr/bin/git "$@"
   if (largeLinks.length !== 0) {
     throw new Error('large exec artifacts unexpectedly exposed user-facing resource links');
   }
-  const largeStdoutChunkResult = await client.callTool({
-    name: 'artifact_read',
-    arguments: { uri: largeExec.stdoutArtifact.uri, offset: 0, maxBytes: 32 },
+  const largeStdoutHeadResult = await client.callTool({
+    name: 'read_artifact',
+    arguments: { uri: largeExec.stdoutArtifact.uri, offset: 0, maxBytes: 64 },
   });
-  const largeStdoutChunk = JSON.parse(
-    largeStdoutChunkResult.content?.find((item) => item.type === 'text')?.text ?? '{}',
+  const largeStdoutHead = JSON.parse(
+    largeStdoutHeadResult.content?.find((item) => item.type === 'text')?.text ?? '{}',
   );
   if (
-    largeStdoutChunk.uri !== largeExec.stdoutArtifact.uri ||
-    largeStdoutChunk.text !== expectedLargeStdout.slice(0, 32) ||
-    largeStdoutChunk.nextOffset !== 32 ||
-    largeStdoutChunk.done
+    largeStdoutHead.uri !== largeExec.stdoutArtifact.uri ||
+    !largeStdoutHead.text.startsWith('BEGIN_ARTIFACT_TEST\n') ||
+    largeStdoutHead.nextOffset !== 64 ||
+    largeStdoutHead.done ||
+    largeStdoutHeadResult.content?.some((item) => item.type === 'resource_link')
   ) {
-    throw new Error('Oversized exec artifact was not available through bounded model-only reads');
+    throw new Error('Oversized exec artifact head was not available through bounded model-only reads');
   }
+  const tailOffset = Math.max(0, largeExec.stdoutArtifact.size - 64);
+  const largeStdoutTailResult = await client.callTool({
+    name: 'read_artifact',
+    arguments: { uri: largeExec.stdoutArtifact.uri, offset: tailOffset, maxBytes: 64 },
+  });
+  const largeStdoutTail = JSON.parse(
+    largeStdoutTailResult.content?.find((item) => item.type === 'text')?.text ?? '{}',
+  );
+  if (
+    largeStdoutTail.uri !== largeExec.stdoutArtifact.uri ||
+    !largeStdoutTail.text.endsWith('END_ARTIFACT_TEST\n') ||
+    !largeStdoutTail.done ||
+    largeStdoutTailResult.content?.some((item) => item.type === 'resource_link')
+  ) {
+    throw new Error('Oversized exec artifact tail was not available through bounded model-only reads');
+  }
+  await expectToolFailure('read_artifact', {
+    uri: 'artifact://agent-vm/art-00000000-0000-4000-8000-000000000000',
+  });
+  await expectToolFailure('read_artifact', { uri: '/tmp/not-an-artifact.txt' });
   const explicitlyPresentedExecArtifact = await client.callTool({
     name: 'present_artifact',
     arguments: { uri: largeExec.stdoutArtifact.uri },
@@ -1184,8 +1224,8 @@ exec /usr/bin/git "$@"
     throw new Error('exec cancellation left the shell process running');
   }
 
-  const artifactReadTool = allTools.find((tool) => tool.name === 'artifact_read');
-  if (!artifactReadTool) throw new Error('artifact_read tool missing');
+  const artifactReadTool = allTools.find((tool) => tool.name === 'read_artifact');
+  if (!artifactReadTool) throw new Error('read_artifact tool missing');
   const presentArtifactTool = allTools.find((tool) => tool.name === 'present_artifact');
   if (!presentArtifactTool) throw new Error('present_artifact tool missing');
   const presentFileTool = allTools.find((tool) => tool.name === 'present_file');
@@ -1284,7 +1324,7 @@ exec /usr/bin/git "$@"
   const capabilitiesText = capabilities.content?.find((item) => item.type === 'text')?.text ?? '';
   const capabilityData = JSON.parse(capabilitiesText);
   if (!capabilityData.execution?.persistentProcesses) throw new Error('persistent process capability missing');
-  for (const name of ['artifact_read', 'present_artifact', 'present_file']) {
+  for (const name of ['read_artifact', 'present_artifact', 'present_file']) {
     if (!capabilityData.mcp?.nativeTools?.includes(name)) throw new Error(`${name} capability missing`);
   }
   if (!capabilityData.runtimes?.some((runtime) => runtime.name === 'node' && runtime.available)) {
@@ -1543,12 +1583,12 @@ exec /usr/bin/git "$@"
     throw new Error('browser_take_screenshot unexpectedly exposed a user-facing resource_link');
   }
   const modelImageRead = await client.callTool({
-    name: 'artifact_read',
+    name: 'read_artifact',
     arguments: { uri: screenshotArtifact.uri },
   });
   const modelImage = modelImageRead.content?.find((item) => item.type === 'image');
   if (modelImage?.mimeType !== 'image/png' || !modelImage.data?.startsWith('iVBORw0KGgo')) {
-    throw new Error('artifact_read did not return the screenshot for model-only image inspection');
+    throw new Error('read_artifact did not return the screenshot for model-only image inspection');
   }
   const screenshotResource = await client.readResource({ uri: screenshotArtifact.uri });
   const pngBlob = screenshotResource.contents?.[0]?.blob ?? '';
