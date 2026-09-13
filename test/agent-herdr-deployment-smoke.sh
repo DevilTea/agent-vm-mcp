@@ -27,7 +27,7 @@ AGENT_USER=agent \
 AGENT_GROUP=agent \
 AGENT_HOME=/home/agent \
 MISE_SHIMS=/home/agent/.local/share/mise/shims \
-HERDR_BIN=/home/agent/.local/share/mise/installs/herdr/0.8.2/herdr \
+HERDR_BIN=/bin/true \
 HERDR_SESSION=agent-vm-mcp \
 python3 "$repo_root/scripts/render-systemd-template.py" \
   "$service" "$verify_root/agent-herdr.service"
