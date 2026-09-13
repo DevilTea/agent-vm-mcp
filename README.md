@@ -172,6 +172,8 @@ The scripts currently provision or configure:
 
 Tunnel software is **not** part of the core lifecycle. Example systemd drop-ins under `config/examples/systemd/` show how a separately managed tunnel service can depend on Herdr or browser services, but the MCP server and provisioners do not require an `agent-tunnel.service`.
 
+For a complete illustrated setup, systemd, verification, and troubleshooting walkthrough, see [`docs/openai-secure-mcp-tunnel.md`](docs/openai-secure-mcp-tunnel.md).
+
 A machine-specific Playwright/LSP bridge configuration is provided as `config/examples/bridges.playwright-lsp.json`; copy/adapt it into the XDG configuration directory rather than turning those integrations into source defaults.
 
 ### Browser takeover
