@@ -98,7 +98,7 @@ Tool names must be unique after prefixing/renaming.
 
 `toolAdapters` can decorate an upstream result without changing transport semantics. Adapter failures are fail-open: if post-processing fails, the original upstream result is returned.
 
-The built-in `output-directory-artifact` adapter snapshots an output directory before a call, detects a created/changed matching file afterward, registers it as an opaque `artifact://agent-vm/<id>` resource, and attaches standard MCP `resource_link` content. Images can also be attached as standard MCP `image` content.
+The built-in `output-directory-artifact` adapter snapshots an output directory before a call, detects a created/changed matching file afterward, and registers it as an opaque `artifact://agent-vm/<id>` resource for model/internal access. It does not automatically attach a user-facing `resource_link`; use `present_artifact` when the file should be presented to the user. Images can still be attached as standard MCP `image` content for same-turn model inspection.
 
 Example:
 

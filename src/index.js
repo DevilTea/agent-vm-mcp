@@ -27,7 +27,11 @@ import { collectSystemAudit } from './system-audit.js';
 import { createBridgeToolAdapterFactory, validateBridgeToolAdapters } from './adapters/index.js';
 import { createBridgeCallPolicyFactory, validateBridgeCallPolicies } from './policies/index.js';
 import { ArtifactStore } from './artifacts/artifact-store.js';
-import { PRESENT_FILE_TOOL } from './artifacts/constants.js';
+import {
+  ARTIFACT_READ_TOOL,
+  PRESENT_ARTIFACT_TOOL,
+  PRESENT_FILE_TOOL,
+} from './artifacts/constants.js';
 import { registerArtifactSystem } from './artifacts/register.js';
 import { ExecOutputCapture } from './exec-output.js';
 import { assertNoRawCodingHarnessLaunch } from './coding-harness-guard.js';
@@ -223,31 +227,7 @@ async function executeCommand({ command, cwd, env, timeoutMs }, requestSignal, a
 }
 
 function execResult(value) {
-  const content = [
-    {
-      type: 'text',
-      text: JSON.stringify(value, null, 2),
-    },
-  ];
-
-  for (const [stream, artifact] of [
-    ['stdout', value.stdoutArtifact],
-    ['stderr', value.stderrArtifact],
-  ]) {
-    if (!artifact) continue;
-    content.push({
-      type: 'resource_link',
-      uri: artifact.uri,
-      name: artifact.name,
-      mimeType: artifact.mimeType,
-      size: artifact.size,
-      description: artifact.truncated
-        ? `Bounded ${stream} capture; stream exceeded the artifact hard limit.`
-        : `Complete ${stream} capture for truncated inline exec output.`,
-    });
-  }
-
-  return { content };
+  return { content: [{ type: 'text', text: JSON.stringify(value, null, 2) }] };
 }
 
 function pruneFinishedProcesses() {
@@ -432,6 +412,8 @@ const NATIVE_TOOL_NAMES = new Set([
   'command_info',
   'system_audit',
   'import_file',
+  ARTIFACT_READ_TOOL,
+  PRESENT_ARTIFACT_TOOL,
   PRESENT_FILE_TOOL,
 ]);
 
@@ -468,7 +450,7 @@ async function createServer() {
     {
       description:
         'Execute an arbitrary shell command on the dedicated disposable Linux agent VM. ' +
-        'Oversized stdout/stderr use bounded head/tail previews plus separate artifacts. ' +
+        'Oversized stdout/stderr use bounded head/tail previews plus opaque model-only artifacts readable with artifact_read. ' +
         'Use this for commands that complete on their own. For servers, watchers, REPLs, or other long-running/interactive commands, use process_start instead. ' +
         'Do not launch Codex, Antigravity CLI (agy), or Claude Code agent work through exec; use agent_start so coding agents run in persistent Herdr workspaces. Harmless --help/--version probes remain allowed.',
       inputSchema: z.object({

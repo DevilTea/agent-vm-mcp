@@ -8,6 +8,8 @@ import { inferMimeType, isTextMimeType } from './mime.js';
 
 const DEFAULT_MAX_BYTES = 50 * 1024 * 1024;
 const DEFAULT_TTL_MS = 24 * 60 * 60 * 1000;
+const DEFAULT_TEXT_READ_BYTES = 64 * 1024;
+const MAX_TEXT_READ_BYTES = 256 * 1024;
 const ARTIFACT_URI_PREFIX = 'artifact://agent-vm/';
 const DEFAULT_OWNED_PARENT = path.join(os.tmpdir(), 'agent-vm-artifacts');
 
@@ -24,6 +26,59 @@ function positiveIntegerFromEnv(name, fallback) {
 function isPathWithin(root, candidate) {
   const relative = path.relative(root, candidate);
   return relative !== '' && relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
+}
+
+
+function isContinuationByte(value) {
+  return value >= 0x80 && value <= 0xbf;
+}
+
+// Returns null for an incomplete sequence, 0 for an invalid sequence, or the
+// number of bytes in the next valid UTF-8 code point.
+function utf8CodePointLength(buffer, offset) {
+  const first = buffer[offset];
+  if (first <= 0x7f) return 1;
+  if (first >= 0xc2 && first <= 0xdf) {
+    if (offset + 1 >= buffer.length) return null;
+    return isContinuationByte(buffer[offset + 1]) ? 2 : 0;
+  }
+  if (first >= 0xe0 && first <= 0xef) {
+    if (offset + 2 >= buffer.length) return null;
+    const second = buffer[offset + 1];
+    const third = buffer[offset + 2];
+    const secondValid = first === 0xe0
+      ? second >= 0xa0 && second <= 0xbf
+      : first === 0xed
+        ? second >= 0x80 && second <= 0x9f
+        : isContinuationByte(second);
+    return secondValid && isContinuationByte(third) ? 3 : 0;
+  }
+  if (first >= 0xf0 && first <= 0xf4) {
+    if (offset + 3 >= buffer.length) return null;
+    const second = buffer[offset + 1];
+    const third = buffer[offset + 2];
+    const fourth = buffer[offset + 3];
+    const secondValid = first === 0xf0
+      ? second >= 0x90 && second <= 0xbf
+      : first === 0xf4
+        ? second >= 0x80 && second <= 0x8f
+        : isContinuationByte(second);
+    return secondValid && isContinuationByte(third) && isContinuationByte(fourth) ? 4 : 0;
+  }
+  return 0;
+}
+
+function completeUtf8PrefixLength(buffer, maxBytes) {
+  let offset = 0;
+  while (offset < buffer.length) {
+    const length = utf8CodePointLength(buffer, offset);
+    if (length === null) throw new Error(`Artifact contains incomplete UTF-8 at byte offset ${offset}.`);
+    if (length === 0) throw new Error(`Artifact contains invalid UTF-8 at byte offset ${offset}.`);
+    if (offset + length > maxBytes) return offset === 0 ? length : offset;
+    offset += length;
+    if (offset === maxBytes) return offset;
+  }
+  return offset;
 }
 
 export class ArtifactStore {
@@ -177,18 +232,23 @@ export class ArtifactStore {
     };
   }
 
-  async readResource(id) {
+  async readResource(id, { maxBytes = this.#maxBytes, maxBytesLabel } = {}) {
     const artifact = this.get(id);
+    if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0) {
+      throw new Error('Artifact resource maxBytes must be a positive safe integer.');
+    }
+    const effectiveMaxBytes = Math.min(maxBytes, this.#maxBytes);
     let data;
     try {
-      ({ data } = await readBoundedRegularFile(artifact.path, this.#maxBytes));
+      ({ data } = await readBoundedRegularFile(artifact.path, effectiveMaxBytes));
     } catch (error) {
       if (error?.code === 'not_regular_file') {
         throw new Error(`Artifact is no longer a regular file: ${id}`);
       }
       if (error?.code === 'too_large') {
+        const label = maxBytesLabel ?? 'artifact read limit';
         const suffix = error.phase === 'read' ? ' while reading' : '';
-        throw new Error(`Artifact grew beyond the ${this.#maxBytes}-byte limit${suffix}: ${id}`);
+        throw new Error(`Artifact exceeded ${label} of ${effectiveMaxBytes} bytes${suffix}: ${id}`);
       }
       throw error;
     }
@@ -200,6 +260,53 @@ export class ArtifactStore {
     return isTextMimeType(artifact.mimeType)
       ? { ...base, text: data.toString('utf8') }
       : { ...base, blob: data.toString('base64') };
+  }
+
+  async readText(id, { offset = 0, maxBytes = DEFAULT_TEXT_READ_BYTES } = {}) {
+    const artifact = this.get(id);
+    if (!isTextMimeType(artifact.mimeType)) {
+      throw new Error(`Artifact is not a text artifact: ${id}`);
+    }
+    if (!Number.isSafeInteger(offset) || offset < 0) {
+      throw new Error('Artifact text read offset must be a non-negative safe integer.');
+    }
+    if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0 || maxBytes > MAX_TEXT_READ_BYTES) {
+      throw new Error(`Artifact text read maxBytes must be a positive safe integer no greater than ${MAX_TEXT_READ_BYTES}.`);
+    }
+
+    const handle = await fs.open(artifact.path, 'r');
+    try {
+      const stat = await handle.stat();
+      if (!stat.isFile()) throw new Error(`Artifact is no longer a regular file: ${id}`);
+      if (stat.size > this.#maxBytes) {
+        throw new Error(`Artifact grew beyond the ${this.#maxBytes}-byte limit: ${id}`);
+      }
+
+      const startOffset = Math.min(offset, stat.size);
+      const readBytes = Math.min(maxBytes + 3, stat.size - startOffset);
+      const buffer = Buffer.alloc(readBytes);
+      let bytesRead = 0;
+      while (bytesRead < buffer.length) {
+        const result = await handle.read(buffer, bytesRead, buffer.length - bytesRead, startOffset + bytesRead);
+        if (result.bytesRead === 0) break;
+        bytesRead += result.bytesRead;
+      }
+
+      const chunkBytes = completeUtf8PrefixLength(buffer.subarray(0, bytesRead), maxBytes);
+      const nextOffset = startOffset + chunkBytes;
+      return {
+        uri: `${ARTIFACT_URI_PREFIX}${artifact.id}`,
+        mimeType: artifact.mimeType,
+        text: buffer.subarray(0, chunkBytes).toString('utf8'),
+        requestedOffset: offset,
+        startOffset,
+        nextOffset,
+        totalBytes: stat.size,
+        done: nextOffset >= stat.size,
+      };
+    } finally {
+      await handle.close();
+    }
   }
 
   async close() {
@@ -226,4 +333,10 @@ export function artifactIdFromUri(uri) {
   return /^art-[0-9a-f-]{36}$/i.test(id) ? id : null;
 }
 
-export { ARTIFACT_URI_PREFIX, DEFAULT_MAX_BYTES, DEFAULT_TTL_MS };
+export {
+  ARTIFACT_URI_PREFIX,
+  DEFAULT_MAX_BYTES,
+  DEFAULT_TTL_MS,
+  DEFAULT_TEXT_READ_BYTES,
+  MAX_TEXT_READ_BYTES,
+};
