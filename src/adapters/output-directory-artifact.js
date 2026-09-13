@@ -141,19 +141,12 @@ export function createOutputDirectoryArtifactAdapter({ artifactStore, config, br
         source: `${bridgeId}.${toolName}`,
       });
 
-      let content = result.content ?? [];
-      if (!content.some((item) => item.type === 'resource_link' && item.uri === artifact.uri)) {
-        content = [
-          ...content,
-          {
-            type: 'resource_link',
-            uri: artifact.uri,
-            name: artifact.name,
-            mimeType: artifact.mimeType,
-            size: artifact.size,
-          },
-        ];
-      }
+      let content = [
+        ...(result.content ?? []).filter(
+          (item) => !(item.type === 'resource_link' && item.uri === artifact.uri),
+        ),
+        { type: 'text', text: JSON.stringify({ artifact }, null, 2) },
+      ];
       if (artifact.mimeType.startsWith('image/') && !content.some((item) => item.type === 'image')) {
         const resource = await artifactStore.readResource(artifact.id);
         if (resource.blob !== undefined) {
@@ -165,7 +158,7 @@ export function createOutputDirectoryArtifactAdapter({ artifactStore, config, br
       }
 
       console.error(
-        `[artifact] adapted ${bridgeId}.${toolName} content=[${content.map((item) => item.type).join(',')}]`,
+        `[artifact] registered ${bridgeId}.${toolName} artifact=${artifact.uri} content=[${content.map((item) => item.type).join(',')}]`,
       );
 
       return {

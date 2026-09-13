@@ -293,6 +293,8 @@ exec /usr/bin/git "$@"
     'capabilities',
     'command_info',
     'system_audit',
+    'artifact_read',
+    'present_artifact',
     'present_file',
     ...(liveIntegrations
       ? [
@@ -1039,12 +1041,31 @@ exec /usr/bin/git "$@"
     throw new Error('large exec did not expose independent complete stdout/stderr artifacts');
   }
   const largeLinks = largeExecResult.content?.filter((item) => item.type === 'resource_link') ?? [];
+  if (largeLinks.length !== 0) {
+    throw new Error('large exec artifacts unexpectedly exposed user-facing resource links');
+  }
+  const largeStdoutChunkResult = await client.callTool({
+    name: 'artifact_read',
+    arguments: { uri: largeExec.stdoutArtifact.uri, offset: 0, maxBytes: 32 },
+  });
+  const largeStdoutChunk = JSON.parse(
+    largeStdoutChunkResult.content?.find((item) => item.type === 'text')?.text ?? '{}',
+  );
   if (
-    largeLinks.length !== 2 ||
-    !largeLinks.some((item) => item.uri === largeExec.stdoutArtifact.uri) ||
-    !largeLinks.some((item) => item.uri === largeExec.stderrArtifact.uri)
+    largeStdoutChunk.uri !== largeExec.stdoutArtifact.uri ||
+    largeStdoutChunk.text !== expectedLargeStdout.slice(0, 32) ||
+    largeStdoutChunk.nextOffset !== 32 ||
+    largeStdoutChunk.done
   ) {
-    throw new Error('large exec artifacts were not exposed as resource links');
+    throw new Error('Oversized exec artifact was not available through bounded model-only reads');
+  }
+  const explicitlyPresentedExecArtifact = await client.callTool({
+    name: 'present_artifact',
+    arguments: { uri: largeExec.stdoutArtifact.uri },
+  });
+  const explicitExecLink = explicitlyPresentedExecArtifact.content?.find((item) => item.type === 'resource_link');
+  if (explicitExecLink?.uri !== largeExec.stdoutArtifact.uri) {
+    throw new Error('present_artifact did not explicitly expose the existing exec artifact');
   }
   const largeStdoutResource = await client.readResource({ uri: largeExec.stdoutArtifact.uri });
   const largeStderrResource = await client.readResource({ uri: largeExec.stderrArtifact.uri });
@@ -1163,10 +1184,16 @@ exec /usr/bin/git "$@"
     throw new Error('exec cancellation left the shell process running');
   }
 
+  const artifactReadTool = allTools.find((tool) => tool.name === 'artifact_read');
+  if (!artifactReadTool) throw new Error('artifact_read tool missing');
+  const presentArtifactTool = allTools.find((tool) => tool.name === 'present_artifact');
+  if (!presentArtifactTool) throw new Error('present_artifact tool missing');
   const presentFileTool = allTools.find((tool) => tool.name === 'present_file');
   if (!presentFileTool) throw new Error('present_file tool missing');
-  if (presentFileTool._meta?.ui?.resourceUri || presentFileTool._meta?.['openai/outputTemplate']) {
-    throw new Error('present_file still exposes obsolete Artifact Viewer metadata');
+  for (const tool of [artifactReadTool, presentArtifactTool, presentFileTool]) {
+    if (tool._meta?.ui?.resourceUri || tool._meta?.['openai/outputTemplate']) {
+      throw new Error(`${tool.name} still exposes obsolete Artifact Viewer metadata`);
+    }
   }
   if (names.includes('artifact_viewer_read') || names.includes('artifact_viewer_relay_probe')) {
     throw new Error('Obsolete Artifact Viewer tools are still registered');
@@ -1257,7 +1284,9 @@ exec /usr/bin/git "$@"
   const capabilitiesText = capabilities.content?.find((item) => item.type === 'text')?.text ?? '';
   const capabilityData = JSON.parse(capabilitiesText);
   if (!capabilityData.execution?.persistentProcesses) throw new Error('persistent process capability missing');
-  if (!capabilityData.mcp?.nativeTools?.includes('present_file')) throw new Error('present_file capability missing');
+  for (const name of ['artifact_read', 'present_artifact', 'present_file']) {
+    if (!capabilityData.mcp?.nativeTools?.includes(name)) throw new Error(`${name} capability missing`);
+  }
   if (!capabilityData.runtimes?.some((runtime) => runtime.name === 'node' && runtime.available)) {
     throw new Error('node runtime capability missing');
   }
@@ -1510,13 +1539,16 @@ exec /usr/bin/git "$@"
     throw new Error('browser_take_screenshot did not expose standard MCP image content');
   }
   const artifactLink = screenshot.content?.find((item) => item.type === 'resource_link');
-  if (
-    artifactLink?.uri !== screenshotArtifact.uri ||
-    artifactLink?.name !== screenshotArtifact.name ||
-    artifactLink?.mimeType !== screenshotArtifact.mimeType ||
-    artifactLink?.size !== screenshotArtifact.size
-  ) {
-    throw new Error('browser_take_screenshot did not expose matching MCP resource_link content');
+  if (artifactLink) {
+    throw new Error('browser_take_screenshot unexpectedly exposed a user-facing resource_link');
+  }
+  const modelImageRead = await client.callTool({
+    name: 'artifact_read',
+    arguments: { uri: screenshotArtifact.uri },
+  });
+  const modelImage = modelImageRead.content?.find((item) => item.type === 'image');
+  if (modelImage?.mimeType !== 'image/png' || !modelImage.data?.startsWith('iVBORw0KGgo')) {
+    throw new Error('artifact_read did not return the screenshot for model-only image inspection');
   }
   const screenshotResource = await client.readResource({ uri: screenshotArtifact.uri });
   const pngBlob = screenshotResource.contents?.[0]?.blob ?? '';
