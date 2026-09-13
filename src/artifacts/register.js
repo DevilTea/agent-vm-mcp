@@ -2,7 +2,7 @@ import { ResourceTemplate } from '@modelcontextprotocol/server';
 import * as z from 'zod/v4';
 
 import {
-  ARTIFACT_READ_TOOL,
+  READ_ARTIFACT_TOOL,
   ARTIFACT_RESULT_META_KEY,
   PRESENT_ARTIFACT_TOOL,
   PRESENT_FILE_TOOL,
@@ -50,7 +50,7 @@ function registeredArtifact(artifactStore, uri) {
 
 export async function registerArtifactSystem(server, artifactStore) {
   server.registerTool(
-    ARTIFACT_READ_TOOL,
+    READ_ARTIFACT_TOOL,
     {
       title: 'Read VM artifact',
       description:
@@ -59,7 +59,7 @@ export async function registerArtifactSystem(server, artifactStore) {
         'Use present_artifact only when user-facing file presentation is intended.',
       inputSchema: z.object({
         uri: z.string().min(1).describe('Opaque artifact://agent-vm URI returned by another tool.'),
-        offset: z.number().int().min(0).default(0).describe('Byte offset for a text artifact.'),
+        offset: z.number().int().min(0).default(0).describe('Requested byte offset for a text artifact. If it lands inside a UTF-8 code point, reading advances to the next code-point boundary; startOffset reports the actual start.'),
         maxBytes: z
           .number()
           .int()
@@ -92,7 +92,7 @@ export async function registerArtifactSystem(server, artifactStore) {
       }
       if (!isTextMimeType(artifact.mimeType)) {
         throw new Error(
-          `artifact_read supports text and image artifacts; unsupported binary MIME type ${artifact.mimeType} cannot be returned to the model.`,
+          `read_artifact supports text and image artifacts; unsupported binary MIME type ${artifact.mimeType} cannot be returned to the model.`,
         );
       }
       return {
@@ -150,7 +150,7 @@ export async function registerArtifactSystem(server, artifactStore) {
       title: 'Present VM artifact',
       description:
         'Explicitly present an already-registered opaque VM artifact to the user as an MCP resource link. ' +
-        'Use the artifact URI returned by another tool. Use artifact_read instead for model-only inspection.',
+        'Use the artifact URI returned by another tool. Use read_artifact instead for model-only inspection.',
       inputSchema: z.object({
         uri: z.string().min(1).describe('Opaque artifact://agent-vm URI returned by another tool.'),
       }),

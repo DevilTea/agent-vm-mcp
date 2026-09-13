@@ -382,6 +382,15 @@ $XDG_CONFIG_HOME/agent-vm-mcp/bridges.json
 
 and inspect `mcp_bridge_status`.
 
+
+### Newly deployed tools do not appear in ChatGPT
+
+`agent-vm-mcp` can change its MCP tool catalog while the Secure MCP Tunnel remains healthy, but ChatGPT does not automatically enable later tool-definition changes for an already approved app. Treat the ChatGPT-side tool catalog as a reviewed snapshot, not as a live reflection of `tools/list`.
+
+For example, after deploying a new model-only helper such as `read_artifact`, a fresh local MCP client may already see the tool while an existing ChatGPT app or chat still exposes the previous snapshot. Starting a new chat alone is not a reliable catalog refresh.
+
+Use the ChatGPT app/action refresh or republish workflow appropriate to the workspace. If Refresh itself succeeds only through `server/discover` but no current `tools/list` is fetched and the new action remains unavailable, capture the tunnel trace rather than changing the MCP server to work around the stale snapshot. This failure boundary has been reported against `tunnel-client` v0.0.14 in upstream issue [#57](https://github.com/openai/tunnel-client/issues/57).
+
 ### Long stdio calls end in 502 and the tunnel restarts
 
 `tunnel-client` v0.0.11 has a known shared-stdio response-deadline bug. When a command reaches its response deadline, that version can close the process-affine stdio pipes instead of retiring only the timed-out JSON-RPC request. The next write then fails and the whole `tunnel-client` process shuts down. A supervisor such as systemd may restart it a few seconds later, which can make the failure look intermittent.
