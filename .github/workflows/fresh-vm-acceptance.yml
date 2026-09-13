@@ -124,10 +124,16 @@ jobs:
           set -euo pipefail
           sudo -u agent env \
             HOME=/home/agent \
+            USER=agent \
+            LOGNAME=agent \
+            XDG_CONFIG_HOME=/home/agent/.config \
             PATH=/home/agent/.local/share/mise/shims:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
             pnpm --dir /opt/agent-vm-mcp audit --prod
           sudo -u agent env \
             HOME=/home/agent \
+            USER=agent \
+            LOGNAME=agent \
+            XDG_CONFIG_HOME=/home/agent/.config \
             PATH=/home/agent/.local/share/mise/shims:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
             pnpm --dir /opt/playwright-mcp audit --prod
 
