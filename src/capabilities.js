@@ -4,27 +4,27 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 
-const DEFAULT_CONFIG_PATH = '/opt/agent-mcp/config/capabilities.json';
+import { resolveConfigPath } from './config-path.js';
 const MAX_VERSION_OUTPUT_BYTES = 16 * 1024;
 const VERSION_TIMEOUT_MS = 2_000;
 
-function configPath() {
-  return process.env.AGENT_MCP_CAPABILITIES_CONFIG ?? DEFAULT_CONFIG_PATH;
-}
-
 async function loadConfig() {
-  const parsed = JSON.parse(await readFile(configPath(), 'utf8'));
+  const configPath = await resolveConfigPath({
+    filename: 'capabilities.json',
+    envName: 'AGENT_MCP_CAPABILITIES_CONFIG',
+  });
+  const parsed = JSON.parse(await readFile(configPath, 'utf8'));
   if (parsed?.version !== 1 || !Array.isArray(parsed.commands)) {
-    throw new Error(`Invalid capability config: ${configPath()}`);
+    throw new Error(`Invalid capability config: ${configPath}`);
   }
   if (parsed.probes !== undefined && !Array.isArray(parsed.probes)) {
-    throw new Error(`Invalid capability probes: ${configPath()}`);
+    throw new Error(`Invalid capability probes: ${configPath}`);
   }
 
   const names = new Set();
   for (const command of parsed.commands) {
     if (!command || typeof command.name !== 'string' || command.name.length === 0) {
-      throw new Error(`Capability config contains an invalid command entry: ${configPath()}`);
+      throw new Error(`Capability config contains an invalid command entry: ${configPath}`);
     }
     if (names.has(command.name)) {
       throw new Error(`Capability config contains duplicate command ${command.name}`);
@@ -43,7 +43,7 @@ async function loadConfig() {
       !Array.isArray(probe.args) ||
       probe.args.some((arg) => typeof arg !== 'string')
     ) {
-      throw new Error(`Capability config contains an invalid probe entry: ${configPath()}`);
+      throw new Error(`Capability config contains an invalid probe entry: ${configPath}`);
     }
     if (probeNames.has(probe.name)) {
       throw new Error(`Capability config contains duplicate probe ${probe.name}`);
@@ -51,7 +51,7 @@ async function loadConfig() {
     probeNames.add(probe.name);
   }
 
-  return parsed;
+  return { config: parsed, configPath };
 }
 
 async function findExecutable(name) {
@@ -116,8 +116,8 @@ async function captureVersion(executable, args) {
   return (await captureInvocation(executable, args)).firstLine;
 }
 
-export async function inspectCommands(names) {
-  const config = await loadConfig();
+export async function inspectCommands(names, { config: providedConfig } = {}) {
+  const config = providedConfig ?? (await loadConfig()).config;
   const definitions = new Map(config.commands.map((command) => [command.name, command]));
 
   return await Promise.all(
@@ -165,8 +165,8 @@ async function inspectProbes(probes) {
 }
 
 export async function collectCapabilities({ nativeTools, bridgeStatus }) {
-  const config = await loadConfig();
-  const commands = await inspectCommands(config.commands.map((command) => command.name));
+  const { config, configPath } = await loadConfig();
+  const commands = await inspectCommands(config.commands.map((command) => command.name), { config });
   const probes = await inspectProbes(config.probes ?? []);
   const runtimes = commands.filter((command) => command.category === 'runtime');
   const categories = {};
@@ -190,7 +190,7 @@ export async function collectCapabilities({ nativeTools, bridgeStatus }) {
     },
     runtimes,
     cli: {
-      configPath: configPath(),
+      configPath,
       curatedCount: commands.length,
       availableCount: commands.filter((command) => command.available).length,
       categories,

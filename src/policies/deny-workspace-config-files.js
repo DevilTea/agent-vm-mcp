@@ -24,7 +24,7 @@ async function pathExists(candidate) {
   }
 }
 
-export function createDenyWorkspaceConfigFilesPolicy({ config, bridgeId }) {
+export function validateDenyWorkspaceConfigFilesPolicyConfig(config, bridgeId) {
   const workspaceRootArgument = config.workspaceRootArgument ?? 'workspaceRoot';
   if (typeof workspaceRootArgument !== 'string' || workspaceRootArgument.length === 0) {
     throw new Error(
@@ -43,6 +43,12 @@ export function createDenyWorkspaceConfigFilesPolicy({ config, bridgeId }) {
       `Call policy deny-workspace-config-files on bridge ${bridgeId} filenames[${index}]`,
     ),
   );
+
+  return { workspaceRootArgument, filenames };
+}
+
+export function createDenyWorkspaceConfigFilesPolicy({ config, bridgeId }) {
+  const { workspaceRootArgument, filenames } = validateDenyWorkspaceConfigFilesPolicyConfig(config, bridgeId);
 
   return {
     async beforeCall({ args }) {

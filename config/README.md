@@ -1,9 +1,59 @@
-# MCP bridges
+# Configuration reference
 
-`bridges.json` declares upstream MCP servers whose tools are re-exported by `agent-mcp`.
-A bridge is connected during `agent-mcp` startup; changing the config therefore requires restarting `agent-tunnel.service`.
+`agent-vm-mcp` ships portable built-in defaults and keeps deployment-specific configuration outside the repository checkout.
 
-## stdio example
+## Resolution order
+
+For file-based configuration, the runtime resolves:
+
+1. an explicit path supplied by the caller/runtime;
+2. the corresponding environment-variable override;
+3. `$XDG_CONFIG_HOME/agent-vm-mcp/<file>` when `XDG_CONFIG_HOME` is set, or `~/.config/agent-vm-mcp/<file>` when it is not;
+4. the built-in file under this repository's `config/` directory when that selected user-config file does not exist.
+
+An explicit environment override is authoritative. If it points to a missing or invalid file, the runtime reports the error rather than silently falling back.
+
+| Purpose | Filename | Environment override |
+| --- | --- | --- |
+| MCP bridges | `bridges.json` | `MCP_BRIDGES_CONFIG` |
+| CLI capabilities | `capabilities.json` | `AGENT_MCP_CAPABILITIES_CONFIG` |
+| System audit | `system-audit.json` | `AGENT_MCP_SYSTEM_AUDIT_CONFIG` |
+| Shared Playwright stdio proxy | `playwright-shared-proxy.json` | `PLAYWRIGHT_SHARED_PROXY_CONFIG` |
+
+The built-in `bridges.json` contains an empty bridge list. Machine-specific Playwright/LSP configuration is an optional example under `config/examples/`.
+
+## MCP bridges
+
+A bridge exposes selected upstream MCP tools through the same server. Supported transports are stdio and Streamable HTTP.
+
+### Semantics
+
+All bridges are optional integrations. `enabled: true` means the runtime attempts to connect that integration during startup. It does not make the integration a prerequisite for the native core.
+
+The contract is:
+
+> Invalid configuration fails startup. Unavailable integrations do not.
+
+An unavailable integration is recorded with `state: "unavailable"` and an error. Examples include:
+
+- missing stdio executables;
+- process startup failure;
+- HTTP connection refusal/offline service;
+- upstream connect/handshake failure;
+- upstream `tools/list` failure.
+
+Startup fails for deterministic local configuration errors, including:
+
+- invalid JSON or unsupported config version;
+- duplicate bridge IDs;
+- invalid transport, adapter, or policy configuration;
+- deterministic exported-tool name collisions.
+
+Bridge tool definitions are staged before registration. If fatal initialization occurs after earlier bridges connected, registered tool handles and upstream clients are cleaned up before the error escapes.
+
+There is intentionally no `required` field. A deployment supervisor or external health check can enforce that a particular optional integration must be available for that deployment.
+
+### stdio example
 
 ```json
 {
@@ -21,18 +71,11 @@ A bridge is connected during `agent-mcp` startup; changing the config therefore 
   "toolPrefix": "example_",
   "includeTools": ["*"],
   "excludeTools": [],
-  "renameTools": {},
-  "toolAdapters": {
-    "tool_that_writes_a_file": {
-      "type": "output-directory-artifact",
-      "outputDir": "/absolute/output/directory",
-      "extensions": [".png"]
-    }
-  }
+  "renameTools": {}
 }
 ```
 
-## Streamable HTTP example
+### Streamable HTTP example
 
 ```json
 {
@@ -49,30 +92,41 @@ A bridge is connected during `agent-mcp` startup; changing the config therefore 
 }
 ```
 
-Tool names must be unique after prefixing/renaming. Startup fails on collisions instead of silently shadowing tools.
-Playwright deliberately uses an empty prefix because its upstream tool names already use the `browser_` namespace. The production Playwright bridge uses Streamable HTTP at `http://localhost:8931/mcp`; `agent-playwright-shared.service` binds the server to IPv4 loopback and owns the persistent profile independently of `agent-tunnel.service`. Coding harnesses that need a clean browser start `/opt/playwright-mcp/start-isolated.sh` as their own stdio MCP process instead of attaching to the shared profile.
+Tool names must be unique after prefixing/renaming.
 
 ## Tool result adapters
 
-`toolAdapters` is an optional bridge extension point. An adapter can decorate a forwarded tool definition and observe the call before/after the upstream MCP invocation without changing the bridge transport itself.
+`toolAdapters` can decorate an upstream result without changing transport semantics. Adapter failures are fail-open: if post-processing fails, the original upstream result is returned.
 
-`output-directory-artifact` snapshots an output directory before the upstream call, detects the newest created/changed matching file afterward, registers it as an opaque `artifact://agent-vm/<id>` resource, and attaches the generic Artifact Viewer to the tool result. Adapter failures are fail-open: the original upstream tool result is returned unchanged.
+The built-in `output-directory-artifact` adapter snapshots an output directory before a call, detects a created/changed matching file afterward, registers it as an opaque `artifact://agent-vm/<id>` resource, and attaches standard MCP `resource_link` content. Images can also be attached as standard MCP `image` content.
 
-Adapter options:
+Example:
 
-- `outputDir`: required directory used for automatic output discovery.
-- `extensions`: file extensions eligible for directory discovery.
-- `pathArgument`: optional tool argument containing an explicit output filename/path.
-- `workingDir`: base directory for a relative `pathArgument`; defaults to `outputDir`.
-- `mimeTypeArgument` + `mimeTypeMap`: optionally derive a MIME type from a tool argument instead of relying only on filename extension.
+```json
+{
+  "toolAdapters": {
+    "tool_that_writes_a_file": {
+      "type": "output-directory-artifact",
+      "outputDir": "/absolute/output/directory",
+      "extensions": [".png"],
+      "pathArgument": "filename",
+      "workingDir": "/optional/working/directory",
+      "mimeTypeArgument": "type",
+      "mimeTypeMap": {
+        "png": "image/png"
+      }
+    }
+  }
+}
+```
 
-The default Playwright bridge applies this adapter only to `browser_take_screenshot`. Playwright writes unnamed screenshots to its configured output directory, while an explicit relative `filename` is resolved against the Playwright MCP working directory; the adapter handles both cases.
+No custom iframe/MCP App viewer is required; presentation is left to the MCP host's native handling of standard resources, resource links, and images.
 
-## Fail-closed call policies
+## Call policies
 
-`callPolicies` are pre-forwarding guardrails. Unlike result adapters, policy failures are **fail-closed**: if a policy rejects or errors, the upstream MCP tool is not invoked.
+`callPolicies` are pre-forwarding guardrails. Policy rejection is fail-closed for that call: the upstream tool is not invoked.
 
-The `deny-workspace-config-files` policy reads a configured workspace-root argument and rejects the call when any configured plain filename exists directly under that root. The default LSP bridge uses it to reject `.lsp-mcp.json` and `.lsp-mcp.jsonc` before `language-server-mcp` can load project-controlled server commands.
+The built-in `deny-workspace-config-files` policy rejects a forwarded call when configured plain filenames exist directly under the supplied workspace root.
 
 ```json
 {
@@ -86,59 +140,68 @@ The `deny-workspace-config-files` policy reads a configured workspace-root argum
 }
 ```
 
-This is intentionally separate from `toolAdapters`: adapters decorate observable results and are fail-open, while policies enforce whether a call may reach an upstream server.
+This is an orchestration/deployment policy, not a security boundary against another process already running as the same trusted VM user.
 
-## Read-only LSP bridge
+## Optional Playwright/LSP example
 
-The default `lsp` bridge launches `/opt/language-server-mcp/start.sh`, prefixes exported tools with `lsp_`, and forwards only these upstream tools:
+`config/examples/bridges.playwright-lsp.json` demonstrates the deployment used by the repository's live smoke test:
 
-- `hover`, `signature_help`
-- `declaration`, `definition`, `type_definition`, `implementation`, `references`
-- `document_symbols`, `workspace_symbols`, `diagnostics`
-- `call_hierarchy_prepare`, `call_hierarchy_incoming`, `call_hierarchy_outgoing`
-- `type_hierarchy_prepare`, `type_hierarchy_supertypes`, `type_hierarchy_subtypes`
-- `list_servers`, `search_servers`, `server_status`
+- Playwright over Streamable HTTP at a loopback service, exporting `browser_*` tools;
+- screenshot artifact adaptation through standard MCP content;
+- a stdio LSP MCP bridge with an `lsp_` prefix;
+- an allow-list of read-oriented LSP tools;
+- host-side rejection of repository-local `.lsp-mcp.json` / `.lsp-mcp.jsonc` before workspace-scoped LSP calls.
 
-Mutation and unrestricted execution surfaces such as rename/formatting/code actions, raw `request`/`notify`, `execute_command`, completion breadth, and server lifecycle mutation tools are not exported. Workspace-scoped calls retain the upstream `workspaceRoot` argument; `agent-vm-mcp` does not introduce a global active workspace.
+The example contains deployment paths such as `/opt/playwright-mcp`, `/opt/language-server-mcp`, and the default `agent` home. Adapt it before placing it in the XDG config directory.
 
-The deployment-owned `~/.config/lsp-mcp/config.json` is created by `scripts/provision-lsp.sh`. It disables managed downloads and LSP command execution and keeps external-workspace access disabled. A missing language server therefore fails observably instead of being downloaded automatically. Repository-local LSP MCP configuration is not trusted in this version and is denied by the host-side call policy above.
+## CLI capability discovery
 
-# CLI capability discovery
+`capabilities.json` is a curated agent-facing CLI catalog rather than a dump of every executable on `PATH`.
 
-`capabilities.json` is the curated, agent-facing CLI catalog. It is intentionally not a dump of every executable on `PATH`.
+- `capabilities` combines runtime detection of the catalog with host/native MCP, process, coding-agent, and bridge information.
+- `command_info` can inspect named commands on `PATH`; curated commands additionally receive category/summary/version metadata.
+- `versionArgs` are executed directly without a shell only for curated entries.
+- `probes` represent curated subcommands such as `docker compose version`.
+- editing capability metadata does not require restarting the server; adding/removing MCP tools does.
 
-- `capabilities` combines runtime detection of this catalog with host, native MCP, persistent-process, and bridge information.
-- `command_info` can inspect any safe command name on `PATH`; commands in the catalog additionally receive category, summary, and version metadata.
-- `versionArgs` are executed directly (without a shell) only for curated entries.
-- Optional `probes` describe curated CLI invocations that are not standalone executables, such as `docker compose version`. Each probe names a real `command` on `PATH` plus direct `args`; `capabilities` reports the probe as available only when that invocation exits successfully. Probes do not change `command_info` semantics or synthesize fake commands on `PATH`.
-- Capability metadata is read on each tool call, so editing `capabilities.json` does not require a service restart. Adding/removing MCP tools still requires one so the MCP tool schema can be rediscovered.
-- Override the catalog path with `AGENT_MCP_CAPABILITIES_CONFIG` when needed.
+The catalog describes useful capabilities to probe. A listed command being absent does not prevent native core startup.
 
+## System maintenance audit
 
-# System maintenance audit
-
-`system-audit.json` drives the read-only `system_audit` native MCP tool. The audit is deliberately split between **automatic discovery** and a small declarative exception map so that adding software to the VM does not require maintaining a second hard-coded checklist.
+`system-audit.json` drives the read-only `system_audit` tool. The built-in file is generic: it has no machine-specific repositories, projects, services, or fixed installations.
 
 Automatic discovery covers:
 
-- all installed mise tools from `mise ls --json`, including inactive installed versions; non-`npm:` tools use `mise latest` by default and `npm:<package>` tools use the npm registry;
-- all global npm packages from `npm ls -g --depth=0 --json`, with npm registry latest-version lookup inferred automatically;
-- every CLI declared in `capabilities.json`; coding harness versions come from the existing agent runtime inspection path and are never raw-launched by `system_audit`;
-- executable files in `directExecutableDirs` (by default `~/.local/bin` and `/usr/local/bin`), with obvious backup/temp names ignored;
-- configured important installations, service health, Git repository cleanliness/remote HEAD, APT upgrades, and project dependency drift.
+- installed mise tools;
+- global npm packages;
+- curated CLI entries;
+- executable files in configured direct-executable directories;
+- configured installations, services, repositories, and package-manager projects.
 
-The coverage contract is explicit: any installed discovered item without an inferred source, a configured `latestSources` entry, or a `managedBy` owner is returned in `coverage.untracked`. A new tool therefore cannot silently disappear from maintenance reporting. `coverage.trackedCount`, `updateSourceKnownCount`, `managedElsewhereCount`, and `untrackedCount` make that invariant easy to monitor.
+An installed item without a safe inferred update source, explicit `latestSources` entry, or `managedBy` owner is surfaced under `coverage.untracked` rather than silently disappearing.
 
-## Adding a future tool
+### Repository state
 
-In the common cases, do nothing beyond installing it:
+Repository status separates local tracking ancestry from live remote observation.
 
-1. A tool installed through mise is discovered automatically.
-2. A package installed globally through npm is discovered automatically.
-3. A new curated CLI added to `capabilities.json` is automatically included.
-4. A custom executable dropped in one of `directExecutableDirs` is automatically included.
+Local `HEAD` vs the local tracking ref is reported as:
 
-Only add an explicit mapping when the audit can see the tool but cannot safely infer how to check its latest release. Put that mapping under `latestSources`; supported source kinds include npm, mise, and GitHub Releases. For example:
+- `in_sync`;
+- `ahead`;
+- `behind`;
+- `diverged`.
+
+The audit uses local Git ancestry/counts for those states and does not fetch solely to classify them.
+
+When `checkLatest` is enabled, `git ls-remote` observes the current remote branch head. That live hash is reported separately (`matchesHead`, `matchesTrackingHead`, `changedFromTracking`); an unequal live hash does not by itself imply that local `HEAD` is behind.
+
+### pnpm project checks
+
+`pnpm outdated --format json` commonly returns a non-zero exit code when updates exist. The audit therefore accepts non-empty valid JSON regardless of exit status. Invalid non-empty JSON or a failed command with no usable JSON becomes a source error; a successful empty result means no outdated packages.
+
+### Adding explicit sources
+
+Example GitHub release source:
 
 ```json
 {
@@ -152,7 +215,7 @@ Only add an explicit mapping when the audit can see the tool but cannot safely i
 }
 ```
 
-For an important binary outside the automatic directories, add a declarative `installations` entry instead of teaching the audit code about that specific tool:
+Example important installation outside the normal discovery paths:
 
 ```json
 {
@@ -168,8 +231,23 @@ For an important binary outside the automatic directories, add a declarative `in
 }
 ```
 
-`command` installations explicitly reject `codex`, `agy`, and `claude`; harness inspection remains owned by `agent_capabilities`. `npm-project` installations can represent fixed deployments such as `/opt/playwright-mcp` and automatically infer their npm update source.
+`command` installations reject direct probing of supported coding harness commands; harness inspection remains owned by the coding-agent runtime.
 
-`latestSources` overrides inferred sources, which is useful for keeping a pinned major track (for example `node@24` or `pnpm@11`) instead of comparing against an unrelated next major. `coverage.managedElsewhere` can mark a discovered executable as intentionally maintained by another audited surface such as a Git repository.
+The audit is fail-soft for source/network failures: affected items remain visible with `sourceErrors` rather than aborting the entire audit. It never installs/upgrades packages, restarts services, or fetches Git refs.
 
-The tool is fail-soft: registry/network/repository failures are collected in `sourceErrors` and leave the affected item `unknown` rather than aborting the whole audit. `checkLatest: false` skips latest/remote lookups while retaining local inventory and health checks. The audit never installs, upgrades, restarts, fetches Git refs, or otherwise mutates the VM.
+## Host profile
+
+`AGENT_MCP_HOST` is connection/deployment context rather than a normal tool argument.
+
+Supported values:
+
+- `generic` — default, no vendor-specific tool metadata;
+- `chatgpt` — currently enables the OpenAI/ChatGPT file-input metadata needed by `import_file`.
+
+Host-specific behavior should remain isolated here. Prefer standard MCP content/capabilities over host-name conditionals whenever possible.
+
+## Deployment examples
+
+The repository's Ubuntu provisioners remain opinionated and may create systemd units or `/opt/...` installations. Those are deployment choices, not portable source defaults.
+
+`config/examples/systemd/` contains optional drop-ins showing how a separately managed tunnel service can depend on Herdr or browser services. The core runtime does not require or manage an `agent-tunnel.service`.

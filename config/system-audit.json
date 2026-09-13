@@ -1,6 +1,5 @@
 {
   "version": 1,
-  "capabilitiesPath": "/opt/agent-mcp/config/capabilities.json",
   "directExecutableDirs": [
     "@HOME@/.local/bin",
     "/usr/local/bin"
@@ -30,86 +29,13 @@
     "pnpm": {
       "kind": "mise",
       "tool": "pnpm@11"
-    },
-    "tailscale": {
-      "kind": "github-release",
-      "repo": "tailscale/tailscale",
-      "stripPrefix": "v"
-    },
-    "tunnel-client": {
-      "kind": "github-release",
-      "repo": "openai/tunnel-client",
-      "stripPrefix": "v"
     }
   },
-  "installations": [
-    {
-      "id": "playwright-mcp",
-      "kind": "npm-project",
-      "root": "/opt/playwright-mcp",
-      "package": "@playwright/mcp"
-    },
-    {
-      "id": "tailscale",
-      "kind": "command",
-      "command": "tailscale",
-      "args": [
-        "version"
-      ],
-      "managedBy": "apt/system"
-    },
-    {
-      "id": "tunnel-client",
-      "kind": "command",
-      "command": "tunnel-client",
-      "args": [
-        "--version"
-      ]
-    }
-  ],
-  "services": [
-    "agent-tunnel.service",
-    "agent-herdr.service",
-    "agent-playwright-shared.service",
-    "tailscaled.service"
-  ],
-  "repositories": [
-    {
-      "id": "agent-vm-mcp-source",
-      "path": "/home/agent/projects/DevilTea/agent-vm-mcp",
-      "branch": "main"
-    },
-    {
-      "id": "agent-vm-mcp-deploy",
-      "path": "/opt/agent-mcp",
-      "branch": "main"
-    },
-    {
-      "id": "dot-agents",
-      "path": "/home/agent/projects/DevilTea/dot-agents",
-      "branch": "main"
-    },
-    {
-      "id": "valchecker",
-      "path": "/home/agent/projects/DevilTea/valchecker",
-      "branch": "main"
-    }
-  ],
-  "projects": [
-    {
-      "id": "agent-vm-mcp",
-      "path": "/home/agent/projects/DevilTea/agent-vm-mcp",
-      "packageManager": "pnpm"
-    },
-    {
-      "id": "valchecker",
-      "path": "/home/agent/projects/DevilTea/valchecker",
-      "packageManager": "pnpm"
-    }
-  ],
+  "installations": [],
+  "services": [],
+  "repositories": [],
+  "projects": [],
   "coverage": {
-    "managedElsewhere": {
-      "dot-agents": "Repository freshness is reported under repositories instead of semantic-version lookup."
-    }
+    "managedElsewhere": {}
   }
 }

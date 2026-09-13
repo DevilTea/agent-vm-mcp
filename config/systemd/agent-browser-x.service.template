@@ -1,6 +1,5 @@
 [Unit]
 Description=Persistent virtual X display for Agent VM browser takeover
-Before=agent-tunnel.service
 
 [Service]
 Type=simple

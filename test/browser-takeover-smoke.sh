@@ -2,7 +2,7 @@
 set -euo pipefail
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-bridge_config="$repo_root/config/bridges.json"
+bridge_config="$repo_root/config/examples/bridges.playwright-lsp.json"
 shared_launcher="$repo_root/config/playwright-start-shared.sh.template"
 shared_proxy_launcher="$repo_root/config/playwright-start-shared-proxy.sh.template"
 shared_proxy_config="$repo_root/config/playwright-shared-proxy.json"
@@ -11,7 +11,7 @@ x_unit="$repo_root/config/systemd/agent-browser-x.service.template"
 playwright_unit="$repo_root/config/systemd/agent-playwright-shared.service.template"
 vnc_unit="$repo_root/config/systemd/agent-browser-vnc.service.template"
 novnc_unit="$repo_root/config/systemd/agent-browser-novnc.service.template"
-tunnel_dropin="$repo_root/config/systemd/agent-tunnel-browser.conf"
+tunnel_example="$repo_root/config/examples/systemd/agent-tunnel-browser.conf"
 provisioner="$repo_root/scripts/provision-browser-takeover.sh"
 
 require_literal() {
@@ -45,7 +45,7 @@ require_literal "$shared_launcher" '--shared-browser-context'
 reject_literal "$shared_launcher" '--headless'
 reject_literal "$shared_launcher" '--isolated'
 
-require_literal "$shared_proxy_launcher" '/opt/agent-mcp/src/playwright-shared-stdio-proxy.js'
+require_literal "$shared_proxy_launcher" '/opt/agent-vm-mcp/src/playwright-shared-stdio-proxy.js'
 require_literal "$shared_proxy_config" '"type": "streamable-http"'
 require_literal "$shared_proxy_config" '"url": "http://localhost:8931/mcp"'
 require_literal "$shared_proxy_config" '"browser_*"'
@@ -77,8 +77,12 @@ require_literal "$vnc_unit" '-rfbport 5900'
 require_literal "$novnc_unit" 'Wants=agent-browser-vnc.service'
 require_literal "$novnc_unit" '127.0.0.1:6080 127.0.0.1:5900'
 
-require_literal "$tunnel_dropin" 'Requires=agent-browser-x.service agent-playwright-shared.service'
-require_literal "$tunnel_dropin" 'After=agent-browser-x.service agent-playwright-shared.service'
+require_literal "$tunnel_example" 'Requires=agent-browser-x.service agent-playwright-shared.service'
+require_literal "$tunnel_example" 'After=agent-browser-x.service agent-playwright-shared.service'
+reject_literal "$x_unit" 'agent-tunnel.service'
+reject_literal "$playwright_unit" 'agent-tunnel.service'
+reject_literal "$provisioner" 'agent-tunnel.service.d'
+reject_literal "$provisioner" 'Restart agent-tunnel.service'
 
 for package in novnc websockify x11-utils x11vnc xvfb tailscale; do
   require_literal "$provisioner" "$package"
@@ -86,6 +90,8 @@ done
 require_literal "$provisioner" 'systemctl enable --now tailscaled.service'
 require_literal "$provisioner" 'systemctl enable agent-playwright-shared.service'
 require_literal "$provisioner" 'start-shared-proxy.sh'
+require_literal "$provisioner" 'canonical_control_plane_root=/opt/agent-vm-mcp'
+require_literal "$provisioner" 'if [[ $repo_root != "$canonical_control_plane_root" ]]'
 reject_literal "$provisioner" 'systemctl enable --now agent-playwright-shared.service'
 if grep -Eq '^[[:space:]]*tailscale[[:space:]]+(up|serve|ssh)([[:space:]]|$)' "$provisioner"; then
   echo "Provisioner must not enroll Tailscale, expose noVNC with tailscale serve, or enable Tailscale SSH." >&2

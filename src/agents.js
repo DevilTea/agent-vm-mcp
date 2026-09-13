@@ -1157,13 +1157,42 @@ async function waitForAgentSettled(agentId, { signal, maxWaitMs = 10_000, verify
   return state;
 }
 
+function promptPreflightError(code, message, { retryable = false, cause } = {}) {
+  const error = new Error(message);
+  error.code = code;
+  error.retryable = retryable;
+  if (cause !== undefined) error.cause = cause;
+  return error;
+}
+
 async function validateSkills(harness, skills) {
   const definition = harnessDefinitions()[harness];
-  if (!definition) throw new Error(`Unsupported harness: ${harness}`);
-  const available = new Set(await scanSkills(definition.skillRoot));
+  if (!definition) {
+    throw promptPreflightError('unsupported_harness', `Unsupported harness: ${harness}`);
+  }
+
+  let discovered;
+  try {
+    discovered = await scanSkills(definition.skillRoot);
+  } catch (error) {
+    throw promptPreflightError(
+      'skill_discovery_failed',
+      `Failed to discover installed skills for harness ${harness}: ${error.message}`,
+      { retryable: true, cause: error },
+    );
+  }
+
+  const available = new Set(discovered);
   for (const skill of skills) {
-    if (!SKILL_NAME_PATTERN.test(skill)) throw new Error(`Invalid skill name: ${skill}`);
-    if (!available.has(skill)) throw new Error(`Skill ${skill} is not installed for harness ${harness}.`);
+    if (!SKILL_NAME_PATTERN.test(skill)) {
+      throw promptPreflightError('invalid_skill_name', `Invalid skill name: ${skill}`);
+    }
+    if (!available.has(skill)) {
+      throw promptPreflightError(
+        'skill_not_installed',
+        `Skill ${skill} is not installed for harness ${harness}.`,
+      );
+    }
   }
 }
 
@@ -1604,12 +1633,18 @@ export async function agentPrompt(
 ) {
   if (!wait && until.length > 0) throw new Error('until requires wait=true.');
 
-  const notSubmitted = (error, { agent = null, transcript = '' } = {}) => ({
+  const preflightRetryable = (error) => {
+    if (typeof error?.retryable === 'boolean') return error.retryable;
+    const code = error?.herdr?.code ?? error?.code;
+    return ['timeout', 'deadline_exceeded', 'herdr_unavailable', 'spawn_failed', 'agent_prompt_in_flight'].includes(code);
+  };
+  const notSubmitted = (error, { agent = null, transcript = '', retryable = preflightRetryable(error) } = {}) => ({
     accepted: false,
     submission: { state: 'not_submitted', retrySafe: true, waitCompleted: false },
     error: {
       code: 'agent_prompt_not_submitted',
       message: 'Prompt was not submitted because Agent Runtime preflight failed.',
+      retryable,
       cause: error?.herdr ?? {
         code: error?.code ?? 'agent_preflight_failed',
         message: error?.message ?? String(error),
@@ -1663,7 +1698,7 @@ export async function agentPrompt(
       }
       return {
         accepted: false,
-        submission: { state: 'not_submitted', retrySafe: Boolean(gate.retryable), waitCompleted: false },
+        submission: { state: 'not_submitted', retrySafe: true, waitCompleted: false },
         error: gate,
         agent: before,
         transcript,
@@ -1679,8 +1714,7 @@ export async function agentPrompt(
       );
     } catch (error) {
       throwIfCancelled(error);
-      if (error?.code === 'timeout') return notSubmitted(error, { agent: before });
-      throw error;
+      return notSubmitted(error, { agent: before });
     }
 
     let finalState;
@@ -1701,7 +1735,7 @@ export async function agentPrompt(
     if (finalGate) {
       return {
         accepted: false,
-        submission: { state: 'not_submitted', retrySafe: Boolean(finalGate.retryable), waitCompleted: false },
+        submission: { state: 'not_submitted', retrySafe: true, waitCompleted: false },
         error: finalGate,
         agent: finalState,
         transcript: '',
@@ -1745,6 +1779,7 @@ export async function agentPrompt(
         error: {
           code: 'agent_prompt_outcome_unknown',
           message: 'Prompt submission may have occurred, but completion could not be confirmed. Do not automatically retry this task.',
+          retryable: false,
           cause: outcome.error,
         },
         agent: diagnostics.agent,

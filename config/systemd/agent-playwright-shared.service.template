@@ -2,7 +2,6 @@
 Description=Shared persistent Playwright MCP browser
 Requires=agent-browser-x.service
 After=agent-browser-x.service
-Before=agent-tunnel.service
 
 [Service]
 Type=simple

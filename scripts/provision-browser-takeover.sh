@@ -32,6 +32,12 @@ fi
 agent_home=$(cut -d: -f6 <<<"$agent_passwd")
 agent_group=$(id -gn "$agent_user")
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+canonical_control_plane_root=/opt/agent-vm-mcp
+if [[ $repo_root != "$canonical_control_plane_root" ]]; then
+  echo "Browser takeover provisioning requires agent-vm-mcp to be deployed at $canonical_control_plane_root." >&2
+  echo "Current checkout: $repo_root" >&2
+  exit 1
+fi
 node_version=24.20.0
 mise_data_dir="$agent_home/.local/share/mise"
 mise_shims="$mise_data_dir/shims"
@@ -49,8 +55,7 @@ for required in \
   "$systemd_template_dir/agent-browser-x.service.template" \
   "$systemd_template_dir/agent-browser-vnc.service.template" \
   "$systemd_template_dir/agent-browser-novnc.service.template" \
-  "$systemd_template_dir/agent-playwright-shared.service.template" \
-  "$systemd_template_dir/agent-tunnel-browser.conf"; do
+  "$systemd_template_dir/agent-playwright-shared.service.template"; do
   if [[ ! -r $required ]]; then
     echo "Missing deployment template: $required" >&2
     exit 1
@@ -133,11 +138,6 @@ render_template "$systemd_template_dir/agent-browser-vnc.service.template" /etc/
 render_template "$systemd_template_dir/agent-browser-novnc.service.template" /etc/systemd/system/agent-browser-novnc.service
 render_template "$systemd_template_dir/agent-playwright-shared.service.template" /etc/systemd/system/agent-playwright-shared.service
 
-install -d -m 0755 -o root -g root /etc/systemd/system/agent-tunnel.service.d
-install -m 0644 -o root -g root \
-  "$systemd_template_dir/agent-tunnel-browser.conf" \
-  /etc/systemd/system/agent-tunnel.service.d/browser-display.conf
-
 render_template "$playwright_shared_launcher_source" /opt/playwright-mcp/start-shared.sh 0755
 render_template "$playwright_shared_proxy_launcher_source" /opt/playwright-mcp/start-shared-proxy.sh 0755
 render_template "$playwright_isolated_launcher_source" /opt/playwright-mcp/start-isolated.sh 0755
@@ -156,5 +156,5 @@ systemctl is-active --quiet tailscaled.service
 
 echo "Browser takeover dependencies provisioned for $agent_user."
 echo "Tailscale enrollment remains explicit; run tailscale up separately as the operator when ready."
-echo "Shared Playwright MCP was installed and enabled but not started, so the currently running tunnel-owned browser is untouched."
-echo "Restart agent-tunnel.service separately during an idle window; the updated dependency will start agent-playwright-shared.service after the old tunnel-owned browser exits."
+echo "Shared Playwright MCP was installed and enabled but not started."
+echo "Start agent-playwright-shared.service separately during an idle window after confirming no other process owns the persistent browser profile."

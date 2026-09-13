@@ -2,18 +2,21 @@ import { McpServer } from '@modelcontextprotocol/server';
 import { serveStdio } from '@modelcontextprotocol/server/stdio';
 
 import { McpBridgeManager } from './mcp-bridge.js';
-
-const DEFAULT_CONFIG_PATH = '/opt/agent-mcp/config/playwright-shared-proxy.json';
+import { resolveConfigPath } from './config-path.js';
 
 async function createServer() {
   const server = new McpServer({
     name: 'playwright-shared-stdio-proxy',
     version: '1.0.0',
   });
+  const configPath = await resolveConfigPath({
+    filename: 'playwright-shared-proxy.json',
+    envName: 'PLAYWRIGHT_SHARED_PROXY_CONFIG',
+  });
   const bridgeManager = new McpBridgeManager({
     server,
     reservedToolNames: new Set(),
-    configPath: process.env.PLAYWRIGHT_SHARED_PROXY_CONFIG ?? DEFAULT_CONFIG_PATH,
+    configPath,
   });
 
   await bridgeManager.initialize();

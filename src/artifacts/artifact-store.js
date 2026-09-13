@@ -3,6 +3,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
+import { readBoundedRegularFile } from '../bounded-file-read.js';
 import { inferMimeType, isTextMimeType } from './mime.js';
 
 const DEFAULT_MAX_BYTES = 50 * 1024 * 1024;
@@ -178,14 +179,18 @@ export class ArtifactStore {
 
   async readResource(id) {
     const artifact = this.get(id);
-    const currentStat = await fs.stat(artifact.path);
-    if (!currentStat.isFile()) throw new Error(`Artifact is no longer a regular file: ${id}`);
-    if (currentStat.size > this.#maxBytes) {
-      throw new Error(`Artifact grew beyond the ${this.#maxBytes}-byte limit: ${id}`);
-    }
-    const data = await fs.readFile(artifact.path);
-    if (data.length > this.#maxBytes) {
-      throw new Error(`Artifact grew beyond the ${this.#maxBytes}-byte limit while reading: ${id}`);
+    let data;
+    try {
+      ({ data } = await readBoundedRegularFile(artifact.path, this.#maxBytes));
+    } catch (error) {
+      if (error?.code === 'not_regular_file') {
+        throw new Error(`Artifact is no longer a regular file: ${id}`);
+      }
+      if (error?.code === 'too_large') {
+        const suffix = error.phase === 'read' ? ' while reading' : '';
+        throw new Error(`Artifact grew beyond the ${this.#maxBytes}-byte limit${suffix}: ${id}`);
+      }
+      throw error;
     }
 
     const base = {

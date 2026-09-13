@@ -1,7 +1,6 @@
 [Unit]
 Description=Persistent Herdr runtime for Agent VM coding agents
 After=network-online.target
-Before=agent-tunnel.service
 
 [Service]
 Type=simple

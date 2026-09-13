@@ -24,13 +24,14 @@ import {
 } from './agents.js';
 import { collectCapabilities, inspectCommands } from './capabilities.js';
 import { collectSystemAudit } from './system-audit.js';
-import { createBridgeToolAdapterFactory } from './adapters/index.js';
-import { createBridgeCallPolicyFactory } from './policies/index.js';
+import { createBridgeToolAdapterFactory, validateBridgeToolAdapters } from './adapters/index.js';
+import { createBridgeCallPolicyFactory, validateBridgeCallPolicies } from './policies/index.js';
 import { ArtifactStore } from './artifacts/artifact-store.js';
 import { PRESENT_FILE_TOOL } from './artifacts/constants.js';
 import { registerArtifactSystem } from './artifacts/register.js';
 import { ExecOutputCapture } from './exec-output.js';
 import { assertNoRawCodingHarnessLaunch } from './coding-harness-guard.js';
+import { resolveHostProfile } from './host-profile.js';
 import { applyUnifiedPatch, listDirectory, readTextFile, waitForFilesystemMutations } from './filesystem.js';
 import { workspaceCreate, workspaceDelete, workspaceList, waitForWorkspaceMutations } from './workspaces.js';
 
@@ -453,6 +454,7 @@ for (const signal of ['SIGTERM', 'SIGINT']) {
 }
 
 async function createServer() {
+  const hostProfile = resolveHostProfile();
   const server = new McpServer({
     name: 'agent-vm-control',
     version: '0.5.0',
@@ -709,7 +711,7 @@ async function createServer() {
     'import_file',
     {
       description:
-        'Import a ChatGPT-hosted file into the agent VM without routing file bytes through model context.',
+        'Import a host-provided file into the Agent VM without routing file bytes through model context.',
       inputSchema: z.object({
         file: z.object({
           download_url: z.string().url(),
@@ -721,7 +723,7 @@ async function createServer() {
         cwd: z.string().optional(),
         overwrite: z.boolean().default(false),
       }),
-      _meta: { 'openai/fileParams': ['file'] },
+      ...(hostProfile.importFileToolMeta ? { _meta: hostProfile.importFileToolMeta } : {}),
     },
     async ({ file, destination, cwd, overwrite }, ctx) => {
       const requestSignal = ctx.mcpReq.signal;
@@ -909,6 +911,10 @@ async function createServer() {
     reservedToolNames: new Set(NATIVE_TOOL_NAMES),
     adapterFactory: createBridgeToolAdapterFactory({ artifactStore }),
     policyFactory: createBridgeCallPolicyFactory(),
+    bridgeValidator: (bridge) => {
+      validateBridgeToolAdapters(bridge);
+      validateBridgeCallPolicies(bridge);
+    },
   });
   await bridgeManager.initialize();
   activeBridgeManagers.add(bridgeManager);

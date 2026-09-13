@@ -50,7 +50,6 @@ herdr_session=agent-vm-mcp
 node_bin="$mise_data_dir/installs/node/$node_version/bin/node"
 herdr_bin="$mise_data_dir/installs/herdr/$herdr_version/herdr"
 herdr_service_template="$repo_root/config/systemd/agent-herdr.service.template"
-herdr_tunnel_dropin_template="$repo_root/config/systemd/agent-tunnel-herdr.conf.template"
 legacy_pnpm_bin="$agent_home/.local/share/pnpm/bin"
 legacy_node="$legacy_pnpm_bin/node"
 
@@ -93,8 +92,8 @@ if [[ ! -x $herdr_bin ]]; then
   echo "Pinned mise-managed Herdr executable is missing: $herdr_bin" >&2
   exit 1
 fi
-if [[ ! -r $herdr_service_template || ! -r $herdr_tunnel_dropin_template ]]; then
-  echo "Missing repo-managed Herdr systemd templates." >&2
+if [[ ! -r $herdr_service_template ]]; then
+  echo "Missing repo-managed Herdr systemd template." >&2
   exit 1
 fi
 
@@ -119,16 +118,6 @@ path.write_text(text.replace(old, new))
 PY
   fi
 }
-
-replace_literal_if_present \
-  /etc/systemd/system/agent-tunnel.service \
-  "$legacy_pnpm_bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
-  "$mise_shims:$agent_home/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-
-replace_literal_if_present \
-  "$agent_home/.config/tunnel-client/agent-01.yaml" \
-  "$legacy_node" \
-  "$node_bin"
 
 for playwright_launcher in \
   /opt/playwright-mcp/start.sh \
@@ -159,9 +148,6 @@ render_systemd_template() {
 }
 
 render_systemd_template "$herdr_service_template" /etc/systemd/system/agent-herdr.service
-render_systemd_template \
-  "$herdr_tunnel_dropin_template" \
-  /etc/systemd/system/agent-tunnel.service.d/20-herdr.conf
 
 bashrc="$agent_home/.bashrc"
 if [[ -f $bashrc ]]; then
@@ -192,9 +178,8 @@ run_as_agent env PATH="$mise_shims:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr
 if $cleanup_legacy; then
   stale_refs=$(rg -l --fixed-strings "$legacy_pnpm_bin" \
     /etc/systemd/system \
-    "$agent_home/.config/tunnel-client" \
     /opt/playwright-mcp \
-    /opt/agent-mcp 2>/dev/null || true)
+    /opt/agent-vm-mcp 2>/dev/null || true)
   if [[ -n $stale_refs ]]; then
     echo "Refusing legacy cleanup while active deployment paths still reference $legacy_pnpm_bin:" >&2
     printf '%s\n' "$stale_refs" >&2
@@ -209,5 +194,4 @@ else
 fi
 
 echo "mise toolchain provisioned for $agent_user."
-echo "Herdr runtime service/drop-in installed; production MCP is configured for external Herdr bootstrap."
-echo "Restart agent-tunnel.service separately to activate the migrated control-plane environment."
+echo "Herdr runtime service installed and enabled; start/restart it separately when using external bootstrap."

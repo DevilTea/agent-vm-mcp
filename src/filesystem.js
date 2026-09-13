@@ -3,6 +3,8 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { TextDecoder } from 'node:util';
 
+import { readBoundedRegularFile } from './bounded-file-read.js';
+
 const MAX_READ_SOURCE_BYTES = 8 * 1024 * 1024;
 const MAX_READ_OUTPUT_BYTES = 256 * 1024;
 const MAX_DIRECTORY_ENTRIES = 4_096;
@@ -29,19 +31,20 @@ export async function readTextFile({ path: inputPath, cwd, startLine = 1, endLin
   }
 
   const resolvedPath = resolveFromCwd(inputPath, cwd);
-  const stat = await fs.stat(resolvedPath);
-  if (!stat.isFile()) throw new Error(`Not a regular file: ${resolvedPath}`);
-  if (stat.size > MAX_READ_SOURCE_BYTES) {
-    throw new Error(
-      `File is ${stat.size} bytes; read_file supports files up to ${MAX_READ_SOURCE_BYTES} bytes. Use shell tools for larger files.`,
-    );
-  }
-
-  const data = await fs.readFile(resolvedPath);
-  if (data.length > MAX_READ_SOURCE_BYTES) {
-    throw new Error(
-      `File is ${data.length} bytes; read_file supports files up to ${MAX_READ_SOURCE_BYTES} bytes. Use shell tools for larger files.`,
-    );
+  let data;
+  try {
+    ({ data } = await readBoundedRegularFile(resolvedPath, MAX_READ_SOURCE_BYTES));
+  } catch (error) {
+    if (error?.code === 'not_regular_file') {
+      throw new Error(`Not a regular file: ${resolvedPath}`);
+    }
+    if (error?.code === 'too_large') {
+      const size = error.phase === 'stat' ? `${error.observedBytes} bytes` : `more than ${MAX_READ_SOURCE_BYTES} bytes`;
+      throw new Error(
+        `File is ${size}; read_file supports files up to ${MAX_READ_SOURCE_BYTES} bytes. Use shell tools for larger files.`,
+      );
+    }
+    throw error;
   }
   let text;
   try {

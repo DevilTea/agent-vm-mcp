@@ -11,7 +11,9 @@ import { StdioClientTransport } from '@modelcontextprotocol/client/stdio';
 
 import { ArtifactStore } from '../src/artifacts/artifact-store.js';
 
-const node = '/home/agent/.local/share/mise/installs/node/24.20.0/bin/node';
+const liveIntegrations = process.env.AGENT_VM_SMOKE_LIVE_INTEGRATIONS === '1';
+const hostKind = process.env.AGENT_MCP_HOST ?? 'generic';
+const node = process.execPath;
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const serverEntry = path.join(projectRoot, 'src/index.js');
 const smokeBridgeConfig = `/tmp/agent-mcp-bridges-smoke-${process.pid}.json`;
@@ -20,9 +22,8 @@ const artifactBorrowedPath = `/tmp/agent-mcp-artifact-borrowed-${process.pid}.tx
 const artifactOwnedParent = '/tmp/agent-vm-artifacts';
 const smokeArtifactMaxBytes = 256 * 1024;
 const artifactMetaKey = 'io.deviltea.agent-vm/artifact';
-const artifactViewerUri = 'ui://agent-vm/artifact-viewer-v12.html';
 const presentFilePath = '/tmp/agent-mcp-present-file-smoke.txt';
-const viewerScriptPath = '/tmp/agent-mcp-artifact-viewer-smoke.mjs';
+const presentBinaryPath = '/tmp/agent-mcp-present-file-smoke.bin';
 const importedFilePath = '/tmp/agent-mcp-import-file-smoke.txt';
 const cancelledImportPath = '/tmp/agent-mcp-import-file-cancelled.txt';
 const execCancelPidPath = '/tmp/agent-mcp-exec-cancel.pid';
@@ -52,7 +53,7 @@ const lspWorkspaceB = path.join(lspSmokeRoot, 'workspace-b');
 const lspDeniedWorkspace = path.join(lspSmokeRoot, 'workspace-denied');
 const lspMissingWorkspace = path.join(lspSmokeRoot, 'workspace-missing-server');
 const lspDeniedMarker = path.join(lspSmokeRoot, 'repo-config-command-executed.marker');
-const lspManagedCacheRoot = '/home/agent/.cache/lsp-mcp/servers';
+const lspManagedCacheRoot = path.join(process.env.HOME ?? '/home/agent', '.cache/lsp-mcp/servers');
 const importPayload = Buffer.from('file ingress smoke\n', 'utf8');
 let importServer;
 let clientClosed = false;
@@ -61,7 +62,7 @@ const client = new Client({ name: 'agent-mcp-smoke', version: '1.0.0' });
 const transport = new StdioClientTransport({
   command: node,
   args: [serverEntry],
-  cwd: '/home/agent',
+  cwd: projectRoot,
   env: {
     ...process.env,
     PATH: `${gitShimDir}:${process.env.PATH}`,
@@ -72,15 +73,18 @@ const transport = new StdioClientTransport({
     AGENT_REPOSITORY_ROOT: repositoryRoot,
     AGENT_HERDR_BIN: `/tmp/agent-mcp-missing-herdr-${process.pid}`,
     AGENT_HERDR_BOOTSTRAP: 'external',
+    AGENT_MCP_HOST: hostKind,
   },
   stderr: 'inherit',
 });
 
 try {
-  const bridgeFixture = (await fs.readFile(path.join(projectRoot, 'test/bridges.smoke.json'), 'utf8')).replace(
-    '/opt/agent-mcp/test/playwright-start-smoke.sh',
-    path.join(projectRoot, 'test/playwright-start-smoke.sh'),
-  );
+  const bridgeFixture = liveIntegrations
+    ? (await fs.readFile(path.join(projectRoot, 'test/bridges.smoke.json'), 'utf8')).replace(
+        '/opt/agent-vm-mcp/test/playwright-start-smoke.sh',
+        path.join(projectRoot, 'test/playwright-start-smoke.sh'),
+      )
+    : '{"version":1,"bridges":[]}\n';
   await fs.writeFile(smokeBridgeConfig, bridgeFixture, 'utf8');
 
   await fs.rm(artifactExpiryRoot, { recursive: true, force: true });
@@ -114,6 +118,7 @@ try {
   await expiryStore.close();
 
   await fs.writeFile(presentFilePath, 'artifact smoke text\nline two\n', 'utf8');
+  await fs.writeFile(presentBinaryPath, Buffer.from([0x00, 0x01, 0x02, 0xff]));
   await fs.rm(importedFilePath, { force: true });
   await fs.rm(cancelledImportPath, { force: true });
   await fs.rm(execCancelPidPath, { force: true });
@@ -137,52 +142,54 @@ try {
   await fs.rm(workspaceWorktreeRemoveTriggerPath, { force: true });
   await fs.rm(workspaceWorktreeRemovePidPath, { force: true });
   await fs.rm(workspaceRediscoveryBridgesConfig, { force: true });
-  await fs.rm(lspSmokeRoot, { recursive: true, force: true });
-  await fs.mkdir(path.join(lspWorkspaceA, 'src'), { recursive: true });
-  await fs.mkdir(path.join(lspWorkspaceB, 'src'), { recursive: true });
-  await fs.mkdir(path.join(lspDeniedWorkspace, 'src'), { recursive: true });
-  await fs.mkdir(lspMissingWorkspace, { recursive: true });
-  const lspTsconfig = JSON.stringify({
-    compilerOptions: {
-      strict: true,
-      target: 'ES2022',
-      module: 'NodeNext',
-      moduleResolution: 'NodeNext',
-    },
-    include: ['src/**/*.ts'],
-  });
-  await fs.writeFile(path.join(lspWorkspaceA, 'tsconfig.json'), `${lspTsconfig}\n`, 'utf8');
-  await fs.writeFile(path.join(lspWorkspaceA, 'src/lib.ts'), "export function greet(name: string): string { return `hello ${name}`; }\n", 'utf8');
-  await fs.writeFile(
-    path.join(lspWorkspaceA, 'src/main.ts'),
-    "import { greet } from './lib.js';\nconst value: string = greet('alpha');\nconst broken: number = 'wrong';\nconsole.log(value, broken);\n",
-    'utf8',
-  );
-  await fs.writeFile(path.join(lspWorkspaceB, 'tsconfig.json'), `${lspTsconfig}\n`, 'utf8');
-  await fs.writeFile(path.join(lspWorkspaceB, 'src/lib.ts'), 'export function square(value: number): number { return value * value; }\n', 'utf8');
-  await fs.writeFile(
-    path.join(lspWorkspaceB, 'src/main.ts'),
-    "import { square } from './lib.js';\nconst result: number = square(4);\nconsole.log(result);\n",
-    'utf8',
-  );
-  await fs.writeFile(path.join(lspDeniedWorkspace, 'src/main.ts'), 'const denied = 1;\n', 'utf8');
-  await fs.writeFile(
-    path.join(lspDeniedWorkspace, '.lsp-mcp.json'),
-    `${JSON.stringify({
-      lsp: {
-        servers: {
-          malicious: {
-            command: '/bin/sh',
-            args: ['-c', `touch ${lspDeniedMarker}; exit 1`],
-            languageIds: ['typescript'],
-            extensions: ['.ts'],
+  if (liveIntegrations) {
+    await fs.rm(lspSmokeRoot, { recursive: true, force: true });
+    await fs.mkdir(path.join(lspWorkspaceA, 'src'), { recursive: true });
+    await fs.mkdir(path.join(lspWorkspaceB, 'src'), { recursive: true });
+    await fs.mkdir(path.join(lspDeniedWorkspace, 'src'), { recursive: true });
+    await fs.mkdir(lspMissingWorkspace, { recursive: true });
+    const lspTsconfig = JSON.stringify({
+      compilerOptions: {
+        strict: true,
+        target: 'ES2022',
+        module: 'NodeNext',
+        moduleResolution: 'NodeNext',
+      },
+      include: ['src/**/*.ts'],
+    });
+    await fs.writeFile(path.join(lspWorkspaceA, 'tsconfig.json'), `${lspTsconfig}\n`, 'utf8');
+    await fs.writeFile(path.join(lspWorkspaceA, 'src/lib.ts'), "export function greet(name: string): string { return `hello ${name}`; }\n", 'utf8');
+    await fs.writeFile(
+      path.join(lspWorkspaceA, 'src/main.ts'),
+      "import { greet } from './lib.js';\nconst value: string = greet('alpha');\nconst broken: number = 'wrong';\nconsole.log(value, broken);\n",
+      'utf8',
+    );
+    await fs.writeFile(path.join(lspWorkspaceB, 'tsconfig.json'), `${lspTsconfig}\n`, 'utf8');
+    await fs.writeFile(path.join(lspWorkspaceB, 'src/lib.ts'), 'export function square(value: number): number { return value * value; }\n', 'utf8');
+    await fs.writeFile(
+      path.join(lspWorkspaceB, 'src/main.ts'),
+      "import { square } from './lib.js';\nconst result: number = square(4);\nconsole.log(result);\n",
+      'utf8',
+    );
+    await fs.writeFile(path.join(lspDeniedWorkspace, 'src/main.ts'), 'const denied = 1;\n', 'utf8');
+    await fs.writeFile(
+      path.join(lspDeniedWorkspace, '.lsp-mcp.json'),
+      `${JSON.stringify({
+        lsp: {
+          servers: {
+            malicious: {
+              command: '/bin/sh',
+              args: ['-c', `touch ${lspDeniedMarker}; exit 1`],
+              languageIds: ['typescript'],
+              extensions: ['.ts'],
+            },
           },
         },
-      },
-    })}\n`,
-    'utf8',
-  );
-  await fs.writeFile(path.join(lspMissingWorkspace, 'fixture.yaml'), 'key: value\n', 'utf8');
+      })}\n`,
+      'utf8',
+    );
+    await fs.writeFile(path.join(lspMissingWorkspace, 'fixture.yaml'), 'key: value\n', 'utf8');
+  }
   await fs.mkdir(filesystemRoot, { recursive: true });
   await fs.mkdir(filesystemOutsideRoot, { recursive: true });
   await fs.mkdir(gitShimDir, { recursive: true });
@@ -287,16 +294,20 @@ exec /usr/bin/git "$@"
     'command_info',
     'system_audit',
     'present_file',
-    'browser_navigate',
-    'browser_snapshot',
-    'browser_take_screenshot',
-    'lsp_hover',
-    'lsp_definition',
-    'lsp_references',
-    'lsp_document_symbols',
-    'lsp_workspace_symbols',
-    'lsp_diagnostics',
-    'lsp_server_status',
+    ...(liveIntegrations
+      ? [
+          'browser_navigate',
+          'browser_snapshot',
+          'browser_take_screenshot',
+          'lsp_hover',
+          'lsp_definition',
+          'lsp_references',
+          'lsp_document_symbols',
+          'lsp_workspace_symbols',
+          'lsp_diagnostics',
+          'lsp_server_status',
+        ]
+      : []),
   ];
   for (const name of required) {
     if (!names.includes(name)) throw new Error(`Missing tool: ${name}`);
@@ -368,8 +379,12 @@ exec /usr/bin/git "$@"
     'lsp_server_status',
   ].sort();
   const actualLspTools = names.filter((name) => name.startsWith('lsp_')).sort();
-  if (JSON.stringify(actualLspTools) !== JSON.stringify(expectedLspTools)) {
-    throw new Error(`Unexpected LSP tool surface: ${actualLspTools.join(',')}`);
+  if (liveIntegrations) {
+    if (JSON.stringify(actualLspTools) !== JSON.stringify(expectedLspTools)) {
+      throw new Error(`Unexpected LSP tool surface: ${actualLspTools.join(',')}`);
+    }
+  } else if (actualLspTools.length !== 0 || names.some((name) => name.startsWith('browser_'))) {
+    throw new Error('Portable smoke unexpectedly exposed optional LSP/Playwright tools');
   }
   for (const forbidden of [
     'lsp_rename',
@@ -583,7 +598,7 @@ exec /usr/bin/git "$@"
   const rediscoveryTransport = new StdioClientTransport({
     command: node,
     args: [serverEntry],
-    cwd: '/home/agent',
+    cwd: projectRoot,
     env: {
       ...process.env,
       PATH: `${gitShimDir}:${process.env.PATH}`,
@@ -871,8 +886,13 @@ exec /usr/bin/git "$@"
   }
 
   const importFileTool = allTools.find((tool) => tool.name === 'import_file');
-  if (importFileTool?._meta?.['openai/fileParams']?.[0] !== 'file') {
-    throw new Error('import_file fileParams metadata missing');
+  const importFileParams = importFileTool?._meta?.['openai/fileParams'];
+  if (hostKind === 'chatgpt') {
+    if (importFileParams?.[0] !== 'file') {
+      throw new Error('import_file ChatGPT fileParams metadata missing');
+    }
+  } else if (importFileParams !== undefined) {
+    throw new Error('generic host unexpectedly exposes ChatGPT fileParams metadata');
   }
 
   importServer = http.createServer((request, response) => {
@@ -1135,75 +1155,21 @@ exec /usr/bin/git "$@"
   }
 
   const presentFileTool = allTools.find((tool) => tool.name === 'present_file');
-  if (presentFileTool?._meta?.ui?.resourceUri !== artifactViewerUri) {
-    throw new Error('present_file UI resource metadata missing');
+  if (!presentFileTool) throw new Error('present_file tool missing');
+  if (presentFileTool._meta?.ui?.resourceUri || presentFileTool._meta?.['openai/outputTemplate']) {
+    throw new Error('present_file still exposes obsolete Artifact Viewer metadata');
   }
-  if (presentFileTool?._meta?.['openai/outputTemplate'] !== artifactViewerUri) {
-    throw new Error('present_file outputTemplate compatibility alias missing');
+  if (names.includes('artifact_viewer_read') || names.includes('artifact_viewer_relay_probe')) {
+    throw new Error('Obsolete Artifact Viewer tools are still registered');
   }
 
   const screenshotTool = allTools.find((tool) => tool.name === 'browser_take_screenshot');
-  if (screenshotTool?._meta?.ui?.resourceUri !== artifactViewerUri) {
-    throw new Error('browser_take_screenshot artifact viewer metadata missing');
+  if (liveIntegrations) {
+    if (!screenshotTool) throw new Error('browser_take_screenshot tool missing in live integration mode');
+    if (screenshotTool._meta?.ui?.resourceUri || screenshotTool._meta?.['openai/outputTemplate']) {
+      throw new Error('browser_take_screenshot still exposes obsolete Artifact Viewer metadata');
+    }
   }
-
-  const viewerResource = await client.readResource({ uri: artifactViewerUri });
-  const viewerHtml = viewerResource.contents?.[0]?.text ?? '';
-  if (viewerResource.contents?.[0]?.mimeType !== 'text/html;profile=mcp-app') {
-    throw new Error('Artifact Viewer MCP Apps MIME type missing');
-  }
-  for (const snippet of [
-    'callServerTool',
-    'artifact_viewer_read',
-    'Loading artifact',
-    'widgetState',
-    'setWidgetState',
-    'toolResponseMetadata',
-    'openai:set_globals',
-    'currentFileObjectUrl',
-    'image-preview',
-  ]) {
-    if (!viewerHtml.includes(snippet)) throw new Error(`Artifact Viewer missing ${snippet}`);
-  }
-  if (viewerHtml.includes('await app.readServerResource')) {
-    throw new Error('Artifact Viewer v12 should not call resources/read from the app');
-  }
-  for (const forbidden of ['artifact_viewer_resolve', 'Make visible to model']) {
-    if (viewerHtml.includes(forbidden)) throw new Error(`Artifact Viewer v12 still contains unsafe/obsolete path: ${forbidden}`);
-  }
-  for (const forbidden of [
-    'downloadCurrentArtifact',
-    'Open original image in a new tab',
-    "imageLink.target = '_blank'",
-    'anchor.download =',
-  ]) {
-    if (viewerHtml.includes(forbidden)) throw new Error(`Artifact Viewer v12 still contains iframe-blob external action: ${forbidden}`);
-  }
-  const relayProbeTool = allTools.find((tool) => tool.name === 'artifact_viewer_relay_probe');
-  if (relayProbeTool?._meta?.ui?.visibility?.[0] !== 'app') {
-    throw new Error('Artifact Viewer relay probe tool should be app-only');
-  }
-  const relayProbeResult = await client.callTool({ name: 'artifact_viewer_relay_probe', arguments: {} });
-  const relayProbeText = relayProbeResult.content?.find((item) => item.type === 'text')?.text ?? '';
-  if (relayProbeText !== 'artifact-viewer-tool-relay-ok') {
-    throw new Error('Artifact Viewer tool relay probe handler failed');
-  }
-
-  const artifactReadTool = allTools.find((tool) => tool.name === 'artifact_viewer_read');
-  if (artifactReadTool?._meta?.ui?.visibility?.[0] !== 'app') {
-    throw new Error('artifact_viewer_read should be app-only');
-  }
-  if (names.includes('artifact_viewer_resolve')) {
-    throw new Error('Unsafe request-id artifact resolver should not be registered');
-  }
-
-  if (viewerHtml.includes('pikacss-small.jpg')) {
-    throw new Error('Artifact Viewer still contains the screenshot POC fixture');
-  }
-  const viewerScript = viewerHtml.match(/<script type="module">([\s\S]*)<\/script>/)?.[1];
-  if (!viewerScript) throw new Error('Artifact Viewer module script missing');
-  await fs.writeFile(viewerScriptPath, viewerScript, 'utf8');
-  await execFileAsync(node, ['--check', viewerScriptPath]);
 
   const presented = await client.callTool({
     name: 'present_file',
@@ -1219,6 +1185,15 @@ exec /usr/bin/git "$@"
   if (JSON.stringify(textArtifact).includes(presentFilePath)) {
     throw new Error('present_file leaked VM filesystem path');
   }
+  const textLink = presented.content?.find((item) => item.type === 'resource_link');
+  if (
+    textLink?.uri !== textArtifact.uri ||
+    textLink?.name !== textArtifact.name ||
+    textLink?.mimeType !== textArtifact.mimeType ||
+    textLink?.size !== textArtifact.size
+  ) {
+    throw new Error('present_file did not expose a matching MCP resource_link for text');
+  }
   const embeddedText = presented.content?.find((item) => item.type === 'resource')?.resource?.text;
   if (!embeddedText?.includes('artifact smoke text')) {
     throw new Error('present_file did not expose small text content to the model');
@@ -1228,18 +1203,33 @@ exec /usr/bin/git "$@"
     throw new Error('Text artifact resource round-trip failed');
   }
 
-  const textToolRead = await client.callTool({
-    name: 'artifact_viewer_read',
-    arguments: { uri: textArtifact.uri },
+  const presentedBinary = await client.callTool({
+    name: 'present_file',
+    arguments: { path: presentBinaryPath, name: 'smoke.bin' },
   });
-  const textToolResource = textToolRead.content?.find((item) => item.type === 'resource')?.resource;
-  if (textToolResource?.text !== 'artifact smoke text\nline two\n') {
-    throw new Error('Text artifact tool relay round-trip failed');
+  const binaryArtifact = presentedBinary._meta?.[artifactMetaKey];
+  const binaryLink = presentedBinary.content?.find((item) => item.type === 'resource_link');
+  if (
+    binaryArtifact?.name !== 'smoke.bin' ||
+    binaryLink?.uri !== binaryArtifact?.uri ||
+    binaryLink?.name !== 'smoke.bin' ||
+    binaryLink?.size !== 4
+  ) {
+    throw new Error('present_file did not expose a matching MCP resource_link for binary content');
+  }
+  if (presentedBinary.content?.some((item) => item.type === 'resource')) {
+    throw new Error('Binary present_file unexpectedly embedded the full resource inline');
+  }
+  const binaryResource = await client.readResource({ uri: binaryArtifact.uri });
+  if (binaryResource.contents?.[0]?.blob !== Buffer.from([0x00, 0x01, 0x02, 0xff]).toString('base64')) {
+    throw new Error('Binary present_file resource round-trip failed');
   }
 
+  const commandInfoNames = ['git', 'pnpm', 'definitely-not-an-agent-command'];
+  if (liveIntegrations) commandInfoNames.splice(1, 0, 'mise');
   const commandInfo = await client.callTool({
     name: 'command_info',
-    arguments: { names: ['git', 'mise', 'pnpm', 'definitely-not-an-agent-command'] },
+    arguments: { names: commandInfoNames },
   });
   const commandInfoText = commandInfo.content?.find((item) => item.type === 'text')?.text ?? '';
   const inspectedCommands = JSON.parse(commandInfoText).commands;
@@ -1248,7 +1238,9 @@ exec /usr/bin/git "$@"
   const pnpm = inspectedCommands.find((command) => command.name === 'pnpm');
   const missing = inspectedCommands.find((command) => command.name === 'definitely-not-an-agent-command');
   if (!git?.available || !git.curated || !git.version) throw new Error('git command_info failed');
-  if (!mise?.available || !mise.curated || !mise.version) throw new Error('mise command_info failed');
+  if (liveIntegrations && (!mise?.available || !mise.curated || !mise.version)) {
+    throw new Error('mise command_info failed');
+  }
   if (!pnpm?.available || !pnpm.curated || !pnpm.version) throw new Error('pnpm command_info failed');
   if (missing?.available || missing?.curated) throw new Error('missing command_info failed');
 
@@ -1260,31 +1252,40 @@ exec /usr/bin/git "$@"
   if (!capabilityData.runtimes?.some((runtime) => runtime.name === 'node' && runtime.available)) {
     throw new Error('node runtime capability missing');
   }
-  if (!capabilityData.runtimes?.some((runtime) => runtime.name === 'mise' && runtime.available)) {
-    throw new Error('mise runtime capability missing');
+  if (liveIntegrations) {
+    if (!capabilityData.runtimes?.some((runtime) => runtime.name === 'mise' && runtime.available)) {
+      throw new Error('mise runtime capability missing');
+    }
+    const docker = capabilityData.cli?.categories?.container?.find((command) => command.name === 'docker');
+    if (!docker?.available || !docker.version) throw new Error('docker capability missing');
+    const compose = capabilityData.cli?.probes?.find((probe) => probe.name === 'docker-compose');
+    if (!compose?.available || !compose.version) throw new Error('docker compose capability missing');
+    const buildx = capabilityData.cli?.probes?.find((probe) => probe.name === 'docker-buildx');
+    if (!buildx?.available || !buildx.version) throw new Error('docker buildx capability missing');
   }
-  const docker = capabilityData.cli?.categories?.container?.find((command) => command.name === 'docker');
-  if (!docker?.available || !docker.version) throw new Error('docker capability missing');
-  const compose = capabilityData.cli?.probes?.find((probe) => probe.name === 'docker-compose');
-  if (!compose?.available || !compose.version) throw new Error('docker compose capability missing');
-  const buildx = capabilityData.cli?.probes?.find((probe) => probe.name === 'docker-buildx');
-  if (!buildx?.available || !buildx.version) throw new Error('docker buildx capability missing');
 
   const status = await client.callTool({ name: 'mcp_bridge_status', arguments: {} });
   const statusText = status.content?.find((item) => item.type === 'text')?.text ?? '';
   const parsed = JSON.parse(statusText);
-  const playwright = parsed.bridges.find((bridge) => bridge.id === 'playwright');
-  if (playwright?.state !== 'connected') throw new Error('Playwright bridge not connected');
-  const lsp = parsed.bridges.find((bridge) => bridge.id === 'lsp');
-  if (lsp?.state !== 'connected' || lsp.tools?.length !== expectedLspTools.length) {
-    throw new Error('LSP bridge not connected with the expected read-only surface');
-  }
-  const capabilityLsp = capabilityData.mcp?.bridges?.find((bridge) => bridge.id === 'lsp');
-  if (capabilityLsp?.state !== 'connected' || capabilityLsp.tools?.length !== expectedLspTools.length) {
-    throw new Error('LSP bridge capability metadata missing');
+  let liveSummary = null;
+  if (liveIntegrations) {
+    const playwright = parsed.bridges.find((bridge) => bridge.id === 'playwright');
+    if (playwright?.state !== 'connected') throw new Error('Playwright bridge not connected');
+    const lsp = parsed.bridges.find((bridge) => bridge.id === 'lsp');
+    if (lsp?.state !== 'connected' || lsp.tools?.length !== expectedLspTools.length) {
+      throw new Error('LSP bridge not connected with the expected read-only surface');
+    }
+    const capabilityLsp = capabilityData.mcp?.bridges?.find((bridge) => bridge.id === 'lsp');
+    if (capabilityLsp?.state !== 'connected' || capabilityLsp.tools?.length !== expectedLspTools.length) {
+      throw new Error('LSP bridge capability metadata missing');
+    }
+    liveSummary = { playwrightTools: playwright.tools.length, lspTools: lsp.tools.length, artifactName: null };
+  } else if (parsed.bridges.length !== 0) {
+    throw new Error(`Portable smoke unexpectedly connected bridges: ${parsed.bridges.map((bridge) => bridge.id).join(',')}`);
   }
 
-  const lspConfig = JSON.parse(await fs.readFile('/home/agent/.config/lsp-mcp/config.json', 'utf8'));
+  if (liveIntegrations) {
+  const lspConfig = JSON.parse(await fs.readFile(path.join(process.env.HOME, '.config/lsp-mcp/config.json'), 'utf8'));
   if (
     lspConfig.downloads?.enabled !== false ||
     lspConfig.commands?.enabled !== false ||
@@ -1490,15 +1491,6 @@ exec /usr/bin/git "$@"
     throw new Error('Screenshot artifact binary round-trip failed');
   }
 
-  const screenshotToolRead = await client.callTool({
-    name: 'artifact_viewer_read',
-    arguments: { uri: screenshotArtifact.uri },
-  });
-  const screenshotToolResource = screenshotToolRead.content?.find((item) => item.type === 'resource')?.resource;
-  if (!screenshotToolResource?.blob?.startsWith('iVBORw0KGgo')) {
-    throw new Error('Screenshot artifact tool relay round-trip failed');
-  }
-
   const explicitScreenshot = await client.callTool({
     name: 'browser_take_screenshot',
     arguments: { filename: 'smoke-explicit.webp', type: 'webp', scale: 'css' },
@@ -1510,6 +1502,8 @@ exec /usr/bin/git "$@"
   const explicitResource = await client.readResource({ uri: explicitArtifact.uri });
   if (!(explicitResource.contents?.[0]?.blob?.length > 100)) {
     throw new Error('Explicit screenshot artifact resource missing');
+  }
+  liveSummary.artifactName = screenshotArtifact.name;
   }
 
   const blockedRawExec = await client.callTool({
@@ -1654,16 +1648,20 @@ exec /usr/bin/git "$@"
   await client.close();
   clientClosed = true;
 
-  console.log(
-    `PASS tools=${names.length} playwrightForwarded=${playwright.tools.length} lspForwarded=${lsp.tools.length} artifact=${screenshotArtifact.name}`,
-  );
+  if (liveIntegrations) {
+    console.log(
+      `PASS live tools=${names.length} playwrightForwarded=${liveSummary.playwrightTools} lspForwarded=${liveSummary.lspTools} artifact=${liveSummary.artifactName}`,
+    );
+  } else {
+    console.log(`PASS portable tools=${names.length} bridges=0`);
+  }
 } finally {
   if (!clientClosed) await client.close();
   await fs.rm(smokeBridgeConfig, { force: true });
   await fs.rm(artifactExpiryRoot, { recursive: true, force: true });
   await fs.rm(artifactBorrowedPath, { force: true });
   await fs.rm(presentFilePath, { force: true });
-  await fs.rm(viewerScriptPath, { force: true });
+  await fs.rm(presentBinaryPath, { force: true });
   await fs.rm(importedFilePath, { force: true });
   await fs.rm(cancelledImportPath, { force: true });
   await fs.rm(execCancelPidPath, { force: true });

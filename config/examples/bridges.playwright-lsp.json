@@ -5,13 +5,8 @@
       "id": "playwright",
       "enabled": true,
       "transport": {
-        "type": "stdio",
-        "command": "/opt/agent-vm-mcp/test/playwright-start-smoke.sh",
-        "args": [],
-        "env": {
-          "PLAYWRIGHT_MCP_OUTPUT_DIR": "/tmp/agent-mcp-playwright-smoke-output",
-          "PLAYWRIGHT_MCP_WORKING_DIR": "/tmp/agent-mcp-playwright-smoke-working"
-        }
+        "type": "streamable-http",
+        "url": "http://localhost:8931/mcp"
       },
       "toolPrefix": "",
       "includeTools": [
@@ -20,7 +15,7 @@
       "toolAdapters": {
         "browser_take_screenshot": {
           "type": "output-directory-artifact",
-          "outputDir": "/tmp/agent-mcp-playwright-smoke-output",
+          "outputDir": "/home/agent/.local/share/playwright-mcp/output",
           "extensions": [
             ".png",
             ".jpg",
@@ -28,7 +23,7 @@
             ".webp"
           ],
           "pathArgument": "filename",
-          "workingDir": "/tmp/agent-mcp-playwright-smoke-working",
+          "workingDir": "/opt/playwright-mcp",
           "mimeTypeArgument": "type",
           "mimeTypeMap": {
             "png": "image/png",

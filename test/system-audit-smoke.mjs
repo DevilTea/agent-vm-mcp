@@ -242,3 +242,169 @@ setTimeout(() => controller.abort(new Error('audit cancelled by test')), 10);
 await assert.rejects(cancellationAudit, /audit cancelled by test/);
 assert.equal(cancellationSignalObserved, true, 'MCP cancellation signal must reach audit command probes');
 console.log('PASS system audit cancellation propagation');
+
+function isolatedAuditDeps(runCommand) {
+  return {
+    now: () => new Date('2026-09-13T00:00:00.000Z'),
+    findExecutable: async () => null,
+    listExecutables: async () => [],
+    readFile: async () => {
+      throw new Error('isolated audit fixture unexpectedly read a file');
+    },
+    fetchJson: async () => {
+      throw new Error('isolated audit fixture unexpectedly used the network');
+    },
+    runCommand,
+  };
+}
+
+function isolatedConfig(overrides = {}) {
+  return {
+    version: 1,
+    directExecutableDirs: [],
+    aliases: {},
+    latestSources: {},
+    installations: [],
+    services: [],
+    repositories: [],
+    projects: [],
+    coverage: { managedElsewhere: {} },
+    ...overrides,
+  };
+}
+
+const repositoryCases = {
+  '/repo/sync': {
+    head: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+    tracking: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+    relation: '0\t0\n',
+    remote: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+  },
+  '/repo/ahead': {
+    head: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+    tracking: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+    relation: '2\t0\n',
+    remote: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+  },
+  '/repo/behind': {
+    head: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+    tracking: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+    relation: '0\t3\n',
+    remote: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+  },
+  '/repo/diverged': {
+    head: 'cccccccccccccccccccccccccccccccccccccccc',
+    tracking: 'dddddddddddddddddddddddddddddddddddddddd',
+    relation: '1\t2\n',
+    remote: 'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee',
+  },
+};
+
+const repositoryAudit = await collectSystemAudit({
+  checkLatest: true,
+  home: '/fake/home',
+  config: isolatedConfig({
+    repositories: Object.keys(repositoryCases).map((repoPath) => ({
+      id: pathId(repoPath),
+      path: repoPath,
+      branch: 'main',
+    })),
+  }),
+  capabilitiesConfig: { version: 1, commands: [], probes: [] },
+  agentRuntime: { runtime: null, harnesses: [] },
+  bridgeStatus: { bridges: [] },
+  deps: isolatedAuditDeps(async (command, args) => {
+    if (command === 'mise' && args.join(' ') === 'ls --json') return result('{}');
+    if (command === 'npm' && args.join(' ') === 'ls -g --depth=0 --json') return result('{"dependencies":{}}');
+    if (command === 'apt' && args.join(' ') === 'list --upgradable') return result('Listing...\n');
+    if (command !== 'git' || args[0] !== '-C') throw new Error(`unexpected repository command: ${command} ${args.join(' ')}`);
+    const repo = repositoryCases[args[1]];
+    if (!repo) throw new Error(`unexpected repository path: ${args[1]}`);
+    const operation = args.slice(2);
+    if (operation.join(' ') === 'status --short --branch') return result('## main...origin/main\n');
+    if (operation.join(' ') === 'rev-parse HEAD') return result(`${repo.head}\n`);
+    if (operation.join(' ') === 'rev-parse refs/remotes/origin/main') return result(`${repo.tracking}\n`);
+    if (operation.join(' ') === 'rev-list --left-right --count HEAD...refs/remotes/origin/main') return result(repo.relation);
+    if (operation.join(' ') === 'ls-remote origin refs/heads/main') {
+      return result(`${repo.remote}\trefs/heads/main\n`);
+    }
+    throw new Error(`unexpected git operation: ${operation.join(' ')}`);
+  }),
+});
+
+function pathId(repoPath) {
+  return repoPath.slice('/repo/'.length);
+}
+
+const repositoriesById = new Map(repositoryAudit.repositories.map((repo) => [repo.id, repo]));
+assert.deepEqual(repositoriesById.get('sync').tracking, {
+  ref: 'refs/remotes/origin/main',
+  head: repositoryCases['/repo/sync'].tracking,
+  state: 'in_sync',
+  ahead: 0,
+  behind: 0,
+});
+assert.equal(repositoriesById.get('ahead').tracking.state, 'ahead');
+assert.equal(repositoriesById.get('ahead').tracking.ahead, 2);
+assert.equal(repositoriesById.get('ahead').tracking.behind, 0);
+assert.equal(repositoriesById.get('behind').tracking.state, 'behind');
+assert.equal(repositoriesById.get('behind').tracking.ahead, 0);
+assert.equal(repositoriesById.get('behind').tracking.behind, 3);
+assert.equal(repositoriesById.get('diverged').tracking.state, 'diverged');
+assert.equal(repositoriesById.get('diverged').tracking.ahead, 1);
+assert.equal(repositoriesById.get('diverged').tracking.behind, 2);
+assert.equal(repositoriesById.get('sync').remote.matchesHead, true);
+assert.equal(repositoriesById.get('ahead').remote.matchesHead, false);
+assert.equal(repositoriesById.get('ahead').remote.matchesTrackingHead, true);
+assert.equal(repositoriesById.get('diverged').remote.matchesTrackingHead, false);
+assert.equal(repositoriesById.get('diverged').remote.changedFromTracking, true);
+assert.equal(repositoryAudit.summary.repositoriesTrackingAhead, 1);
+assert.equal(repositoryAudit.summary.repositoriesTrackingBehind, 1);
+assert.equal(repositoryAudit.summary.repositoriesTrackingDiverged, 1);
+assert.equal(repositoryAudit.summary.repositoriesRemoteChanged, 1);
+assert.equal('repositoriesBehind' in repositoryAudit.summary, false);
+assert.equal(repositoryAudit.sourceErrors.length, 0);
+console.log('PASS system audit repository tracking/live-remote semantics');
+
+const projectAudit = await collectSystemAudit({
+  checkLatest: false,
+  home: '/fake/home',
+  config: isolatedConfig({
+    projects: [
+      { id: 'valid-nonzero', path: '/project/valid-nonzero', packageManager: 'pnpm' },
+      { id: 'invalid-json', path: '/project/invalid-json', packageManager: 'pnpm' },
+      { id: 'empty-success', path: '/project/empty-success', packageManager: 'pnpm' },
+      { id: 'empty-fail', path: '/project/empty-fail', packageManager: 'pnpm' },
+    ],
+  }),
+  capabilitiesConfig: { version: 1, commands: [], probes: [] },
+  agentRuntime: { runtime: null, harnesses: [] },
+  bridgeStatus: { bridges: [] },
+  deps: isolatedAuditDeps(async (command, args, options = {}) => {
+    if (command === 'mise' && args.join(' ') === 'ls --json') return result('{}');
+    if (command === 'npm' && args.join(' ') === 'ls -g --depth=0 --json') return result('{"dependencies":{}}');
+    if (command === 'apt' && args.join(' ') === 'list --upgradable') return result('Listing...\n');
+    if (command === 'pnpm' && args.join(' ') === 'outdated --format json') {
+      if (options.cwd === '/project/valid-nonzero') {
+        return result('{"zod":{"current":"4.4.3","latest":"4.6.2"}}\n', { ok: false, code: 1 });
+      }
+      if (options.cwd === '/project/invalid-json') return result('not-json\n', { ok: false, code: 1, stderr: 'failed' });
+      if (options.cwd === '/project/empty-success') return result('');
+      if (options.cwd === '/project/empty-fail') return result('', { ok: false, code: 1, stderr: 'invalid package.json' });
+    }
+    throw new Error(`unexpected project command: ${command} ${args.join(' ')} cwd=${options.cwd ?? ''}`);
+  }),
+});
+
+const projectsById = new Map(projectAudit.projectDependencies.map((project) => [project.id, project]));
+assert.equal(projectsById.get('valid-nonzero').outdated.length, 1, 'parseable nonzero pnpm outdated result was discarded');
+assert.equal(projectsById.get('valid-nonzero').outdated[0].name, 'zod');
+assert.deepEqual(projectsById.get('empty-success').outdated, []);
+assert.match(projectsById.get('invalid-json').error, /invalid pnpm outdated JSON/);
+assert.match(projectsById.get('empty-fail').error, /invalid package\.json/);
+assert.equal(projectAudit.summary.projectDependencyUpdates, 1);
+assert.ok(projectAudit.sourceErrors.some((entry) => entry.source === 'project:invalid-json'));
+assert.ok(projectAudit.sourceErrors.some((entry) => entry.source === 'project:empty-fail'));
+assert.equal(projectAudit.sourceErrors.some((entry) => entry.source === 'project:valid-nonzero'), false);
+assert.equal(projectAudit.sourceErrors.some((entry) => entry.source === 'project:empty-success'), false);
+console.log('PASS system audit pnpm outdated result semantics');

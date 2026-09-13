@@ -1,5 +1,3 @@
-import fs from 'node:fs/promises';
-
 import {
   Client,
   StreamableHTTPClientTransport,
@@ -10,18 +8,19 @@ import {
 } from '@modelcontextprotocol/client/stdio';
 import { fromJsonSchema } from '@modelcontextprotocol/server';
 
-const DEFAULT_CONFIG_PATH = '/opt/agent-mcp/config/bridges.json';
+import { resolveConfigPath } from './config-path.js';
+import { BridgeConfigError, loadBridgeConfig } from './mcp-bridge-config.js';
 const EMPTY_OBJECT_SCHEMA = {
   type: 'object',
   properties: {},
   additionalProperties: false,
 };
 
-function assertString(value, label) {
-  if (typeof value !== 'string' || value.length === 0) {
-    throw new Error(`${label} must be a non-empty string.`);
-  }
-  return value;
+function bridgeErrorDetails(error) {
+  return {
+    code: error?.code ?? error?.cause?.code ?? null,
+    message: error?.message ?? String(error),
+  };
 }
 
 function patternToRegExp(pattern) {
@@ -44,7 +43,7 @@ function shouldExposeTool(toolName, bridge) {
 function exportedToolName(toolName, bridge) {
   const renamed = bridge.renameTools?.[toolName];
   if (renamed !== undefined) {
-    return assertString(renamed, `bridge ${bridge.id} renameTools.${toolName}`);
+    return renamed;
   }
 
   const prefix = bridge.toolPrefix ?? `${bridge.id}_`;
@@ -66,7 +65,7 @@ function resolvedChildEnvironment(transport) {
   for (const [targetName, sourceName] of Object.entries(transport.envFrom ?? {})) {
     const value = process.env[sourceName];
     if (value === undefined) {
-      throw new Error(
+      throw new BridgeConfigError(
         `Missing environment variable ${sourceName} required for child env ${targetName}.`,
       );
     }
@@ -81,7 +80,7 @@ function resolvedHttpHeaders(transport) {
   for (const [headerName, envName] of Object.entries(transport.headersFromEnv ?? {})) {
     const value = process.env[envName];
     if (value === undefined) {
-      throw new Error(
+      throw new BridgeConfigError(
         `Missing environment variable ${envName} required for HTTP header ${headerName}.`,
       );
     }
@@ -92,13 +91,9 @@ function resolvedHttpHeaders(transport) {
 
 function createTransport(bridge) {
   const transport = bridge.transport;
-  if (!transport || typeof transport !== 'object') {
-    throw new Error(`Bridge ${bridge.id} is missing transport configuration.`);
-  }
-
   if (transport.type === 'stdio') {
     return new StdioClientTransport({
-      command: assertString(transport.command, `bridge ${bridge.id} transport.command`),
+      command: transport.command,
       args: transport.args ?? [],
       cwd: transport.cwd,
       env: resolvedChildEnvironment(transport),
@@ -125,7 +120,7 @@ function createTransport(bridge) {
       : undefined;
 
     return new StreamableHTTPClientTransport(
-      new URL(assertString(transport.url, `bridge ${bridge.id} transport.url`)),
+      new URL(transport.url),
       {
         ...(Object.keys(headers).length > 0
           ? { requestInit: { headers } }
@@ -135,7 +130,7 @@ function createTransport(bridge) {
     );
   }
 
-  throw new Error(
+  throw new BridgeConfigError(
     `Unsupported transport type ${JSON.stringify(transport.type)} for bridge ${bridge.id}.`,
   );
 }
@@ -153,21 +148,6 @@ async function listAllTools(client) {
   return tools;
 }
 
-async function loadBridgeConfig(configPath) {
-  const raw = JSON.parse(await fs.readFile(configPath, 'utf8'));
-  if (raw.version !== 1 || !Array.isArray(raw.bridges)) {
-    throw new Error(`Unsupported MCP bridge config in ${configPath}. Expected version 1.`);
-  }
-
-  const ids = new Set();
-  for (const bridge of raw.bridges) {
-    const id = assertString(bridge.id, 'bridge.id');
-    if (ids.has(id)) throw new Error(`Duplicate MCP bridge id: ${id}`);
-    ids.add(id);
-  }
-
-  return raw.bridges;
-}
 
 export class McpBridgeManager {
   #server;
@@ -175,32 +155,177 @@ export class McpBridgeManager {
   #configPath;
   #adapterFactory;
   #policyFactory;
+  #bridgeValidator;
   #connections = [];
   #status = [];
 
-  constructor({ server, reservedToolNames, configPath, adapterFactory, policyFactory }) {
+  constructor({ server, reservedToolNames, configPath, adapterFactory, policyFactory, bridgeValidator }) {
     this.#server = server;
     this.#reservedToolNames = reservedToolNames;
-    this.#configPath = configPath ?? process.env.MCP_BRIDGES_CONFIG ?? DEFAULT_CONFIG_PATH;
+    this.#configPath = configPath ?? null;
     this.#adapterFactory = adapterFactory;
     this.#policyFactory = policyFactory;
+    this.#bridgeValidator = bridgeValidator;
   }
 
   async initialize() {
+    this.#configPath = await resolveConfigPath({
+      filename: 'bridges.json',
+      envName: 'MCP_BRIDGES_CONFIG',
+      explicitPath: this.#configPath,
+    });
     const bridges = await loadBridgeConfig(this.#configPath);
-
     for (const bridge of bridges) {
-      if (bridge.enabled === false) {
-        this.#status.push({ id: bridge.id, enabled: false, state: 'disabled', tools: [] });
-        continue;
+      try {
+        this.#bridgeValidator?.(bridge);
+      } catch (error) {
+        throw new BridgeConfigError(`Invalid extension configuration for bridge ${bridge.id}: ${error.message}`, {
+          cause: error,
+        });
       }
+    }
 
-      await this.#connectBridge(bridge);
+    try {
+      for (const bridge of bridges) {
+        if (bridge.enabled === false) {
+          this.#status.push({ id: bridge.id, enabled: false, state: 'disabled', tools: [] });
+          continue;
+        }
+
+        await this.#connectBridge(bridge);
+      }
+    } catch (error) {
+      await this.close();
+      throw error;
     }
   }
 
+  #stageTool(bridge, tool, stagedNames) {
+    const exportedName = exportedToolName(tool.name, bridge);
+    if (stagedNames.has(exportedName)) {
+      throw new BridgeConfigError(
+        `MCP tool name collision: ${exportedName} from bridge ${bridge.id}. ` +
+          'Set toolPrefix or renameTools in the bridge config.',
+      );
+    }
+    stagedNames.add(exportedName);
+
+    let baseConfig;
+    try {
+      baseConfig = {
+        ...(tool.title !== undefined ? { title: tool.title } : {}),
+        ...(tool.description !== undefined ? { description: tool.description } : {}),
+        inputSchema: fromJsonSchema(tool.inputSchema ?? EMPTY_OBJECT_SCHEMA),
+        ...(tool.outputSchema !== undefined
+          ? { outputSchema: fromJsonSchema(tool.outputSchema) }
+          : {}),
+        ...(tool.annotations !== undefined ? { annotations: tool.annotations } : {}),
+        ...(tool.icons !== undefined ? { icons: tool.icons } : {}),
+        ...(tool._meta !== undefined ? { _meta: tool._meta } : {}),
+      };
+    } catch (error) {
+      // The upstream connected but supplied a tool definition we cannot expose.
+      // Treat this integration as unavailable rather than blaming local config.
+      const unavailable = new Error(
+        `Unsupported tool schema from bridge ${bridge.id}.${tool.name}: ${error.message}`,
+        { cause: error },
+      );
+      unavailable.bridgeUnavailable = true;
+      throw unavailable;
+    }
+
+    let adapter;
+    let policies;
+    let config;
+    try {
+      adapter = this.#adapterFactory?.({ bridge, tool, exportedName }) ?? null;
+      policies = this.#policyFactory?.({ bridge, tool, exportedName }) ?? [];
+      if (!Array.isArray(policies)) {
+        throw new Error(`Call policy factory for bridge ${bridge.id} must return an array.`);
+      }
+      config = adapter?.configureTool ? adapter.configureTool(baseConfig) : baseConfig;
+    } catch (error) {
+      throw new BridgeConfigError(
+        `Invalid adapter/policy configuration for ${bridge.id}.${tool.name}: ${error.message}`,
+        { cause: error },
+      );
+    }
+
+    return { tool, exportedName, config, adapter, policies };
+  }
+
+  #registerStagedTool(bridge, client, staged) {
+    const { tool, exportedName, config, adapter, policies } = staged;
+    return this.#server.registerTool(exportedName, config, async (args, ctx) => {
+      for (const policy of policies) {
+        if (policy?.beforeCall) {
+          await policy.beforeCall({ args: args ?? {}, ctx, tool, bridge });
+        }
+      }
+
+      let adapterState;
+      if (adapter?.beforeCall) {
+        try {
+          adapterState = await adapter.beforeCall({ args: args ?? {}, ctx });
+        } catch (error) {
+          console.error(
+            `[mcp-bridge] ${bridge.id}.${tool.name}: adapter beforeCall failed: ${error.message}`,
+          );
+        }
+      }
+
+      const result = await client.callTool(
+        {
+          name: tool.name,
+          arguments: args ?? {},
+        },
+        {
+          signal: ctx.mcpReq.signal,
+          toolDefinition: tool,
+        },
+      );
+
+      if (!adapter?.afterCall) return result;
+      try {
+        return await adapter.afterCall({
+          args: args ?? {},
+          ctx,
+          result,
+          state: adapterState,
+        });
+      } catch (error) {
+        console.error(
+          `[mcp-bridge] ${bridge.id}.${tool.name}: adapter afterCall failed: ${error.message}`,
+        );
+        return result;
+      }
+    });
+  }
+
+  async #markUnavailable(bridge, client, error) {
+    await client.close().catch(() => {});
+    this.#status.push({
+      id: bridge.id,
+      enabled: true,
+      state: 'unavailable',
+      transport: bridge.transport?.type ?? null,
+      tools: [],
+      error: bridgeErrorDetails(error),
+    });
+    console.error(`[mcp-bridge] ${bridge.id}: unavailable: ${error.message}`);
+  }
+
   async #connectBridge(bridge) {
-    const transport = createTransport(bridge);
+    let transport;
+    try {
+      transport = createTransport(bridge);
+    } catch (error) {
+      if (error instanceof BridgeConfigError) throw error;
+      throw new BridgeConfigError(`Invalid transport configuration for bridge ${bridge.id}: ${error.message}`, {
+        cause: error,
+      });
+    }
+
     const client = new Client({
       name: `agent-mcp-bridge-${bridge.id}`,
       version: '1.0.0',
@@ -208,107 +333,74 @@ export class McpBridgeManager {
 
     try {
       await client.connect(transport);
-      const allTools = await listAllTools(client);
-      const exposedTools = allTools.filter((tool) => shouldExposeTool(tool.name, bridge));
-      const mappings = [];
+    } catch (error) {
+      await this.#markUnavailable(bridge, client, error);
+      return;
+    }
 
-      for (const tool of exposedTools) {
-        const exportedName = exportedToolName(tool.name, bridge);
-        if (this.#reservedToolNames.has(exportedName)) {
-          throw new Error(
-            `MCP tool name collision: ${exportedName} from bridge ${bridge.id}. ` +
-              'Set toolPrefix or renameTools in the bridge config.',
-          );
-        }
-        this.#reservedToolNames.add(exportedName);
+    let allTools;
+    try {
+      allTools = await listAllTools(client);
+    } catch (error) {
+      await this.#markUnavailable(bridge, client, error);
+      return;
+    }
 
-        const baseConfig = {
-          ...(tool.title !== undefined ? { title: tool.title } : {}),
-          ...(tool.description !== undefined ? { description: tool.description } : {}),
-          inputSchema: fromJsonSchema(tool.inputSchema ?? EMPTY_OBJECT_SCHEMA),
-          ...(tool.outputSchema !== undefined
-            ? { outputSchema: fromJsonSchema(tool.outputSchema) }
-            : {}),
-          ...(tool.annotations !== undefined ? { annotations: tool.annotations } : {}),
-          ...(tool.icons !== undefined ? { icons: tool.icons } : {}),
-          ...(tool._meta !== undefined ? { _meta: tool._meta } : {}),
-        };
-        const adapter = this.#adapterFactory?.({ bridge, tool, exportedName }) ?? null;
-        const policies = this.#policyFactory?.({ bridge, tool, exportedName }) ?? [];
-        if (!Array.isArray(policies)) {
-          throw new Error(`Call policy factory for bridge ${bridge.id} must return an array.`);
-        }
-        const config = adapter?.configureTool
-          ? adapter.configureTool(baseConfig)
-          : baseConfig;
-
-        this.#server.registerTool(exportedName, config, async (args, ctx) => {
-          for (const policy of policies) {
-            if (policy?.beforeCall) {
-              await policy.beforeCall({ args: args ?? {}, ctx, tool, bridge });
-            }
-          }
-
-          let adapterState;
-          if (adapter?.beforeCall) {
-            try {
-              adapterState = await adapter.beforeCall({ args: args ?? {}, ctx });
-            } catch (error) {
-              console.error(
-                `[mcp-bridge] ${bridge.id}.${tool.name}: adapter beforeCall failed: ${error.message}`,
-              );
-            }
-          }
-
-          const result = await client.callTool(
-            {
-              name: tool.name,
-              arguments: args ?? {},
-            },
-            {
-              signal: ctx.mcpReq.signal,
-              toolDefinition: tool,
-            },
-          );
-
-          if (!adapter?.afterCall) return result;
-          try {
-            return await adapter.afterCall({
-              args: args ?? {},
-              ctx,
-              result,
-              state: adapterState,
-            });
-          } catch (error) {
-            console.error(
-              `[mcp-bridge] ${bridge.id}.${tool.name}: adapter afterCall failed: ${error.message}`,
-            );
-            return result;
-          }
-        });
-
-        mappings.push({ upstream: tool.name, exported: exportedName });
-      }
-
-      this.#connections.push({ id: bridge.id, client, transport });
-      this.#status.push({
-        id: bridge.id,
-        enabled: true,
-        state: 'connected',
-        transport: bridge.transport.type,
-        server: client.getServerVersion() ?? null,
-        tools: mappings,
-      });
-
-      console.error(
-        `[mcp-bridge] ${bridge.id}: connected, forwarding ${mappings.length}/${allTools.length} tools`,
-      );
+    const exposedTools = allTools.filter((tool) => shouldExposeTool(tool.name, bridge));
+    const stagedNames = new Set(this.#reservedToolNames);
+    let stagedTools;
+    try {
+      stagedTools = exposedTools.map((tool) => this.#stageTool(bridge, tool, stagedNames));
     } catch (error) {
       await client.close().catch(() => {});
-      throw new Error(`Failed to initialize MCP bridge ${bridge.id}: ${error.message}`, {
-        cause: error,
-      });
+      if (error?.bridgeUnavailable) {
+        this.#status.push({
+          id: bridge.id,
+          enabled: true,
+          state: 'unavailable',
+          transport: bridge.transport.type,
+          tools: [],
+          error: bridgeErrorDetails(error),
+        });
+        return;
+      }
+      if (error instanceof BridgeConfigError) throw error;
+      throw new BridgeConfigError(`Invalid bridge configuration for ${bridge.id}: ${error.message}`, { cause: error });
     }
+
+    const registrations = [];
+    try {
+      for (const staged of stagedTools) {
+        const handle = this.#registerStagedTool(bridge, client, staged);
+        registrations.push({ name: staged.exportedName, handle });
+      }
+    } catch (error) {
+      for (const { handle } of registrations.reverse()) {
+        try {
+          handle.remove();
+        } catch {
+          // Best-effort rollback; startup will fail below.
+        }
+      }
+      await client.close().catch(() => {});
+      throw new BridgeConfigError(`Failed to register tools for bridge ${bridge.id}: ${error.message}`, { cause: error });
+    }
+
+    for (const { name } of registrations) this.#reservedToolNames.add(name);
+    const mappings = stagedTools.map(({ tool, exportedName }) => ({ upstream: tool.name, exported: exportedName }));
+    this.#connections.push({ id: bridge.id, client, transport, registrations });
+    this.#status.push({
+      id: bridge.id,
+      enabled: true,
+      state: 'connected',
+      transport: bridge.transport.type,
+      server: client.getServerVersion() ?? null,
+      tools: mappings,
+    });
+
+    console.error(
+      `[mcp-bridge] ${bridge.id}: connected, forwarding ${mappings.length}/${allTools.length} tools`,
+    );
   }
 
   status() {
@@ -320,6 +412,16 @@ export class McpBridgeManager {
 
   async close() {
     const connections = this.#connections.splice(0);
+    for (const connection of connections) {
+      for (const { name, handle } of [...(connection.registrations ?? [])].reverse()) {
+        try {
+          handle.remove();
+        } catch {
+          // Continue closing the rest of the manager even if a registration was already removed.
+        }
+        this.#reservedToolNames.delete(name);
+      }
+    }
     await Promise.allSettled(connections.map(({ client }) => client.close()));
   }
 }

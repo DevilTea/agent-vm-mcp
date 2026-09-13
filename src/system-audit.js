@@ -3,8 +3,7 @@ import { constants as fsConstants } from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 
-const DEFAULT_CONFIG_PATH = '/opt/agent-mcp/config/system-audit.json';
-const DEFAULT_CAPABILITIES_PATH = '/opt/agent-mcp/config/capabilities.json';
+import { resolveConfigPath } from './config-path.js';
 const COMMAND_TIMEOUT_MS = 8_000;
 const LATEST_LOOKUP_TIMEOUT_MS = 15_000;
 const COMMAND_OUTPUT_LIMIT = 512 * 1024;
@@ -558,12 +557,26 @@ async function inspectServices(config, deps, sourceErrors) {
   });
 }
 
+function trackingRelation(stdout) {
+  const line = firstNonEmptyLine(stdout);
+  const match = line?.match(/^(\d+)\s+(\d+)$/);
+  if (!match) throw new Error(`unexpected git rev-list --left-right --count output: ${line ?? '<empty>'}`);
+  const ahead = Number(match[1]);
+  const behind = Number(match[2]);
+  let state = 'in_sync';
+  if (ahead > 0 && behind > 0) state = 'diverged';
+  else if (ahead > 0) state = 'ahead';
+  else if (behind > 0) state = 'behind';
+  return { state, ahead, behind };
+}
+
 async function inspectRepositories(config, deps, sourceErrors, checkLatest) {
   return await mapLimit(config.repositories ?? [], LOOKUP_CONCURRENCY, async (repo) => {
+    const trackingRef = `refs/remotes/origin/${repo.branch}`;
     const [statusResult, headResult, trackingResult] = await Promise.all([
       deps.runCommand('git', ['-C', repo.path, 'status', '--short', '--branch']),
       deps.runCommand('git', ['-C', repo.path, 'rev-parse', 'HEAD']),
-      deps.runCommand('git', ['-C', repo.path, 'rev-parse', `refs/remotes/origin/${repo.branch}`]),
+      deps.runCommand('git', ['-C', repo.path, 'rev-parse', trackingRef]),
     ]);
     const errors = [statusResult, headResult].filter((result) => !result.ok);
     if (errors.length > 0) {
@@ -572,18 +585,58 @@ async function inspectRepositories(config, deps, sourceErrors, checkLatest) {
       return { id: repo.id, path: repo.path, healthy: null, error };
     }
 
-    let remoteHead = trackingResult.ok ? firstNonEmptyLine(trackingResult.stdout) : null;
-    let remoteChecked = false;
+    const head = firstNonEmptyLine(headResult.stdout);
+    const trackingHead = trackingResult.ok ? firstNonEmptyLine(trackingResult.stdout) : null;
+    let tracking = {
+      ref: trackingRef,
+      head: trackingHead,
+      state: null,
+      ahead: null,
+      behind: null,
+    };
+    if (trackingHead) {
+      const relationResult = await deps.runCommand('git', [
+        '-C', repo.path, 'rev-list', '--left-right', '--count', `HEAD...${trackingRef}`,
+      ]);
+      if (relationResult.ok) {
+        try {
+          tracking = { ...tracking, ...trackingRelation(relationResult.stdout) };
+        } catch (error) {
+          sourceErrors.push({ source: `repo-tracking:${repo.id}`, error: error.message });
+        }
+      } else {
+        sourceErrors.push({
+          source: `repo-tracking:${repo.id}`,
+          error: (relationResult.error ?? relationResult.stderr.trim()) || `exit ${relationResult.code}`,
+        });
+      }
+    }
+
+    let remote = {
+      checked: false,
+      head: null,
+      matchesHead: null,
+      matchesTrackingHead: null,
+      changedFromTracking: null,
+    };
     if (checkLatest) {
       const remoteResult = await deps.runCommand('git', ['-C', repo.path, 'ls-remote', 'origin', `refs/heads/${repo.branch}`]);
       if (remoteResult.ok) {
-        remoteHead = firstNonEmptyLine(remoteResult.stdout)?.split(/\s+/)[0] ?? remoteHead;
-        remoteChecked = true;
+        const remoteHead = firstNonEmptyLine(remoteResult.stdout)?.split(/\s+/)[0] ?? null;
+        remote = {
+          checked: true,
+          head: remoteHead,
+          matchesHead: remoteHead && head ? remoteHead === head : null,
+          matchesTrackingHead: remoteHead && trackingHead ? remoteHead === trackingHead : null,
+          changedFromTracking: remoteHead && trackingHead ? remoteHead !== trackingHead : null,
+        };
       } else {
-        sourceErrors.push({ source: `repo-remote:${repo.id}`, error: (remoteResult.error ?? remoteResult.stderr.trim()) || `exit ${remoteResult.code}` });
+        const error = (remoteResult.error ?? remoteResult.stderr.trim()) || `exit ${remoteResult.code}`;
+        sourceErrors.push({ source: `repo-remote:${repo.id}`, error });
+        remote = { ...remote, checked: true, error };
       }
     }
-    const head = firstNonEmptyLine(headResult.stdout);
+
     const statusLines = statusResult.stdout.split(/\r?\n/).filter(Boolean);
     const dirty = statusLines.slice(1).length > 0;
     return {
@@ -591,10 +644,9 @@ async function inspectRepositories(config, deps, sourceErrors, checkLatest) {
       path: repo.path,
       branch: repo.branch,
       head,
-      remoteHead,
-      remoteChecked,
+      tracking,
+      remote,
       dirty,
-      behindRemote: remoteHead ? head !== remoteHead : null,
       status: statusLines[0] ?? null,
     };
   });
@@ -615,16 +667,31 @@ async function inspectProjects(config, deps, sourceErrors) {
       return { id: project.id, path: project.path, outdated: [], error };
     }
     const result = await deps.runCommand('pnpm', ['outdated', '--format', 'json'], { cwd: project.path });
-    const parsed = safeJsonParse(result.stdout);
-    if (parsed === null && result.stdout.trim()) {
-      sourceErrors.push({ source: `project:${project.id}`, error: 'invalid pnpm outdated JSON output' });
-      return { id: project.id, path: project.path, outdated: [], error: 'invalid JSON output' };
+    const stdout = result.stdout.trim();
+    if (stdout) {
+      const parsed = safeJsonParse(result.stdout);
+      if (parsed === null) {
+        const error = 'invalid pnpm outdated JSON output';
+        sourceErrors.push({ source: `project:${project.id}`, error });
+        return { id: project.id, path: project.path, packageManager: project.packageManager, outdated: [], error };
+      }
+      return {
+        id: project.id,
+        path: project.path,
+        packageManager: project.packageManager,
+        outdated: normalizeOutdatedPayload(parsed),
+      };
+    }
+    if (!result.ok) {
+      const error = (result.error ?? result.stderr.trim()) || `pnpm outdated failed with exit ${result.code}`;
+      sourceErrors.push({ source: `project:${project.id}`, error });
+      return { id: project.id, path: project.path, packageManager: project.packageManager, outdated: [], error };
     }
     return {
       id: project.id,
       path: project.path,
       packageManager: project.packageManager,
-      outdated: normalizeOutdatedPayload(parsed),
+      outdated: [],
     };
   });
 }
@@ -686,10 +753,20 @@ export async function collectSystemAudit(options = {}) {
   signal?.throwIfAborted();
   const checkLatest = options.checkLatest !== false;
   const home = options.home ?? process.env.HOME ?? '';
-  const configPath = options.configPath ?? process.env.AGENT_MCP_SYSTEM_AUDIT_CONFIG ?? DEFAULT_CONFIG_PATH;
+  const configPath = await resolveConfigPath({
+    filename: 'system-audit.json',
+    envName: 'AGENT_MCP_SYSTEM_AUDIT_CONFIG',
+    explicitPath: options.configPath,
+  });
   const config = validateConfig(options.config ?? await loadJsonFile(configPath, deps));
   const capabilitiesPath = expandHome(
-    options.capabilitiesPath ?? config.capabilitiesPath ?? process.env.AGENT_MCP_CAPABILITIES_CONFIG ?? DEFAULT_CAPABILITIES_PATH,
+    await resolveConfigPath({
+      filename: 'capabilities.json',
+      explicitPath:
+        options.capabilitiesPath ??
+        process.env.AGENT_MCP_CAPABILITIES_CONFIG ??
+        config.capabilitiesPath,
+    }),
     home,
   );
   const capabilitiesConfig = options.capabilitiesConfig ?? await loadJsonFile(capabilitiesPath, deps);
@@ -760,7 +837,10 @@ export async function collectSystemAudit(options = {}) {
       projectDependencyUpdates: projectDependencies.reduce((sum, project) => sum + project.outdated.length, 0),
       unhealthyServices: services.filter((service) => service.healthy === false).length,
       dirtyRepositories: repositories.filter((repo) => repo.dirty === true).length,
-      repositoriesBehind: repositories.filter((repo) => repo.behindRemote === true).length,
+      repositoriesTrackingAhead: repositories.filter((repo) => repo.tracking?.state === 'ahead').length,
+      repositoriesTrackingBehind: repositories.filter((repo) => repo.tracking?.state === 'behind').length,
+      repositoriesTrackingDiverged: repositories.filter((repo) => repo.tracking?.state === 'diverged').length,
+      repositoriesRemoteChanged: repositories.filter((repo) => repo.remote?.changedFromTracking === true).length,
       sourceErrors: sourceErrors.length,
     },
     updates,

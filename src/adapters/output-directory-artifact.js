@@ -2,7 +2,6 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 
 import { ARTIFACT_RESULT_META_KEY } from '../artifacts/constants.js';
-import { withArtifactViewerMeta } from '../artifacts/tool-meta.js';
 
 async function statFile(filePath) {
   try {
@@ -76,29 +75,43 @@ function configuredMimeType(args, config) {
   return typeof value === 'string' ? config.mimeTypeMap[value] : undefined;
 }
 
-export function createOutputDirectoryArtifactAdapter({ artifactStore, config, bridgeId, toolName }) {
+export function validateOutputDirectoryArtifactConfig(config, bridgeId, toolName) {
   if (!config.outputDir || typeof config.outputDir !== 'string') {
     throw new Error(`Adapter for ${bridgeId}.${toolName} requires outputDir.`);
   }
   const extensions = config.extensions ?? ['.png', '.jpg', '.jpeg', '.webp'];
-  if (!Array.isArray(extensions) || extensions.length === 0 || extensions.some((value) => typeof value !== 'string')) {
+  if (
+    !Array.isArray(extensions) ||
+    extensions.length === 0 ||
+    extensions.some((value) => typeof value !== 'string' || value.length === 0)
+  ) {
     throw new Error(`Adapter for ${bridgeId}.${toolName} requires a non-empty extensions array.`);
   }
-  if (config.pathArgument !== undefined && typeof config.pathArgument !== 'string') {
-    throw new Error(`Adapter pathArgument for ${bridgeId}.${toolName} must be a string.`);
+  for (const key of ['pathArgument', 'workingDir', 'mimeTypeArgument']) {
+    if (config[key] !== undefined && (typeof config[key] !== 'string' || config[key].length === 0)) {
+      throw new Error(`Adapter ${key} for ${bridgeId}.${toolName} must be a non-empty string.`);
+    }
   }
-  if (config.workingDir !== undefined && typeof config.workingDir !== 'string') {
-    throw new Error(`Adapter workingDir for ${bridgeId}.${toolName} must be a string.`);
+  if (config.mimeTypeMap !== undefined) {
+    if (!config.mimeTypeMap || typeof config.mimeTypeMap !== 'object' || Array.isArray(config.mimeTypeMap)) {
+      throw new Error(`Adapter mimeTypeMap for ${bridgeId}.${toolName} must be an object.`);
+    }
+    for (const [key, value] of Object.entries(config.mimeTypeMap)) {
+      if (!key || typeof value !== 'string' || value.length === 0) {
+        throw new Error(`Adapter mimeTypeMap for ${bridgeId}.${toolName} must contain non-empty string values.`);
+      }
+    }
   }
+  if ((config.mimeTypeArgument === undefined) !== (config.mimeTypeMap === undefined)) {
+    throw new Error(`Adapter for ${bridgeId}.${toolName} requires mimeTypeArgument and mimeTypeMap together.`);
+  }
+  return { extensions };
+}
+
+export function createOutputDirectoryArtifactAdapter({ artifactStore, config, bridgeId, toolName }) {
+  const { extensions } = validateOutputDirectoryArtifactConfig(config, bridgeId, toolName);
 
   return {
-    configureTool(toolConfig) {
-      return {
-        ...toolConfig,
-        _meta: withArtifactViewerMeta(toolConfig._meta),
-      };
-    },
-
     async beforeCall({ args }) {
       const explicitPath = explicitOutputPath(args, config);
       return {
@@ -152,7 +165,7 @@ export function createOutputDirectoryArtifactAdapter({ artifactStore, config, br
       }
 
       console.error(
-        `[artifact-viewer] adapted ${bridgeId}.${toolName} content=[${content.map((item) => item.type).join(',')}]`,
+        `[artifact] adapted ${bridgeId}.${toolName} content=[${content.map((item) => item.type).join(',')}]`,
       );
 
       return {

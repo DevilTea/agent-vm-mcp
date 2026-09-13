@@ -391,7 +391,13 @@ try {
     wait: true,
     timeoutMs: 10_000,
   });
-  if (notReady.accepted !== false || notReady.submission?.state !== 'not_submitted' || notReady.error?.code !== 'agent_not_ready') {
+  if (
+    notReady.accepted !== false ||
+    notReady.submission?.state !== 'not_submitted' ||
+    notReady.submission?.retrySafe !== true ||
+    notReady.error?.code !== 'agent_not_ready' ||
+    notReady.error?.retryable !== true
+  ) {
     throw new Error('interactive_ready=false was not positively gated');
   }
   state = JSON.parse(await fs.readFile(statePath, 'utf8'));
@@ -433,7 +439,12 @@ try {
     wait: true,
     timeoutMs: 10_000,
   });
-  if (ambiguous.accepted !== null || ambiguous.submission?.state !== 'possibly_submitted' || ambiguous.submission?.retrySafe !== false) {
+  if (
+    ambiguous.accepted !== null ||
+    ambiguous.submission?.state !== 'possibly_submitted' ||
+    ambiguous.submission?.retrySafe !== false ||
+    ambiguous.error?.retryable !== false
+  ) {
     throw new Error('Post-invocation prompt failure was not reported as possibly submitted');
   }
   if (!ambiguous.transcript.includes('AMBIGUOUS_SUBMISSION')) throw new Error('Ambiguous submission diagnostics lost transcript evidence');
@@ -727,6 +738,8 @@ try {
   if (
     serializedSecond.accepted !== false ||
     serializedSecond.submission?.state !== 'not_submitted' ||
+    serializedSecond.submission?.retrySafe !== true ||
+    serializedSecond.error?.retryable !== true ||
     serializedSecond.error?.cause?.code !== 'agent_prompt_in_flight'
   ) {
     throw new Error('Concurrent prompt was not rejected by per-agent serialization');
@@ -742,17 +755,26 @@ try {
   state.agents[codex.agent.agentId].transcript = 'READY';
   await fs.writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, 'utf8');
 
-  try {
-    await agentPrompt({
-      agentId: codex.agent.agentId,
-      task: 'Should fail.',
-      skills: ['missing-skill'],
-      wait: true,
-      timeoutMs: 10_000,
-    });
-    throw new Error('Missing skill unexpectedly succeeded');
-  } catch (error) {
-    if (!String(error.message).includes('not installed')) throw error;
+  const missingSkill = await agentPrompt({
+    agentId: codex.agent.agentId,
+    task: 'MUST_NOT_SUBMIT_MISSING_SKILL',
+    skills: ['missing-skill'],
+    wait: true,
+    timeoutMs: 10_000,
+  });
+  if (
+    missingSkill.accepted !== false ||
+    missingSkill.submission?.state !== 'not_submitted' ||
+    missingSkill.submission?.retrySafe !== true ||
+    missingSkill.error?.code !== 'agent_prompt_not_submitted' ||
+    missingSkill.error?.retryable !== false ||
+    missingSkill.error?.cause?.code !== 'skill_not_installed'
+  ) {
+    throw new Error('Missing skill did not return structured non-retryable preflight with duplicate-safe submission state');
+  }
+  state = JSON.parse(await fs.readFile(statePath, 'utf8'));
+  if (state.agents[codex.agent.agentId].transcript.includes('MUST_NOT_SUBMIT_MISSING_SKILL')) {
+    throw new Error('Missing-skill task reached agent transcript');
   }
 
   state = JSON.parse(await fs.readFile(statePath, 'utf8'));
@@ -764,7 +786,13 @@ try {
     wait: true,
     timeoutMs: 10_000,
   });
-  if (blocked.accepted || blocked.error?.code !== 'interaction_required') {
+  if (
+    blocked.accepted ||
+    blocked.submission?.state !== 'not_submitted' ||
+    blocked.submission?.retrySafe !== true ||
+    blocked.error?.code !== 'interaction_required' ||
+    blocked.error?.retryable !== false
+  ) {
     throw new Error('Trust interaction was not guarded');
   }
   if (blocked.agent.interaction?.kind !== 'workspace_trust') throw new Error('Trust interaction kind was not detected');
