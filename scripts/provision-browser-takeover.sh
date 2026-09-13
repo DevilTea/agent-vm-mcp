@@ -77,6 +77,9 @@ fi
 run_as_agent() {
   runuser -u "$agent_user" -- env \
     HOME="$agent_home" \
+    USER="$agent_user" \
+    LOGNAME="$agent_user" \
+    XDG_CONFIG_HOME="$agent_home/.config" \
     PATH="$mise_shims:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
     "$@"
 }

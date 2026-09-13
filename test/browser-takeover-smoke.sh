@@ -101,6 +101,9 @@ require_literal "$provisioner" 'install-deps chromium'
 require_literal "$provisioner" 'install chromium'
 require_literal "$provisioner" 'playwright_manifest_source='
 require_literal "$provisioner" 'playwright_lock_source='
+require_literal "$provisioner" 'USER="$agent_user"'
+require_literal "$provisioner" 'LOGNAME="$agent_user"'
+require_literal "$provisioner" 'XDG_CONFIG_HOME="$agent_home/.config"'
 reject_literal "$provisioner" 'systemctl enable --now agent-playwright-shared.service'
 if grep -Eq '^[[:space:]]*tailscale[[:space:]]+(up|serve|ssh)([[:space:]]|$)' "$provisioner"; then
   echo "Provisioner must not enroll Tailscale, expose noVNC with tailscale serve, or enable Tailscale SSH." >&2
