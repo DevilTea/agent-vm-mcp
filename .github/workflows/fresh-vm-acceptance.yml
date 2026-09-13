@@ -1,0 +1,152 @@
+name: Fresh Ubuntu VM acceptance
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  accept:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Verify fresh Ubuntu runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          source /etc/os-release
+          test "$ID" = ubuntu
+          test "$VERSION_ID" = 26.04
+          uname -a
+          systemd --version | head -n 1
+          systemctl is-system-running || true
+
+      - name: Create dedicated agent deployment
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! id agent >/dev/null 2>&1; then
+            sudo useradd --create-home --shell /bin/bash agent
+          fi
+          sudo install -d -m 0755 -o agent -g agent /opt/agent-vm-mcp
+          sudo cp -a "$GITHUB_WORKSPACE/." /opt/agent-vm-mcp/
+          sudo chown -R agent:agent /opt/agent-vm-mcp
+
+      - name: Run documented Ubuntu provisioners
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd /opt/agent-vm-mcp
+          sudo ./scripts/provision-docker.sh
+          sudo ./scripts/provision-mise.sh
+          sudo ./scripts/provision-lsp.sh
+          sudo ./scripts/provision-browser-takeover.sh
+
+      - name: Install control-plane dependencies and machine-local bridge config
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo -u agent env \
+            HOME=/home/agent \
+            USER=agent \
+            LOGNAME=agent \
+            XDG_CONFIG_HOME=/home/agent/.config \
+            PATH=/home/agent/.local/share/mise/shims:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+            pnpm --dir /opt/agent-vm-mcp install --frozen-lockfile
+          sudo install -d -m 0755 -o agent -g agent /home/agent/.config/agent-vm-mcp
+          sudo install -m 0644 -o agent -g agent \
+            /opt/agent-vm-mcp/config/examples/bridges.playwright-lsp.json \
+            /home/agent/.config/agent-vm-mcp/bridges.json
+
+      - name: Start optional integration services
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo systemctl start agent-herdr.service
+          sudo systemctl start agent-playwright-shared.service
+          for unit in \
+            docker.service \
+            agent-herdr.service \
+            agent-browser-x.service \
+            agent-browser-vnc.service \
+            agent-browser-novnc.service \
+            agent-playwright-shared.service \
+            tailscaled.service; do
+            sudo systemctl is-active --quiet "$unit" || {
+              sudo systemctl status --no-pager "$unit" || true
+              exit 1
+            }
+          done
+
+      - name: Verify VM-level runtime behavior
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo -u agent docker run --rm hello-world
+          sudo -u agent docker compose version
+          sudo -u agent docker buildx version
+          test "$(stat -c '%U:%G' /home/agent/.config)" = 'agent:agent'
+          ss -ltnp | tee /tmp/listeners.txt
+          grep -Eq '127\.0\.0\.1:5900\b' /tmp/listeners.txt
+          grep -Eq '127\.0\.0\.1:6080\b' /tmp/listeners.txt
+          grep -Eq '127\.0\.0\.1:8931\b' /tmp/listeners.txt
+          ! grep -Eq '(0\.0\.0\.0|\[::\]):(5900|6080|8931)\b' /tmp/listeners.txt
+          curl --fail --silent --show-error http://127.0.0.1:6080/vnc.html >/dev/null
+
+      - name: Run portable and live acceptance suites
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo -u agent env \
+            HOME=/home/agent \
+            USER=agent \
+            LOGNAME=agent \
+            XDG_CONFIG_HOME=/home/agent/.config \
+            PATH=/home/agent/.local/share/mise/shims:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+            pnpm --dir /opt/agent-vm-mcp test
+          sudo -u agent env \
+            HOME=/home/agent \
+            USER=agent \
+            LOGNAME=agent \
+            XDG_CONFIG_HOME=/home/agent/.config \
+            PATH=/home/agent/.local/share/mise/shims:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+            pnpm --dir /opt/agent-vm-mcp smoke
+
+      - name: Audit production dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo -u agent env \
+            HOME=/home/agent \
+            PATH=/home/agent/.local/share/mise/shims:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+            pnpm --dir /opt/agent-vm-mcp audit --prod
+          sudo -u agent env \
+            HOME=/home/agent \
+            PATH=/home/agent/.local/share/mise/shims:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+            pnpm --dir /opt/playwright-mcp audit --prod
+
+      - name: Collect service diagnostics on failure
+        if: failure()
+        shell: bash
+        run: |
+          sudo systemctl --no-pager --full status \
+            docker.service \
+            agent-herdr.service \
+            agent-browser-x.service \
+            agent-browser-vnc.service \
+            agent-browser-novnc.service \
+            agent-playwright-shared.service \
+            tailscaled.service || true
+          sudo journalctl --no-pager -n 300 \
+            -u agent-herdr.service \
+            -u agent-browser-x.service \
+            -u agent-browser-vnc.service \
+            -u agent-browser-novnc.service \
+            -u agent-playwright-shared.service \
+            -u tailscaled.service || true
