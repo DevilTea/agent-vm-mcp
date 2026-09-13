@@ -24,7 +24,7 @@ jobs:
           test "$ID" = ubuntu
           test "$VERSION_ID" = 26.04
           uname -a
-          systemd --version | head -n 1
+          systemctl --version | head -n 1
           systemctl is-system-running || true
 
       - name: Create dedicated agent deployment
