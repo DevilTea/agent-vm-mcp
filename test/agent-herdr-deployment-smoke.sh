@@ -15,6 +15,9 @@ grep -Fq '/etc/systemd/system/agent-herdr.service' "$provision"
 ! grep -Fq '.config/tunnel-client' "$provision"
 grep -Fq 'systemctl daemon-reload' "$provision"
 grep -Fq 'systemctl enable agent-herdr.service' "$provision"
+grep -Fq 'baseline_arch=$(dpkg --print-architecture)' "$provision"
+grep -Fq "Architectures: {arch}" "$provision"
+grep -Fq 'apt-get update' "$provision"
 grep -Fq 'install -d -m 0755 -o "$agent_user" -g "$agent_group" "$agent_config_root"' "$provision"
 
 # Optional tunnel integration remains an example, not something the core provisioner installs.

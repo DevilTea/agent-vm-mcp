@@ -65,8 +65,77 @@ apt-get install -y --no-install-recommends software-properties-common ca-certifi
 
 if ! grep -RqsE '(^|/)jdxcode/mise' /etc/apt/sources.list /etc/apt/sources.list.d 2>/dev/null; then
   add-apt-repository -y ppa:jdxcode/mise
-  apt-get update
 fi
+
+# Ubuntu 26.04 can opt into architecture variants such as amd64v3. Third-party
+# repositories may not publish variant indexes, so pin the mise PPA to the
+# baseline dpkg architecture without disabling variants for Ubuntu's own repos.
+baseline_arch=$(dpkg --print-architecture)
+python3 - "$baseline_arch" <<'PY_ARCH'
+from pathlib import Path
+import re
+import sys
+
+arch = sys.argv[1]
+root = Path('/etc/apt/sources.list.d')
+uri = 'ppa.launchpadcontent.net/jdxcode/mise/ubuntu'
+
+for path in root.glob('*.sources'):
+    text = path.read_text()
+    if uri not in text:
+        continue
+    stanzas = re.split(r'(\n\s*\n)', text)
+    changed = False
+    for index in range(0, len(stanzas), 2):
+        stanza = stanzas[index]
+        if uri not in stanza:
+            continue
+        if re.search(r'^Architectures:', stanza, flags=re.MULTILINE):
+            stanza = re.sub(
+                r'^Architectures:.*$',
+                f'Architectures: {arch}',
+                stanza,
+                flags=re.MULTILINE,
+            )
+        else:
+            lines = stanza.splitlines()
+            insert_at = next(
+                (i + 1 for i, line in enumerate(lines) if line.startswith('Components:')),
+                len(lines),
+            )
+            lines.insert(insert_at, f'Architectures: {arch}')
+            stanza = '\n'.join(lines)
+        stanzas[index] = stanza
+        changed = True
+    if changed:
+        path.write_text(''.join(stanzas))
+
+for path in root.glob('*.list'):
+    lines = path.read_text().splitlines()
+    changed = False
+    for index, line in enumerate(lines):
+        if uri not in line or not line.lstrip().startswith('deb '):
+            continue
+        option_match = re.match(r'^(\s*deb\s+)\[([^]]*)\](.*)$', line)
+        if option_match:
+            options = option_match.group(2).split()
+            replaced = False
+            for option_index, option in enumerate(options):
+                if option.startswith('arch='):
+                    options[option_index] = f'arch={arch}'
+                    replaced = True
+            if not replaced:
+                options.append(f'arch={arch}')
+            line = f"{option_match.group(1)}[{' '.join(options)}]{option_match.group(3)}"
+        else:
+            line = re.sub(r'^(\s*deb)\s+', rf'\1 [arch={arch}] ', line, count=1)
+        lines[index] = line
+        changed = True
+    if changed:
+        path.write_text('\n'.join(lines) + '\n')
+PY_ARCH
+
+apt-get update
 apt-get install -y --no-install-recommends mise
 
 # The dedicated agent must own its XDG config root so tools such as Herdr and
