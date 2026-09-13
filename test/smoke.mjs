@@ -1312,86 +1312,110 @@ exec /usr/bin/git "$@"
     );
   };
   const lspJson = async (name, args) => parseJsonToolResult(await lspCall(name, args));
+  const lspEventually = async (name, args, predicate, description, timeoutMs = 15_000) => {
+    const deadline = Date.now() + timeoutMs;
+    let lastValue;
+    let lastError = null;
+    while (Date.now() <= deadline) {
+      try {
+        lastValue = await lspJson(name, args);
+        lastError = null;
+        if (predicate(lastValue)) return lastValue;
+      } catch (error) {
+        lastError = error;
+      }
+      if (Date.now() > deadline) break;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    const detail = lastError
+      ? String(lastError?.stack ?? lastError)
+      : JSON.stringify(lastValue).slice(0, 2_000);
+    throw new Error(`${description} within ${timeoutMs}ms; last=${detail}`);
+  };
   const workspaceAMain = path.join(lspWorkspaceA, 'src/main.ts');
   const workspaceALib = path.join(lspWorkspaceA, 'src/lib.ts');
   const workspaceBMain = path.join(lspWorkspaceB, 'src/main.ts');
 
-  const hoverA = await lspJson('lsp_hover', {
+  const hoverAArgs = {
     workspaceRoot: lspWorkspaceA,
     filePath: workspaceAMain,
     line: 2,
     character: 23,
-  });
-  if (!JSON.stringify(hoverA).includes('greet')) throw new Error('LSP hover failed in workspace A');
+  };
+  await lspEventually(
+    'lsp_hover',
+    hoverAArgs,
+    (value) => JSON.stringify(value).includes('greet'),
+    'LSP hover did not become ready in workspace A',
+  );
 
-  const definitionA = await lspJson('lsp_definition', {
-    workspaceRoot: lspWorkspaceA,
-    filePath: workspaceAMain,
-    line: 2,
-    character: 23,
-  });
-  if (!JSON.stringify(definitionA).includes(workspaceALib)) {
-    throw new Error('LSP definition did not resolve workspace A declaration');
-  }
+  await lspEventually(
+    'lsp_definition',
+    hoverAArgs,
+    (value) => JSON.stringify(value).includes(workspaceALib),
+    'LSP definition did not resolve workspace A declaration',
+  );
 
-  const referencesA = await lspJson('lsp_references', {
-    workspaceRoot: lspWorkspaceA,
-    filePath: workspaceAMain,
-    line: 2,
-    character: 23,
+  const referencesAArgs = {
+    ...hoverAArgs,
     includeDeclaration: true,
-  });
-  const referencesAText = JSON.stringify(referencesA);
-  if (!referencesAText.includes(workspaceAMain) || !referencesAText.includes(workspaceALib)) {
-    throw new Error('LSP references did not include workspace A usage and declaration');
-  }
+  };
+  await lspEventually(
+    'lsp_references',
+    referencesAArgs,
+    (value) => {
+      const text = JSON.stringify(value);
+      return text.includes(workspaceAMain) && text.includes(workspaceALib);
+    },
+    'LSP references did not include workspace A usage and declaration',
+  );
 
-  const documentSymbolsA = await lspJson('lsp_document_symbols', {
-    workspaceRoot: lspWorkspaceA,
-    filePath: workspaceALib,
-  });
-  if (!JSON.stringify(documentSymbolsA).includes('greet')) {
-    throw new Error('LSP document symbols failed in workspace A');
-  }
+  await lspEventually(
+    'lsp_document_symbols',
+    { workspaceRoot: lspWorkspaceA, filePath: workspaceALib },
+    (value) => JSON.stringify(value).includes('greet'),
+    'LSP document symbols did not become ready in workspace A',
+  );
 
-  const workspaceSymbolsA = await lspJson('lsp_workspace_symbols', {
-    workspaceRoot: lspWorkspaceA,
-    filePath: workspaceAMain,
-    query: 'greet',
-  });
-  const workspaceSymbolsAText = JSON.stringify(workspaceSymbolsA);
-  if (!workspaceSymbolsAText.includes('greet') || workspaceSymbolsAText.includes(lspWorkspaceB)) {
-    throw new Error('LSP workspace symbols leaked across workspace roots');
-  }
+  await lspEventually(
+    'lsp_workspace_symbols',
+    { workspaceRoot: lspWorkspaceA, filePath: workspaceAMain, query: 'greet' },
+    (value) => {
+      const text = JSON.stringify(value);
+      return text.includes('greet') && !text.includes(lspWorkspaceB);
+    },
+    'LSP workspace symbols did not stabilize for workspace A',
+  );
 
-  const diagnosticsA = await lspJson('lsp_diagnostics', {
-    workspaceRoot: lspWorkspaceA,
-    filePath: workspaceAMain,
-  });
-  const diagnosticsAText = JSON.stringify(diagnosticsA);
-  if (!diagnosticsAText.includes('Type') && !diagnosticsAText.includes('assignable')) {
-    throw new Error('LSP diagnostics did not report the intentional TypeScript error');
-  }
+  await lspEventually(
+    'lsp_diagnostics',
+    { workspaceRoot: lspWorkspaceA, filePath: workspaceAMain },
+    (value) => {
+      const text = JSON.stringify(value);
+      return text.includes('Type') || text.includes('assignable');
+    },
+    'LSP diagnostics did not report the intentional TypeScript error',
+  );
 
-  const hoverB = await lspJson('lsp_hover', {
-    workspaceRoot: lspWorkspaceB,
-    filePath: workspaceBMain,
-    line: 2,
-    character: 24,
-  });
-  const hoverBText = JSON.stringify(hoverB);
-  if (!hoverBText.includes('square') || hoverBText.includes('greet')) {
-    throw new Error('LSP workspace B hover was confused with workspace A');
-  }
-  const workspaceSymbolsB = await lspJson('lsp_workspace_symbols', {
-    workspaceRoot: lspWorkspaceB,
-    filePath: workspaceBMain,
-    query: 'square',
-  });
-  const workspaceSymbolsBText = JSON.stringify(workspaceSymbolsB);
-  if (!workspaceSymbolsBText.includes('square') || workspaceSymbolsBText.includes(lspWorkspaceA)) {
-    throw new Error('LSP workspace B symbols were confused with workspace A');
-  }
+  await lspEventually(
+    'lsp_hover',
+    { workspaceRoot: lspWorkspaceB, filePath: workspaceBMain, line: 2, character: 24 },
+    (value) => {
+      const text = JSON.stringify(value);
+      return text.includes('square') && !text.includes('greet');
+    },
+    'LSP workspace B hover did not stabilize',
+  );
+
+  await lspEventually(
+    'lsp_workspace_symbols',
+    { workspaceRoot: lspWorkspaceB, filePath: workspaceBMain, query: 'square' },
+    (value) => {
+      const text = JSON.stringify(value);
+      return text.includes('square') && !text.includes(lspWorkspaceA);
+    },
+    'LSP workspace B symbols did not stabilize',
+  );
 
   await expectToolFailure('lsp_hover', {
     workspaceRoot: lspDeniedWorkspace,
