@@ -54,7 +54,7 @@ try {
     cursor = page.nextCursor;
   } while (cursor);
 
-  for (const native of ['exec', 'read_file', 'agent_start', 'read_artifact', 'present_artifact', 'present_file', 'mcp_bridge_status']) {
+  for (const native of ['exec', 'read_file', 'agent_start', 'read_artifact', 'present_artifact', 'present_file', 'mcp_bridge_status', 'server_info']) {
     assert.ok(names.includes(native), `missing native tool: ${native}`);
   }
   assert.equal(names.some((name) => name.startsWith('browser_')), false, 'portable defaults unexpectedly expose Playwright');

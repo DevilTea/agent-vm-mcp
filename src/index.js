@@ -36,12 +36,21 @@ import { registerArtifactSystem } from './artifacts/register.js';
 import { ExecOutputCapture } from './exec-output.js';
 import { assertNoRawCodingHarnessLaunch } from './coding-harness-guard.js';
 import { resolveHostProfile } from './host-profile.js';
+import {
+  SERVER_INFO_TOOL,
+  ToolCatalogTracker,
+  buildServerInfo,
+  captureServerRuntimeIdentity,
+  serverInfoToolDescription,
+} from './server-info.js';
 import { applyUnifiedPatch, listDirectory, readTextFile, waitForFilesystemMutations } from './filesystem.js';
 import { workspaceCreate, workspaceDelete, workspaceList, waitForWorkspaceMutations } from './workspaces.js';
 
 const MAX_PROCESS_STREAM_BYTES = 4 * 1024 * 1024;
 const MAX_PROCESS_SESSIONS = 32;
 const DEFAULT_MAX_FILE_IMPORT_BYTES = 256 * 1024 * 1024;
+const SERVER_NAME = 'agent-vm-control';
+const SERVER_VERSION = '0.5.0';
 
 function positiveIntegerFromEnv(name, fallback) {
   const raw = process.env[name];
@@ -412,6 +421,7 @@ const NATIVE_TOOL_NAMES = new Set([
   'command_info',
   'system_audit',
   'import_file',
+  SERVER_INFO_TOOL,
   READ_ARTIFACT_TOOL,
   PRESENT_ARTIFACT_TOOL,
   PRESENT_FILE_TOOL,
@@ -437,9 +447,15 @@ for (const signal of ['SIGTERM', 'SIGINT']) {
 
 async function createServer() {
   const hostProfile = resolveHostProfile();
-  const server = new McpServer({
-    name: 'agent-vm-control',
-    version: '0.5.0',
+  const catalogTracker = new ToolCatalogTracker();
+  const server = catalogTracker.instrument(new McpServer({
+    name: SERVER_NAME,
+    version: SERVER_VERSION,
+  }));
+  const runtimeIdentity = await captureServerRuntimeIdentity({
+    name: SERVER_NAME,
+    version: SERVER_VERSION,
+    hostKind: hostProfile.kind,
   });
   const artifactStore = new ArtifactStore();
   activeArtifactStores.add(artifactStore);
@@ -948,6 +964,22 @@ async function createServer() {
     async () => jsonResult(bridgeManager.status()),
   );
 
+  const catalogMarker = catalogTracker.identity().marker;
+  server.registerTool(
+    SERVER_INFO_TOOL,
+    {
+      description: serverInfoToolDescription(catalogMarker),
+      inputSchema: z.object({}),
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+    },
+    async () => jsonResult(buildServerInfo({ runtime: runtimeIdentity, catalogTracker })),
+  );
+
   const originalClose = server.close.bind(server);
   let closed = false;
   server.close = async () => {
@@ -967,4 +999,4 @@ async function createServer() {
 }
 
 void serveStdio(createServer);
-console.error('agent-vm-control MCP server v0.5.0 running on stdio');
+console.error(`${SERVER_NAME} MCP server v${SERVER_VERSION} running on stdio`);
