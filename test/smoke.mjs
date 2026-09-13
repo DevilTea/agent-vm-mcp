@@ -1147,11 +1147,20 @@ exec /usr/bin/git "$@"
   if ((await fs.readFile(execCancelMarkerPath, 'utf8')).trim() !== 'terminated') {
     throw new Error('exec cancellation did not terminate the process group');
   }
-  try {
-    process.kill(execPid, 0);
+  const execExitDeadline = Date.now() + 2_000;
+  let execStillAlive = true;
+  while (Date.now() < execExitDeadline) {
+    try {
+      process.kill(execPid, 0);
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    } catch (error) {
+      if (error?.code !== 'ESRCH') throw error;
+      execStillAlive = false;
+      break;
+    }
+  }
+  if (execStillAlive) {
     throw new Error('exec cancellation left the shell process running');
-  } catch (error) {
-    if (error?.code !== 'ESRCH') throw error;
   }
 
   const presentFileTool = allTools.find((tool) => tool.name === 'present_file');
