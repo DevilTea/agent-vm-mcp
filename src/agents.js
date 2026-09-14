@@ -1141,7 +1141,10 @@ function ownedAgentRecord(snapshot, agentId, metadata = { agents: {} }) {
   return ownedAgentRecords(snapshot, metadata).find(({ agent, logical }) => agent.name === agentId || logical?.agentId === agentId) ?? null;
 }
 
-async function requireOwnedAgent(agentId, { signal, timeoutMs = DEFAULT_COMMAND_TIMEOUT_MS } = {}) {
+async function requireOwnedAgent(
+  agentId,
+  { signal, timeoutMs = DEFAULT_COMMAND_TIMEOUT_MS, allowUnverifiedLegacyCodex = false } = {},
+) {
   const metadata = await readAgentMetadata();
   const durable = metadata.agents[agentId] ?? null;
   if (durable?.lifecycle === 'quarantined') {
@@ -1160,6 +1163,12 @@ async function requireOwnedAgent(agentId, { signal, timeoutMs = DEFAULT_COMMAND_
     const error = new Error(`Agent ${agentId} is not an MCP-managed Herdr agent.`);
     error.code = 'agent_not_managed';
     throw error;
+  }
+  if (!owned.logical && owned.agent?.agent === 'codex' && !allowUnverifiedLegacyCodex) {
+    throw codexPolicyError(
+      { agentId },
+      'legacy Codex session has no durable MCP-managed launch provenance and cannot be used after policy enforcement.',
+    );
   }
   return {
     ...owned,
@@ -2433,7 +2442,11 @@ export async function agentStop({ agentId }, signal) {
     error.code = 'agent_invalid_transition';
     throw error;
   }
-  const owned = await requireOwnedAgent(agentId, { signal, timeoutMs: 5_000 });
+  const owned = await requireOwnedAgent(agentId, {
+    signal,
+    timeoutMs: 5_000,
+    allowUnverifiedLegacyCodex: true,
+  });
   const agent = normalizeAgent(owned.agent);
   const workspaceId = owned.workspace.workspace_id;
   const verify = await runHerdr(['workspace', 'get', workspaceId], { timeoutMs: 5_000, signal });
@@ -2444,7 +2457,11 @@ export async function agentStop({ agentId }, signal) {
     throw error;
   }
 
-  const latest = await requireOwnedAgent(agentId, { signal, timeoutMs: 5_000 });
+  const latest = await requireOwnedAgent(agentId, {
+    signal,
+    timeoutMs: 5_000,
+    allowUnverifiedLegacyCodex: true,
+  });
   if (latest.workspace.workspace_id !== workspaceId || latest.agent.workspace_id !== workspaceId) {
     const error = new Error(`Agent ${agentId} changed workspace before stop.`);
     error.code = 'agent_not_managed';
