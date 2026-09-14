@@ -18,8 +18,16 @@ import {
 const CHATGPT_INTERACTION_RESOURCE_NAME = 'Agent VM structured user input';
 const CHATGPT_UI_PATH = new URL('./chatgpt-app.html', import.meta.url);
 const CHATGPT_UI_HTML = readFileSync(CHATGPT_UI_PATH, 'utf8');
+const CHATGPT_UI_RESOURCE_META = {
+  'openai/widgetPrefersBorder': true,
+  ui: {
+    prefersBorder: true,
+  },
+};
 const CHATGPT_UI_REVISION = createHash('sha256')
   .update(CHATGPT_UI_HTML)
+  .update('\0')
+  .update(JSON.stringify(CHATGPT_UI_RESOURCE_META))
   .digest('hex')
   .slice(0, 12);
 export const CHATGPT_INTERACTION_RESOURCE_URI =
@@ -32,11 +40,7 @@ export function registerChatgptInteractionAdapter(server) {
     CHATGPT_INTERACTION_RESOURCE_URI,
     {
       description: 'Inline structured question form used by request_user_input.',
-      _meta: {
-        ui: {
-          prefersBorder: true,
-        },
-      },
+      _meta: CHATGPT_UI_RESOURCE_META,
     },
     async () => ({
       contents: [
@@ -44,11 +48,7 @@ export function registerChatgptInteractionAdapter(server) {
           uri: CHATGPT_INTERACTION_RESOURCE_URI,
           mimeType: RESOURCE_MIME_TYPE,
           text: CHATGPT_UI_HTML,
-          _meta: {
-            ui: {
-              prefersBorder: true,
-            },
-          },
+          _meta: CHATGPT_UI_RESOURCE_META,
         },
       ],
     }),
