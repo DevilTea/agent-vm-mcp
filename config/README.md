@@ -22,15 +22,17 @@ An explicit environment override is authoritative. If it points to a missing or 
 
 The built-in `bridges.json` contains an empty bridge list. Machine-specific Playwright/LSP configuration is an optional example under `config/examples/`.
 
-## Dot-agents skill projection
+## MCP Skills (SEP-2640)
 
-The native host-facing `skill_list` and `skill_read` tools consume a published dot-agents projection rather than scanning installed harness skill directories. The projection root defaults to:
+The canonical MCP-facing skill surface follows the [Final SEP-2640: Skills Extension](https://github.com/modelcontextprotocol/modelcontextprotocol/pull/2640). It declares the `io.modelcontextprotocol/skills` extension and uses `skills/list`, `skills/get`, standard `resources/read`, and `resources/directory/read` with `skill://` URIs. Listings contain complete parsed `SKILL.md` frontmatter and a digest/size manifest for every regular file; reads are lazy and bounded by the SEP limits.
+
+The dot-agents projection is an internal publication snapshot rather than a second protocol model. The native host-facing `skill_list` and `skill_read` tools remain compatibility fallbacks for current ChatGPT behavior and consume that published projection rather than scanning installed harness skill directories. The projection root defaults to:
 
 ```text
 ${XDG_DATA_HOME:-$HOME/.local/share}/dot-agents/skill-projection/v1/
 ```
 
-Override it with `AGENT_MCP_SKILL_PROJECTION_ROOT`. The root contains a version 1 `catalog.json` with `source: "dot-agents"` and `skills/<name>/...`; each catalog entry must provide a sorted `name`, `description`, `entrypoint: "SKILL.md"`, and `sha256:<64 lowercase hex digits>` hash. The adapter validates the root/catalog layout at tool-call time, so absent or invalid published data is reported as unavailable without blocking MCP startup.
+Override it with `AGENT_MCP_SKILL_PROJECTION_ROOT`. The root contains a version 1 `catalog.json` with `source: "dot-agents"` and `skills/<name>/...`; each catalog entry must provide a sorted `name`, `description`, `entrypoint: "SKILL.md"`, and `sha256:<64 lowercase hex digits>` hash. The adapter validates the root/catalog layout and tree hash at request time. Filesystem paths are not exposed. Absent or invalid published data is reported as unavailable without blocking MCP startup for the compatibility tools. This repository has not verified ChatGPT native SEP-2640 consumption, so no such support is claimed.
 
 `skill_list` exposes availability, root source, and catalog metadata without filesystem paths, with an optional case-insensitive name/description query. Hosts should inspect it when reusable guidance may apply and then use `skill_read` for the selected skill. `skill_read` defaults to `SKILL.md` and permits only safe relative text reads within that skill, including references or scripts as text. Traversal, symlinks/escaping paths, non-regular files, binary/non-UTF-8 content, and reads above the 256 KiB bound are rejected. These skills are instructions/data, not executable capabilities; this surface does not expose Codex system skills.
 

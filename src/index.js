@@ -40,9 +40,9 @@ import { interactionToolNamesForHost, registerInteractionsForHost } from './inte
 import {
   SKILL_LIST_TOOL,
   SKILL_READ_TOOL,
-  createSkillProjectionAdapter,
   registerSkillProjectionTools,
 } from './skill-projection.js';
+import { createSepSkillsAdapter, registerSepSkillsExtension } from './sep-skills.js';
 import {
   SERVER_INFO_TOOL,
   ToolCatalogTracker,
@@ -474,7 +474,12 @@ async function createServer() {
   activeArtifactStores.add(artifactStore);
   await registerArtifactSystem(server, artifactStore);
   registerInteractionsForHost(server, hostProfile);
-  registerSkillProjectionTools(server, createSkillProjectionAdapter());
+  const sepSkillsAdapter = createSepSkillsAdapter();
+  registerSepSkillsExtension(server, sepSkillsAdapter);
+  registerSkillProjectionTools(server, {
+    list: sepSkillsAdapter.listCompatibility,
+    read: sepSkillsAdapter.readCompatibility,
+  });
 
   server.registerTool(
     'exec',
