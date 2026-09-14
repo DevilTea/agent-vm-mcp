@@ -22,6 +22,18 @@ An explicit environment override is authoritative. If it points to a missing or 
 
 The built-in `bridges.json` contains an empty bridge list. Machine-specific Playwright/LSP configuration is an optional example under `config/examples/`.
 
+## Dot-agents skill projection
+
+The native host-facing `skill_list` and `skill_read` tools consume a published dot-agents projection rather than scanning installed harness skill directories. The projection root defaults to:
+
+```text
+${XDG_DATA_HOME:-$HOME/.local/share}/dot-agents/skill-projection/v1/
+```
+
+Override it with `AGENT_MCP_SKILL_PROJECTION_ROOT`. The root contains a version 1 `catalog.json` with `source: "dot-agents"` and `skills/<name>/...`; each catalog entry must provide a sorted `name`, `description`, `entrypoint: "SKILL.md"`, and `sha256:<64 lowercase hex digits>` hash. The adapter validates the root/catalog layout at tool-call time, so absent or invalid published data is reported as unavailable without blocking MCP startup.
+
+`skill_list` exposes availability, root source, and catalog metadata without filesystem paths, with an optional case-insensitive name/description query. Hosts should inspect it when reusable guidance may apply and then use `skill_read` for the selected skill. `skill_read` defaults to `SKILL.md` and permits only safe relative text reads within that skill, including references or scripts as text. Traversal, symlinks/escaping paths, non-regular files, binary/non-UTF-8 content, and reads above the 256 KiB bound are rejected. These skills are instructions/data, not executable capabilities; this surface does not expose Codex system skills.
+
 ## MCP bridges
 
 A bridge exposes selected upstream MCP tools through the same server. Supported transports are stdio and Streamable HTTP.

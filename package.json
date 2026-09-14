@@ -10,12 +10,13 @@
   "packageManager": "pnpm@11.25.0",
   "scripts": {
     "start": "node src/index.js",
-    "test": "node test/server-info-smoke.mjs && node test/config-path-smoke.mjs && node test/portable-start-smoke.mjs && node test/host-profile-smoke.mjs && node test/mcp-bridge-lifecycle-smoke.mjs && node test/bounded-file-read-smoke.mjs && node test/system-audit-smoke.mjs && bash test/browser-takeover-smoke.sh && bash test/agent-herdr-deployment-smoke.sh && node test/coding-harness-guard-smoke.mjs && node test/agents-smoke.mjs && node test/agent-mcp-error-smoke.mjs && node test/smoke.mjs",
-    "smoke": "node test/server-info-smoke.mjs && node test/config-path-smoke.mjs && node test/portable-start-smoke.mjs && node test/host-profile-smoke.mjs && node test/mcp-bridge-lifecycle-smoke.mjs && node test/bounded-file-read-smoke.mjs && node test/system-audit-smoke.mjs && bash test/browser-takeover-smoke.sh && bash test/agent-herdr-deployment-smoke.sh && node test/coding-harness-guard-smoke.mjs && node test/agents-smoke.mjs && node test/agent-mcp-error-smoke.mjs && AGENT_VM_SMOKE_LIVE_INTEGRATIONS=1 AGENT_MCP_HOST=chatgpt node test/smoke.mjs"
+    "test": "node test/server-info-smoke.mjs && node test/config-path-smoke.mjs && node test/portable-start-smoke.mjs && node test/host-profile-smoke.mjs && node test/interactions-smoke.mjs && node test/skill-projection-smoke.mjs && node test/mcp-bridge-lifecycle-smoke.mjs && node test/bounded-file-read-smoke.mjs && node test/system-audit-smoke.mjs && bash test/browser-takeover-smoke.sh && bash test/agent-herdr-deployment-smoke.sh && node test/coding-harness-guard-smoke.mjs && node test/agents-smoke.mjs && node test/agent-mcp-error-smoke.mjs && node test/smoke.mjs",
+    "smoke": "node test/server-info-smoke.mjs && node test/config-path-smoke.mjs && node test/portable-start-smoke.mjs && node test/host-profile-smoke.mjs && node test/interactions-smoke.mjs && node test/skill-projection-smoke.mjs && node test/mcp-bridge-lifecycle-smoke.mjs && node test/bounded-file-read-smoke.mjs && node test/system-audit-smoke.mjs && bash test/browser-takeover-smoke.sh && bash test/agent-herdr-deployment-smoke.sh && node test/coding-harness-guard-smoke.mjs && node test/agents-smoke.mjs && node test/agent-mcp-error-smoke.mjs && AGENT_VM_SMOKE_LIVE_INTEGRATIONS=1 AGENT_MCP_HOST=chatgpt node test/smoke.mjs"
   },
   "license": "ISC",
   "dependencies": {
     "@modelcontextprotocol/client": "^2.0.0",
+    "@modelcontextprotocol/ext-apps": "^2.0.0",
     "@modelcontextprotocol/server": "^2.0.0",
     "zod": "^4.4.3"
   }
