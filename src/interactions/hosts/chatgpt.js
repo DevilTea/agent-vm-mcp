@@ -1,5 +1,5 @@
-import { randomUUID } from 'node:crypto';
-import fs from 'node:fs/promises';
+import { createHash, randomUUID } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 
 import {
   RESOURCE_MIME_TYPE,
@@ -15,15 +15,15 @@ import {
   interactionResultSchema,
 } from '../model.js';
 
-export const CHATGPT_INTERACTION_RESOURCE_URI = 'ui://agent-vm/request-user-input/v1.html';
 const CHATGPT_INTERACTION_RESOURCE_NAME = 'Agent VM structured user input';
 const CHATGPT_UI_PATH = new URL('./chatgpt-app.html', import.meta.url);
-let chatgptUiHtmlPromise;
-
-function readChatgptUiHtml() {
-  chatgptUiHtmlPromise ??= fs.readFile(CHATGPT_UI_PATH, 'utf8');
-  return chatgptUiHtmlPromise;
-}
+const CHATGPT_UI_HTML = readFileSync(CHATGPT_UI_PATH, 'utf8');
+const CHATGPT_UI_REVISION = createHash('sha256')
+  .update(CHATGPT_UI_HTML)
+  .digest('hex')
+  .slice(0, 12);
+export const CHATGPT_INTERACTION_RESOURCE_URI =
+  `ui://agent-vm/request-user-input/v1-${CHATGPT_UI_REVISION}.html`;
 
 export function registerChatgptInteractionAdapter(server) {
   registerAppResource(
@@ -43,7 +43,7 @@ export function registerChatgptInteractionAdapter(server) {
         {
           uri: CHATGPT_INTERACTION_RESOURCE_URI,
           mimeType: RESOURCE_MIME_TYPE,
-          text: await readChatgptUiHtml(),
+          text: CHATGPT_UI_HTML,
           _meta: {
             ui: {
               prefersBorder: true,
