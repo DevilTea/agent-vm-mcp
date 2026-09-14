@@ -146,9 +146,54 @@ function abortReason(signal, fallback) {
   return signal?.reason instanceof Error ? signal.reason : new Error(fallback);
 }
 
-function strictGitApplyArgs({ check }) {
+function patchPathStyle(header) {
+  const value = header.trimStart();
+  if (value === '/dev/null' || value.startsWith('/dev/null\t')) return 'null';
+  if (value.startsWith('a/') || value.startsWith('"a/')) return 'git-old';
+  if (value.startsWith('b/') || value.startsWith('"b/')) return 'git-new';
+  return 'cwd';
+}
+
+function patchStripComponents(patch) {
+  let pendingOld = null;
+  let mode = null;
+
+  for (const line of patch.split('\n')) {
+    const gitDiffHeader = line.startsWith('diff --git a/') || line.startsWith('diff --git "a/');
+    if (gitDiffHeader) {
+      if (mode === 'cwd') {
+        throw new Error('Patch mixes cwd-relative paths with git a/ and b/ path prefixes. Use one path style per patch.');
+      }
+      mode = 'git';
+      continue;
+    }
+    if (line.startsWith('--- ')) {
+      pendingOld = patchPathStyle(line.slice(4));
+      continue;
+    }
+    if (!line.startsWith('+++ ') || pendingOld === null) continue;
+
+    const next = patchPathStyle(line.slice(4));
+    const gitStyle =
+      (pendingOld === 'null' || pendingOld === 'git-old') &&
+      (next === 'null' || next === 'git-new') &&
+      !(pendingOld === 'null' && next === 'null');
+    const pairMode = gitStyle ? 'git' : 'cwd';
+
+    if (mode !== null && mode !== pairMode) {
+      throw new Error('Patch mixes cwd-relative paths with git a/ and b/ path prefixes. Use one path style per patch.');
+    }
+    mode = pairMode;
+    pendingOld = null;
+  }
+
+  return mode === 'git' ? 1 : 0;
+}
+
+function strictGitApplyArgs({ check, stripComponents }) {
   return [
     'apply',
+    `-p${stripComponents}`,
     '--no-unsafe-paths',
     '--no-3way',
     '--no-reject',
@@ -163,14 +208,14 @@ function strictGitApplyArgs({ check }) {
   ];
 }
 
-function runGitApply({ cwd, patch, check, signal }) {
+function runGitApply({ cwd, patch, check, stripComponents, signal }) {
   return new Promise((resolve, reject) => {
     if (signal?.aborted) {
       reject(abortReason(signal, 'Patch validation cancelled.'));
       return;
     }
 
-    const child = spawn('git', strictGitApplyArgs({ check }), {
+    const child = spawn('git', strictGitApplyArgs({ check, stripComponents }), {
       cwd,
       env: process.env,
       detached: true,
@@ -286,11 +331,13 @@ export async function applyUnifiedPatch({ patch, cwd }, requestSignal) {
   const resolvedCwd = path.resolve(cwd ?? process.env.HOME);
   const cwdStat = await fs.stat(resolvedCwd);
   if (!cwdStat.isDirectory()) throw new Error(`Patch cwd is not a directory: ${resolvedCwd}`);
+  const stripComponents = patchStripComponents(patch);
 
   const numstat = await runGitApply({
     cwd: resolvedCwd,
     patch,
     check: true,
+    stripComponents,
     signal: requestSignal,
   });
   const files = parseNumstat(numstat);
@@ -300,6 +347,7 @@ export async function applyUnifiedPatch({ patch, cwd }, requestSignal) {
     cwd: resolvedCwd,
     patch,
     check: false,
+    stripComponents,
     signal: undefined,
   });
   activePatchCommits.add(commit);

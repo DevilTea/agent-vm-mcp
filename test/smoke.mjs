@@ -756,6 +756,26 @@ exec /usr/bin/git "$@"
     throw new Error('list_directory deterministic structured listing failed');
   }
 
+  const cwdRelativePatch = `--- subdir/direct.txt
++++ subdir/direct.txt
+@@ -1 +1 @@
+-before
++after
+`;
+  await fs.writeFile(`${filesystemRoot}/subdir/direct.txt`, 'before\n', 'utf8');
+  const cwdRelativeResult = parseJsonToolResult(
+    await client.callTool({
+      name: 'apply_patch',
+      arguments: { patch: cwdRelativePatch, cwd: filesystemRoot },
+    }),
+  );
+  if (
+    (await fs.readFile(`${filesystemRoot}/subdir/direct.txt`, 'utf8')) !== 'after\n' ||
+    cwdRelativeResult.files[0]?.path !== 'subdir/direct.txt'
+  ) {
+    throw new Error('apply_patch cwd-relative path handling failed');
+  }
+
   const exactPatch = `--- a/a.txt
 +++ b/a.txt
 @@ -1,3 +1,3 @@
@@ -778,6 +798,27 @@ exec /usr/bin/git "$@"
     appliedPatch.files[0].deletions !== 1
   ) {
     throw new Error('apply_patch exact patch failed');
+  }
+
+  const mixedStylePatch = `--- a/a.txt
++++ b/a.txt
+@@ -1,3 +1,3 @@
+ one
+-TWO
++two
+ three
+--- subdir/direct.txt
++++ subdir/direct.txt
+@@ -1 +1 @@
+-after
++before
+`;
+  await expectToolFailure('apply_patch', { patch: mixedStylePatch, cwd: filesystemRoot });
+  if (
+    (await fs.readFile(`${filesystemRoot}/a.txt`, 'utf8')) !== 'one\nTWO\nthree\n' ||
+    (await fs.readFile(`${filesystemRoot}/subdir/direct.txt`, 'utf8')) !== 'after\n'
+  ) {
+    throw new Error('apply_patch mixed path style failure was not zero-write');
   }
 
   await fs.writeFile(`${filesystemRoot}/offset.txt`, 'zero\none\ntwo\nthree\n', 'utf8');
@@ -819,10 +860,10 @@ exec /usr/bin/git "$@"
 
   await fs.writeFile(`${filesystemRoot}/delete.txt`, 'delete-me\n', 'utf8');
   const createDeletePatch = `--- /dev/null
-+++ b/created.txt
++++ created.txt
 @@ -0,0 +1 @@
 +created
---- a/delete.txt
+--- delete.txt
 +++ /dev/null
 @@ -1 +0,0 @@
 -delete-me
@@ -839,6 +880,19 @@ exec /usr/bin/git "$@"
     throw new Error('apply_patch delete failed');
   } catch (error) {
     if (error?.code !== 'ENOENT') throw error;
+  }
+
+  await fs.writeFile(`${filesystemRoot}/mode-only.txt`, 'mode\n', { mode: 0o644 });
+  const modeOnlyPatch = `diff --git a/mode-only.txt b/mode-only.txt
+old mode 100644
+new mode 100755
+`;
+  await client.callTool({
+    name: 'apply_patch',
+    arguments: { patch: modeOnlyPatch, cwd: filesystemRoot },
+  });
+  if (((await fs.stat(`${filesystemRoot}/mode-only.txt`)).mode & 0o777) !== 0o755) {
+    throw new Error('apply_patch git-style mode-only patch failed');
   }
 
   const traversalName = `agent-mcp-traversal-${process.pid}.txt`;
