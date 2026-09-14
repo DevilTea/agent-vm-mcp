@@ -308,12 +308,16 @@ const previous = {
   AGENT_HERDR_SESSION: process.env.AGENT_HERDR_SESSION,
   AGENT_HERDR_FAKE_STATE: process.env.AGENT_HERDR_FAKE_STATE,
   AGENT_HERDR_BOOTSTRAP: process.env.AGENT_HERDR_BOOTSTRAP,
+  AGENT_CODEX_ENFORCED_MODEL: process.env.AGENT_CODEX_ENFORCED_MODEL,
+  AGENT_CODEX_ENFORCED_EFFORT: process.env.AGENT_CODEX_ENFORCED_EFFORT,
 };
 process.env.HOME = home;
 process.env.PATH = `${bin}:${previous.PATH}`;
 process.env.AGENT_HERDR_BIN = herdrPath;
 process.env.AGENT_HERDR_SESSION = 'fake-session';
 process.env.AGENT_HERDR_FAKE_STATE = statePath;
+process.env.AGENT_CODEX_ENFORCED_MODEL = 'gpt-5.6-luna';
+process.env.AGENT_CODEX_ENFORCED_EFFORT = 'max';
 
 try {
   const capabilities = await agentCapabilities();
@@ -325,12 +329,32 @@ try {
       throw new Error(`agentCapabilities did not discover ${harness.kind} or its skills`);
     }
   }
+  const codexCapability = capabilities.harnesses.find((harness) => harness.kind === 'codex');
+  if (
+    codexCapability?.launchPolicy?.enforced !== true ||
+    codexCapability.launchPolicy.model !== 'gpt-5.6-luna' ||
+    codexCapability.launchPolicy.effort !== 'max'
+  ) {
+    throw new Error(`agentCapabilities did not expose enforced Codex policy: ${JSON.stringify(codexCapability?.launchPolicy)}`);
+  }
+
+  try {
+    await agentStart({ harness: 'codex', cwd: root, model: 'gpt-5.6-terra', effort: 'max', timeoutMs: 10_000 });
+    throw new Error('Forbidden Codex model unexpectedly started');
+  } catch (error) {
+    if (error?.code !== 'agent_launch_policy_violation' || !String(error.message).includes('gpt-5.6-luna')) throw error;
+  }
+
+  try {
+    await agentStart({ harness: 'codex', cwd: root, model: 'gpt-5.6-luna', effort: 'high', timeoutMs: 10_000 });
+    throw new Error('Forbidden Codex effort unexpectedly started');
+  } catch (error) {
+    if (error?.code !== 'agent_launch_policy_violation' || !String(error.message).includes('effort max')) throw error;
+  }
 
   const codex = await agentStart({
     harness: 'codex',
     cwd: root,
-    model: 'gpt-5.6-luna',
-    effort: 'max',
     timeoutMs: 10_000,
   });
   if (!codex.startup.ready || codex.agent.harness !== 'codex') throw new Error('Codex fake agent did not start');
@@ -977,8 +1001,20 @@ try {
   }
   state = JSON.parse(await fs.readFile(statePath, 'utf8'));
   const resumedRuntime = state.agents[resumed.agent.runtimeAgentId];
-  if (!resumedRuntime || JSON.stringify(resumedRuntime.launch_args) !== JSON.stringify(['resume', resumableNativeSessionId]) || !resumedRuntime.transcript.includes('PERSIST_THIS_NATIVE_SESSION')) {
-    throw new Error('agent_resume did not use the same native Codex session or restore its transcript');
+  if (
+    !resumedRuntime ||
+    JSON.stringify(resumedRuntime.launch_args) !==
+      JSON.stringify([
+        'resume',
+        resumableNativeSessionId,
+        '--model',
+        'gpt-5.6-luna',
+        '--config',
+        'model_reasoning_effort="max"',
+      ]) ||
+    !resumedRuntime.transcript.includes('PERSIST_THIS_NATIVE_SESSION')
+  ) {
+    throw new Error('agent_resume did not preserve the enforced Codex model/effort or restore its transcript');
   }
   resumedRuntime.agent_status = 'working';
   await fs.writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, 'utf8');

@@ -66,6 +66,11 @@
       gap: 7px;
     }
 
+    .option-block {
+      display: grid;
+      gap: 6px;
+    }
+
     .option {
       display: grid;
       grid-template-columns: auto 1fr;
@@ -76,10 +81,16 @@
       border-radius: 10px;
       cursor: pointer;
       background: var(--color-background-secondary, color-mix(in srgb, Canvas 96%, CanvasText 4%));
+      transition: border-color 120ms ease, background 120ms ease;
     }
 
     .option:hover {
       border-color: var(--color-border-emphasis, color-mix(in srgb, CanvasText 35%, transparent));
+    }
+
+    .option-block.selected > .option {
+      border-color: var(--color-border-emphasis, color-mix(in srgb, CanvasText 48%, transparent));
+      background: var(--color-background-tertiary, color-mix(in srgb, Canvas 91%, CanvasText 9%));
     }
 
     .option input { margin: 3px 0 0; }
@@ -99,6 +110,20 @@
       vertical-align: 1px;
     }
 
+    .custom-input {
+      display: grid;
+      gap: 5px;
+      margin: 0 10px 2px 30px;
+    }
+
+    .custom-input[hidden] { display: none; }
+
+    .custom-input-label {
+      font-size: 0.78rem;
+      line-height: 1.35;
+      color: var(--color-text-secondary, GrayText);
+    }
+
     input[type="text"],
     textarea {
       width: 100%;
@@ -109,6 +134,17 @@
       color: inherit;
       background: var(--color-background-primary, Canvas);
       resize: vertical;
+    }
+
+    input[type="text"]:focus,
+    textarea:focus {
+      outline: 2px solid var(--color-border-emphasis, Highlight);
+      outline-offset: 1px;
+    }
+
+    input[aria-invalid="true"],
+    textarea[aria-invalid="true"] {
+      border-color: var(--color-border-danger, #d92d20);
     }
 
     textarea { min-height: 88px; }
@@ -242,11 +278,15 @@
       }
 
       function optionRow(question, option, inputType) {
+        const row = make('div', 'option-block');
+        row.dataset.optionId = option.id;
+
         const label = make('label', 'option');
         const input = document.createElement('input');
         input.type = inputType;
         input.name = question.id;
         input.value = option.id;
+        input.dataset.optionChoice = 'true';
         label.append(input);
 
         const main = make('span', 'option-main');
@@ -255,7 +295,48 @@
         main.append(heading);
         if (option.description) main.append(make('div', 'option-description', option.description));
         label.append(main);
-        return { label, input };
+        row.append(label);
+
+        let customInput = null;
+        if (option.allowCustomInput === true) {
+          const custom = make('div', 'custom-input');
+          custom.hidden = true;
+
+          const customId = `custom-${question.id}-${option.id}`;
+          const customLabel = make('label', 'custom-input-label', `Additional details for ${option.label}`);
+          customLabel.htmlFor = customId;
+
+          customInput = document.createElement('input');
+          customInput.type = 'text';
+          customInput.id = customId;
+          customInput.name = `${question.id}__custom__${option.id}`;
+          customInput.placeholder = option.customInputPlaceholder ?? 'Please specify';
+          customInput.dataset.customInput = 'true';
+          customInput.dataset.optionId = option.id;
+          customInput.disabled = true;
+          customInput.setAttribute('aria-required', 'true');
+
+          custom.append(customLabel, customInput);
+          row.append(custom);
+        }
+
+        return { row, label, input, customInput };
+      }
+
+      function syncOptionState(section) {
+        for (const row of section.querySelectorAll('.option-block')) {
+          const choice = row.querySelector('[data-option-choice="true"]');
+          if (!choice) continue;
+
+          row.classList.toggle('selected', choice.checked);
+          const customInput = row.querySelector('[data-custom-input="true"]');
+          const custom = customInput?.closest('.custom-input');
+          if (!customInput || !custom) continue;
+
+          custom.hidden = !choice.checked;
+          customInput.disabled = !choice.checked;
+          if (!choice.checked) customInput.removeAttribute('aria-invalid');
+        }
       }
 
       function booleanRow(question, value, labelText) {
@@ -283,17 +364,25 @@
         if (question.kind === 'single_select' || question.kind === 'multi_select') {
           const options = make('div', 'options');
           for (const option of question.options ?? []) {
-            const { label } = optionRow(question, option, question.kind === 'single_select' ? 'radio' : 'checkbox');
-            options.append(label);
+            const { row } = optionRow(question, option, question.kind === 'single_select' ? 'radio' : 'checkbox');
+            options.append(row);
           }
+          options.addEventListener('change', (event) => {
+            if (event.target?.matches?.('[data-option-choice="true"]')) syncOptionState(section);
+          });
           section.append(options);
           section.dataset.minSelections = String(question.minSelections ?? 0);
           section.dataset.maxSelections = question.maxSelections == null ? '' : String(question.maxSelections);
+          syncOptionState(section);
         } else if (question.kind === 'boolean') {
           const options = make('div', 'options');
-          options.append(booleanRow(question, true, question.trueLabel ?? 'Yes').label);
-          options.append(booleanRow(question, false, question.falseLabel ?? 'No').label);
+          options.append(booleanRow(question, true, question.trueLabel ?? 'Yes').row);
+          options.append(booleanRow(question, false, question.falseLabel ?? 'No').row);
+          options.addEventListener('change', (event) => {
+            if (event.target?.matches?.('[data-option-choice="true"]')) syncOptionState(section);
+          });
           section.append(options);
+          syncOptionState(section);
         } else if (question.kind === 'text') {
           const input = document.createElement(question.multiline ? 'textarea' : 'input');
           if (!question.multiline) input.type = 'text';
@@ -314,6 +403,37 @@
         return values.map((value) => byId.get(value) ?? value);
       }
 
+      function collectCustomValues(question, fieldset, values) {
+        const customValues = {};
+        const missingLabels = [];
+
+        for (const input of fieldset.querySelectorAll('[data-custom-input="true"]')) {
+          input.removeAttribute('aria-invalid');
+        }
+
+        for (const value of values) {
+          const row = fieldset.querySelector(`[data-option-id="${CSS.escape(value)}"]`);
+          const input = row?.querySelector('[data-custom-input="true"]');
+          if (!input) continue;
+
+          const customValue = input.value.trim();
+          if (!customValue) {
+            input.setAttribute('aria-invalid', 'true');
+            missingLabels.push(selectedLabels(question, [value])[0] ?? value);
+          } else {
+            customValues[value] = customValue;
+          }
+        }
+
+        return { customValues, missingLabels };
+      }
+
+      function customInputError(labels) {
+        if (labels.length === 0) return '';
+        const quoted = labels.map((label) => `“${label}”`).join(', ');
+        return `Please provide additional details for ${quoted}.`;
+      }
+
       function collectAnswers(requestData, form) {
         const answers = [];
         let valid = true;
@@ -332,11 +452,22 @@
               continue;
             }
             const value = checked?.value ?? null;
+            const { customValues, missingLabels } = collectCustomValues(
+              question,
+              fieldset,
+              value == null ? [] : [value],
+            );
+            if (missingLabels.length > 0) {
+              error.textContent = customInputError(missingLabels);
+              valid = false;
+              continue;
+            }
             answers.push({
               questionId: question.id,
               kind: question.kind,
               value,
               labels: value == null ? [] : selectedLabels(question, [value]),
+              customValue: value == null ? null : customValues[value] ?? null,
             });
           } else if (question.kind === 'multi_select') {
             const values = [...fieldset.querySelectorAll(`input[name="${CSS.escape(question.id)}"]:checked`)].map((input) => input.value);
@@ -352,11 +483,18 @@
               valid = false;
               continue;
             }
+            const { customValues, missingLabels } = collectCustomValues(question, fieldset, values);
+            if (missingLabels.length > 0) {
+              error.textContent = customInputError(missingLabels);
+              valid = false;
+              continue;
+            }
             answers.push({
               questionId: question.id,
               kind: question.kind,
               value: values,
               labels: selectedLabels(question, values),
+              customValues,
             });
           } else if (question.kind === 'boolean') {
             const checked = fieldset.querySelector(`input[name="${CSS.escape(question.id)}"]:checked`);
@@ -403,6 +541,16 @@
             lines.push(`   Answer: ${answer.labels.join(', ')}`);
             const raw = Array.isArray(answer.value) ? answer.value.join(', ') : String(answer.value);
             lines.push(`   Value: ${raw}`);
+            if (answer.customValue) {
+              lines.push(`   Custom value [${String(answer.value)}]: ${answer.customValue}`);
+            }
+            if (answer.customValues && Array.isArray(answer.value)) {
+              for (const optionId of answer.value) {
+                if (answer.customValues[optionId]) {
+                  lines.push(`   Custom value [${optionId}]: ${answer.customValues[optionId]}`);
+                }
+              }
+            }
           } else {
             lines.push(`   Answer: ${String(answer.value)}`);
           }

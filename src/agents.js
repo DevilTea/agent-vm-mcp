@@ -20,6 +20,7 @@ const AGENT_ID_PATTERN = /^agent-[0-9a-f]{26}$/;
 const READY_STATUSES = new Set(['idle', 'done']);
 const BOOTSTRAP_MODES = new Set(['auto', 'external']);
 const LIFECYCLE_STATES = new Set(['active', 'suspending', 'suspended', 'resuming']);
+const CODEX_SUPPORTED_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
 
 let sessionBootstrapPromise = null;
 const promptAgentsInFlight = new Set();
@@ -51,6 +52,43 @@ function herdrSessionName() {
   return name;
 }
 
+function codexLaunchPolicy(env = process.env) {
+  const model = env.AGENT_CODEX_ENFORCED_MODEL?.trim() || null;
+  const effort = env.AGENT_CODEX_ENFORCED_EFFORT?.trim() || null;
+  if (model === null && effort === null) return { enforced: false };
+  if (model === null || effort === null) {
+    throw new Error('AGENT_CODEX_ENFORCED_MODEL and AGENT_CODEX_ENFORCED_EFFORT must be configured together.');
+  }
+  validateModel(model);
+  if (!CODEX_SUPPORTED_EFFORTS.includes(effort)) {
+    throw new Error(`AGENT_CODEX_ENFORCED_EFFORT must be one of: ${CODEX_SUPPORTED_EFFORTS.join(', ')}.`);
+  }
+  return { enforced: true, model, effort };
+}
+
+function applyHarnessLaunchPolicy({ harness, model, effort }) {
+  if (harness !== 'codex') return { model, effort };
+  const policy = codexLaunchPolicy();
+  if (!policy.enforced) return { model, effort };
+
+  if (model !== undefined && model !== policy.model) {
+    const error = new Error(
+      `Codex launch policy requires model ${policy.model}; requested model ${model} is forbidden on this deployment.`,
+    );
+    error.code = 'agent_launch_policy_violation';
+    throw error;
+  }
+  if (effort !== undefined && effort !== policy.effort) {
+    const error = new Error(
+      `Codex launch policy requires effort ${policy.effort}; requested effort ${effort} is forbidden on this deployment.`,
+    );
+    error.code = 'agent_launch_policy_violation';
+    throw error;
+  }
+
+  return { model: policy.model, effort: policy.effort };
+}
+
 function harnessDefinitions() {
   const home = homeDirectory();
   return {
@@ -64,7 +102,7 @@ function harnessDefinitions() {
       supportsModel: true,
       supportsEffort: true,
       startupGraceMs: 0,
-      supportedEfforts: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'],
+      supportedEfforts: CODEX_SUPPORTED_EFFORTS,
       buildArgs({ model, effort }) {
         const args = [];
         if (model) args.push('--model', model);
@@ -1336,6 +1374,7 @@ export async function agentCapabilities({ signal } = {}) {
       supportsModel: definition.supportsModel,
       supportsEffort: definition.supportsEffort,
       supportedEfforts: definition.supportedEfforts,
+      launchPolicy: kind === 'codex' ? codexLaunchPolicy() : { enforced: false },
       skills: await scanSkills(definition.skillRoot),
       resume: definition.resume,
     });
@@ -1388,6 +1427,7 @@ async function startAgentRuntime(
   const definitions = harnessDefinitions();
   const definition = definitions[harness];
   if (!definition) throw new Error(`Unsupported harness: ${harness}`);
+  ({ model, effort } = applyHarnessLaunchPolicy({ harness, model, effort }));
   validateModel(model);
   if (effort && !definition.supportedEfforts.includes(effort)) {
     throw new Error(`Effort ${effort} is not supported for harness ${harness}.`);

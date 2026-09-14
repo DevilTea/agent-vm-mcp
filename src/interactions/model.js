@@ -8,12 +8,32 @@ const identifierSchema = z
   .regex(/^[A-Za-z][A-Za-z0-9_-]{0,63}$/)
   .describe('Stable identifier used to correlate this item with the user response.');
 
-const optionSchema = z.object({
-  id: identifierSchema,
-  label: z.string().min(1).max(160),
-  description: z.string().min(1).max(600).optional(),
-  recommended: z.boolean().default(false),
-});
+const optionSchema = z
+  .object({
+    id: identifierSchema,
+    label: z.string().min(1).max(160),
+    description: z.string().min(1).max(600).optional(),
+    recommended: z.boolean().default(false),
+    allowCustomInput: z
+      .boolean()
+      .optional()
+      .describe('When true, selecting this option requires an additional inline text value.'),
+    customInputPlaceholder: z
+      .string()
+      .min(1)
+      .max(300)
+      .optional()
+      .describe('Placeholder for the additional inline text value when allowCustomInput is true.'),
+  })
+  .superRefine((option, ctx) => {
+    if (option.customInputPlaceholder !== undefined && option.allowCustomInput !== true) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['customInputPlaceholder'],
+        message: 'customInputPlaceholder requires allowCustomInput=true.',
+      });
+    }
+  });
 
 function withUniqueOptions(schema) {
   return schema.superRefine((question, ctx) => {
@@ -138,8 +158,10 @@ function questionFallback(question, index) {
   if (question.kind === 'single_select' || question.kind === 'multi_select') {
     for (const option of question.options) {
       const recommendation = option.recommended ? ' [recommended]' : '';
+      const customInput = option.allowCustomInput ? ' [custom input required]' : '';
       const description = option.description ? ` — ${option.description}` : '';
-      lines.push(`   - ${option.id}: ${option.label}${recommendation}${description}`);
+      const placeholder = option.customInputPlaceholder ? ` (placeholder: ${option.customInputPlaceholder})` : '';
+      lines.push(`   - ${option.id}: ${option.label}${recommendation}${customInput}${placeholder}${description}`);
     }
   } else if (question.kind === 'boolean') {
     const trueRecommendation = question.recommendedValue === true ? ' [recommended]' : '';

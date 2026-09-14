@@ -68,6 +68,12 @@ try {
         options: [
           { id: 'files', label: 'Files', recommended: true },
           { id: 'db', label: 'Database' },
+          {
+            id: 'other',
+            label: 'Other',
+            allowCustomInput: true,
+            customInputPlaceholder: 'Describe the storage option',
+          },
         ],
       },
       {
@@ -100,6 +106,9 @@ try {
   });
   assert.equal(normalized.submitLabel, 'Submit');
   assert.equal(normalized.questions[0].required, true);
+  assert.equal(normalized.questions[0].options[2].allowCustomInput, true);
+  assert.equal(normalized.questions[0].options[2].customInputPlaceholder, 'Describe the storage option');
+  assert.equal('allowCustomInput' in normalized.questions[0].options[0], false);
   assert.equal(normalized.questions[2].maxLength, 2_000);
 
   assert.throws(
@@ -133,6 +142,25 @@ try {
     /At most one option may be marked recommended/,
   );
 
+  assert.throws(
+    () =>
+      interactionRequestSchema.parse({
+        title: 'Invalid custom input',
+        questions: [
+          {
+            id: 'choice',
+            kind: 'single_select',
+            prompt: 'Choose.',
+            options: [
+              { id: 'a', label: 'A', customInputPlaceholder: 'Explain A' },
+              { id: 'b', label: 'B' },
+            ],
+          },
+        ],
+      }),
+    /customInputPlaceholder requires allowCustomInput=true/,
+  );
+
   const generic = await connect('generic');
   try {
     const tools = await allToolPages(generic);
@@ -155,6 +183,8 @@ try {
     assert.equal(interactionTool._meta?.ui?.resourceUri, CHATGPT_INTERACTION_RESOURCE_URI);
     assert.equal(interactionTool._meta?.['ui/resourceUri'], CHATGPT_INTERACTION_RESOURCE_URI);
     assert.deepEqual(interactionTool._meta?.ui?.visibility, ['model']);
+    assert.match(JSON.stringify(interactionTool.inputSchema), /allowCustomInput/);
+    assert.match(JSON.stringify(interactionTool.inputSchema), /customInputPlaceholder/);
     const capabilities = parseJsonToolResult(await chatgpt.callTool({ name: 'capabilities', arguments: {} }));
     assert.equal(capabilities.mcp.nativeTools.includes(REQUEST_USER_INPUT_TOOL), true);
 
@@ -167,6 +197,10 @@ try {
     assert.match(content.text, /ui\/notifications\/initialized/);
     assert.match(content.text, /ui\/message/);
     assert.match(content.text, /2026-01-26/);
+    assert.match(content.text, /option\.allowCustomInput === true/);
+    assert.match(content.text, /data-custom-input/);
+    assert.match(content.text, /Please provide additional details/);
+    assert.match(content.text, /Custom value \[/);
 
     const scriptMatch = content.text.match(/<script>([\s\S]*?)<\/script>/i);
     assert.ok(scriptMatch, 'interaction UI script missing');
@@ -185,6 +219,12 @@ try {
             options: [
               { id: 'git', label: 'Git' },
               { id: 'external', label: 'External storage', recommended: true },
+              {
+                id: 'other',
+                label: 'Other',
+                allowCustomInput: true,
+                customInputPlaceholder: 'Describe another storage strategy',
+              },
             ],
           },
         ],
@@ -195,6 +235,12 @@ try {
     assert.equal(result.structuredContent?.schemaVersion, 1);
     assert.match(result.structuredContent?.interactionId ?? '', /^[0-9a-f-]{36}$/i);
     assert.equal(result.structuredContent?.request?.questions?.[0]?.required, true);
+    assert.equal(result.structuredContent?.request?.questions?.[0]?.options?.[2]?.allowCustomInput, true);
+    assert.equal(
+      result.structuredContent?.request?.questions?.[0]?.options?.[2]?.customInputPlaceholder,
+      'Describe another storage strategy',
+    );
+    assert.match(result.content?.[0]?.text ?? '', /custom input required/);
     assert.match(result.content?.[0]?.text ?? '', /Wait for the user response/);
   } finally {
     await chatgpt.close().catch(() => {});
