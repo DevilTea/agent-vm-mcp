@@ -537,7 +537,7 @@ async function createServer() {
     'apply_patch',
     {
       description:
-        'Apply a strict standard unified diff relative to cwd. All hunks are validated before mutation; context mismatch rejects the entire patch without fuzzy or partial fallback.',
+        'Apply a strict standard unified diff relative to cwd. Accepts cwd-relative file headers (for example --- src/file / +++ src/file) and conventional git a/ and b/ prefixes. Do not mix path styles within one patch. All hunks are validated before mutation; context mismatch rejects the entire patch without fuzzy or partial fallback.',
       inputSchema: z.object({
         patch: z.string().min(1).describe('Standard unified diff to validate and apply.'),
         cwd: z.string().optional().describe('Patch root directory. Defaults to the agent user home directory.'),
