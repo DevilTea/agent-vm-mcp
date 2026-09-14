@@ -89,9 +89,11 @@ Examples of unavailable integrations include a missing stdio executable, connect
 
 Invalid JSON, unsupported config versions, duplicate bridge IDs, invalid adapter/policy configuration, unsupported transport definitions, and deterministic exported-tool collisions are startup errors. Partial bridge initialization is rolled back before the error escapes.
 
-## Dot-agents skill projection
+## MCP Skills (SEP-2640)
 
-The native `skill_list` and `skill_read` tools consume only the dot-agents host-facing projection. They do not scan harness directories and do not infer or expose Codex system skills. The projection is published as a version 1 directory containing `catalog.json` and `skills/<name>/...`; the catalog `source` must be `dot-agents`.
+The canonical MCP-facing skill surface follows the [Final SEP-2640: Skills Extension](https://github.com/modelcontextprotocol/modelcontextprotocol/pull/2640): the server declares the `io.modelcontextprotocol/skills` extension and exposes `skills/list`, `skills/get`, standard `resources/read`, and `resources/directory/read`. Skill identity is its URI, using `skill://<skill-name>` for a skill root and `skill://<skill-name>/<path>` for files and directories. Listings include complete parsed `SKILL.md` frontmatter and a digest/size manifest for every regular file; reads are lazy and bounded by the SEP limits.
+
+The dot-agents projection is an internal publication snapshot, not a second protocol model. It is a version 1 directory containing `catalog.json` and `skills/<name>/...`; the catalog `source` must be `dot-agents`, and its tree hash is verified before content is served. Filesystem paths are never exposed.
 
 The default projection root is:
 
@@ -99,9 +101,7 @@ The default projection root is:
 ${XDG_DATA_HOME:-$HOME/.local/share}/dot-agents/skill-projection/v1/
 ```
 
-Set `AGENT_MCP_SKILL_PROJECTION_ROOT` to use another projection root. `skill_list` returns the projection availability, root source, and catalog entries without filesystem paths. Its optional `query` is a case-insensitive substring filter over skill names and descriptions. When reusable guidance may apply, the host should inspect `skill_list`, then call `skill_read` for the relevant `SKILL.md` before acting.
-
-`skill_read` defaults to `SKILL.md` and can read bounded UTF-8 text from safe relative paths under the named skill, including references and scripts as text. It rejects traversal, symlink/escape paths, binary or non-UTF-8 content, and oversized files. Missing or invalid projections produce an explicit unavailable result and do not prevent MCP startup. Projection content is instructions/data, not executable capability.
+Set `AGENT_MCP_SKILL_PROJECTION_ROOT` to use another projection root. The native `skill_list` and `skill_read` tools remain exposed as compatibility fallbacks for current ChatGPT behavior and delegate to the same validated registry where possible. They do not scan harness directories or infer or expose Codex system skills. Their optional `query` is a case-insensitive substring filter over skill names and descriptions; `skill_read` defaults to `SKILL.md` and reads bounded UTF-8 text from safe relative paths. Missing or invalid projections fail soft for this compatibility surface and do not prevent MCP startup. This repository has not verified that ChatGPT natively consumes SEP-2640, so no native-consumption support is claimed. Projection content is instructions/data, not executable capability.
 
 ## Structured user input
 

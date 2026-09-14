@@ -80,7 +80,7 @@ function parseToolResult(result) {
   return JSON.parse(text);
 }
 
-const alphaContent = '# Alpha\nUse the alpha playbook.\n';
+const alphaContent = '---\nname: alpha\ndescription: Alpha reusable guidance\n---\n# Alpha\nUse the alpha playbook.\n';
 const guideContent = 'Read this reference when the alpha playbook points here.\n';
 const scriptContent = '#!/bin/sh\nprintf text-only\n';
 
