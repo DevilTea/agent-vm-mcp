@@ -36,6 +36,7 @@ import { registerArtifactSystem } from './artifacts/register.js';
 import { ExecOutputCapture } from './exec-output.js';
 import { assertNoRawCodingHarnessLaunch } from './coding-harness-guard.js';
 import { resolveHostProfile } from './host-profile.js';
+import { interactionToolNamesForHost, registerInteractionsForHost } from './interactions/index.js';
 import {
   SERVER_INFO_TOOL,
   ToolCatalogTracker,
@@ -394,7 +395,7 @@ async function stopManagedProcesses() {
 
 const activeBridgeManagers = new Set();
 const activeArtifactStores = new Set();
-const NATIVE_TOOL_NAMES = new Set([
+const BASE_NATIVE_TOOL_NAMES = new Set([
   'exec',
   'read_file',
   'list_directory',
@@ -447,6 +448,10 @@ for (const signal of ['SIGTERM', 'SIGINT']) {
 
 async function createServer() {
   const hostProfile = resolveHostProfile();
+  const nativeToolNames = new Set([
+    ...BASE_NATIVE_TOOL_NAMES,
+    ...interactionToolNamesForHost(hostProfile),
+  ]);
   const catalogTracker = new ToolCatalogTracker();
   const server = catalogTracker.instrument(new McpServer({
     name: SERVER_NAME,
@@ -460,6 +465,7 @@ async function createServer() {
   const artifactStore = new ArtifactStore();
   activeArtifactStores.add(artifactStore);
   await registerArtifactSystem(server, artifactStore);
+  registerInteractionsForHost(server, hostProfile);
 
   server.registerTool(
     'exec',
@@ -906,7 +912,7 @@ async function createServer() {
 
   const bridgeManager = new McpBridgeManager({
     server,
-    reservedToolNames: new Set(NATIVE_TOOL_NAMES),
+    reservedToolNames: new Set(nativeToolNames),
     adapterFactory: createBridgeToolAdapterFactory({ artifactStore }),
     policyFactory: createBridgeCallPolicyFactory(),
     bridgeValidator: (bridge) => {
@@ -949,7 +955,7 @@ async function createServer() {
     async () =>
       jsonResult(
         await collectCapabilities({
-          nativeTools: NATIVE_TOOL_NAMES,
+          nativeTools: nativeToolNames,
           bridgeStatus: bridgeManager.status(),
         }),
       ),

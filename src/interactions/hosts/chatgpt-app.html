@@ -1,0 +1,517 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Structured user input</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      font-family: var(--font-sans, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif);
+      background: transparent;
+      color: var(--color-text-primary, CanvasText);
+    }
+
+    * { box-sizing: border-box; }
+    html, body { margin: 0; padding: 0; background: transparent; }
+    body { padding: 12px; }
+
+    .card {
+      display: grid;
+      gap: 14px;
+      max-width: 760px;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: 1rem;
+      line-height: 1.4;
+      font-weight: 650;
+    }
+
+    .description,
+    .question-description,
+    .option-description,
+    .status {
+      color: var(--color-text-secondary, GrayText);
+    }
+
+    .description,
+    .question-description {
+      margin: 4px 0 0;
+      font-size: 0.9rem;
+      line-height: 1.45;
+      white-space: pre-wrap;
+    }
+
+    fieldset {
+      border: 0;
+      padding: 0;
+      margin: 0;
+      display: grid;
+      gap: 8px;
+    }
+
+    legend {
+      padding: 0;
+      font-size: 0.94rem;
+      line-height: 1.4;
+      font-weight: 600;
+    }
+
+    .required::after { content: " *"; }
+
+    .options {
+      display: grid;
+      gap: 7px;
+    }
+
+    .option {
+      display: grid;
+      grid-template-columns: auto 1fr;
+      gap: 8px;
+      align-items: start;
+      padding: 9px 10px;
+      border: 1px solid var(--color-border-default, color-mix(in srgb, CanvasText 18%, transparent));
+      border-radius: 10px;
+      cursor: pointer;
+      background: var(--color-background-secondary, color-mix(in srgb, Canvas 96%, CanvasText 4%));
+    }
+
+    .option:hover {
+      border-color: var(--color-border-emphasis, color-mix(in srgb, CanvasText 35%, transparent));
+    }
+
+    .option input { margin: 3px 0 0; }
+    .option-main { min-width: 0; }
+    .option-label { font-size: 0.92rem; line-height: 1.35; }
+    .option-description { margin-top: 2px; font-size: 0.8rem; line-height: 1.35; }
+
+    .recommended {
+      display: inline-block;
+      margin-left: 6px;
+      padding: 1px 6px;
+      border-radius: 999px;
+      font-size: 0.72rem;
+      font-weight: 600;
+      color: var(--color-text-info, HighlightText);
+      background: var(--color-background-info, Highlight);
+      vertical-align: 1px;
+    }
+
+    input[type="text"],
+    textarea {
+      width: 100%;
+      border: 1px solid var(--color-border-default, color-mix(in srgb, CanvasText 18%, transparent));
+      border-radius: 9px;
+      padding: 9px 10px;
+      font: inherit;
+      color: inherit;
+      background: var(--color-background-primary, Canvas);
+      resize: vertical;
+    }
+
+    textarea { min-height: 88px; }
+
+    .error {
+      min-height: 1.2em;
+      font-size: 0.8rem;
+      color: var(--color-text-danger, #b42318);
+    }
+
+    .actions {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    button {
+      appearance: none;
+      border: 0;
+      border-radius: 9px;
+      padding: 8px 13px;
+      font: inherit;
+      font-weight: 600;
+      color: var(--color-text-on-emphasis, HighlightText);
+      background: var(--color-background-inverse, Highlight);
+      cursor: pointer;
+    }
+
+    button:disabled { opacity: 0.55; cursor: default; }
+    .status { font-size: 0.82rem; }
+
+    .fatal {
+      padding: 10px;
+      border: 1px solid var(--color-border-danger, #d92d20);
+      border-radius: 9px;
+      color: var(--color-text-danger, #b42318);
+      white-space: pre-wrap;
+    }
+  </style>
+</head>
+<body>
+  <main id="root" class="card" aria-live="polite"></main>
+
+  <script>
+    (() => {
+      'use strict';
+
+      const APP_PROTOCOL_VERSION = '2026-01-26';
+      const pending = new Map();
+      let nextRequestId = 1;
+      let initialized = false;
+      let latestInput = null;
+      let latestResult = null;
+      let resizeObserver = null;
+
+      const root = document.getElementById('root');
+
+      function post(message) {
+        window.parent.postMessage({ jsonrpc: '2.0', ...message }, '*');
+      }
+
+      function request(method, params) {
+        const id = nextRequestId++;
+        post({ id, method, params });
+        return new Promise((resolve, reject) => {
+          pending.set(id, { resolve, reject });
+        });
+      }
+
+      function notify(method, params = {}) {
+        post({ method, params });
+      }
+
+      function text(value) {
+        return value == null ? '' : String(value);
+      }
+
+      function setHostContext(hostContext) {
+        const theme = hostContext?.theme;
+        if (theme === 'light' || theme === 'dark') {
+          document.documentElement.dataset.theme = theme;
+          document.documentElement.style.colorScheme = theme;
+        }
+        const variables = hostContext?.styles?.variables;
+        if (variables && typeof variables === 'object') {
+          for (const [name, value] of Object.entries(variables)) {
+            if (typeof value === 'string') document.documentElement.style.setProperty(name, value);
+          }
+        }
+      }
+
+      function sendSize() {
+        if (!initialized) return;
+        const rect = document.documentElement.getBoundingClientRect();
+        notify('ui/notifications/size-changed', {
+          width: Math.ceil(window.innerWidth),
+          height: Math.ceil(rect.height),
+        });
+      }
+
+      function startResizeObserver() {
+        if (typeof ResizeObserver !== 'function' || resizeObserver) return;
+        resizeObserver = new ResizeObserver(() => requestAnimationFrame(sendSize));
+        resizeObserver.observe(document.documentElement);
+        resizeObserver.observe(document.body);
+      }
+
+      function currentPayload() {
+        const result = latestResult?.structuredContent;
+        if (result?.request) return result;
+        const args = latestInput?.arguments;
+        if (args?.questions) {
+          return {
+            schemaVersion: 1,
+            interactionId: null,
+            request: args,
+          };
+        }
+        return null;
+      }
+
+      function make(tag, className, value) {
+        const node = document.createElement(tag);
+        if (className) node.className = className;
+        if (value !== undefined) node.textContent = text(value);
+        return node;
+      }
+
+      function recommendationBadge() {
+        return make('span', 'recommended', 'Recommended');
+      }
+
+      function optionRow(question, option, inputType) {
+        const label = make('label', 'option');
+        const input = document.createElement('input');
+        input.type = inputType;
+        input.name = question.id;
+        input.value = option.id;
+        label.append(input);
+
+        const main = make('span', 'option-main');
+        const heading = make('span', 'option-label', option.label);
+        if (option.recommended) heading.append(recommendationBadge());
+        main.append(heading);
+        if (option.description) main.append(make('div', 'option-description', option.description));
+        label.append(main);
+        return { label, input };
+      }
+
+      function booleanRow(question, value, labelText) {
+        return optionRow(
+          question,
+          {
+            id: value ? 'true' : 'false',
+            label: labelText,
+            recommended: question.recommendedValue === value,
+          },
+          'radio',
+        );
+      }
+
+      function renderQuestion(question, index) {
+        const section = document.createElement('fieldset');
+        section.dataset.questionId = question.id;
+        section.dataset.kind = question.kind;
+        section.dataset.required = question.required === false ? 'false' : 'true';
+
+        const legend = make('legend', question.required === false ? '' : 'required', `${index + 1}. ${question.prompt}`);
+        section.append(legend);
+        if (question.description) section.append(make('p', 'question-description', question.description));
+
+        if (question.kind === 'single_select' || question.kind === 'multi_select') {
+          const options = make('div', 'options');
+          for (const option of question.options ?? []) {
+            const { label } = optionRow(question, option, question.kind === 'single_select' ? 'radio' : 'checkbox');
+            options.append(label);
+          }
+          section.append(options);
+          section.dataset.minSelections = String(question.minSelections ?? 0);
+          section.dataset.maxSelections = question.maxSelections == null ? '' : String(question.maxSelections);
+        } else if (question.kind === 'boolean') {
+          const options = make('div', 'options');
+          options.append(booleanRow(question, true, question.trueLabel ?? 'Yes').label);
+          options.append(booleanRow(question, false, question.falseLabel ?? 'No').label);
+          section.append(options);
+        } else if (question.kind === 'text') {
+          const input = document.createElement(question.multiline ? 'textarea' : 'input');
+          if (!question.multiline) input.type = 'text';
+          input.name = question.id;
+          input.maxLength = Number(question.maxLength ?? 2000);
+          if (question.placeholder) input.placeholder = question.placeholder;
+          section.append(input);
+        }
+
+        const error = make('div', 'error');
+        error.dataset.errorFor = question.id;
+        section.append(error);
+        return section;
+      }
+
+      function selectedLabels(question, values) {
+        const byId = new Map((question.options ?? []).map((option) => [option.id, option.label]));
+        return values.map((value) => byId.get(value) ?? value);
+      }
+
+      function collectAnswers(requestData, form) {
+        const answers = [];
+        let valid = true;
+
+        for (const question of requestData.questions) {
+          const fieldset = form.querySelector(`[data-question-id="${CSS.escape(question.id)}"]`);
+          const error = fieldset.querySelector(`[data-error-for="${CSS.escape(question.id)}"]`);
+          error.textContent = '';
+          const required = question.required !== false;
+
+          if (question.kind === 'single_select') {
+            const checked = fieldset.querySelector(`input[name="${CSS.escape(question.id)}"]:checked`);
+            if (!checked && required) {
+              error.textContent = 'Please select an option.';
+              valid = false;
+              continue;
+            }
+            const value = checked?.value ?? null;
+            answers.push({
+              questionId: question.id,
+              kind: question.kind,
+              value,
+              labels: value == null ? [] : selectedLabels(question, [value]),
+            });
+          } else if (question.kind === 'multi_select') {
+            const values = [...fieldset.querySelectorAll(`input[name="${CSS.escape(question.id)}"]:checked`)].map((input) => input.value);
+            const minSelections = Math.max(required ? 1 : 0, Number(question.minSelections ?? 0));
+            const maxSelections = question.maxSelections == null ? Infinity : Number(question.maxSelections);
+            if (values.length < minSelections) {
+              error.textContent = `Select at least ${minSelections} option${minSelections === 1 ? '' : 's'}.`;
+              valid = false;
+              continue;
+            }
+            if (values.length > maxSelections) {
+              error.textContent = `Select at most ${maxSelections} options.`;
+              valid = false;
+              continue;
+            }
+            answers.push({
+              questionId: question.id,
+              kind: question.kind,
+              value: values,
+              labels: selectedLabels(question, values),
+            });
+          } else if (question.kind === 'boolean') {
+            const checked = fieldset.querySelector(`input[name="${CSS.escape(question.id)}"]:checked`);
+            if (!checked && required) {
+              error.textContent = 'Please choose yes or no.';
+              valid = false;
+              continue;
+            }
+            const value = checked ? checked.value === 'true' : null;
+            const label = value === null ? null : value ? question.trueLabel ?? 'Yes' : question.falseLabel ?? 'No';
+            answers.push({ questionId: question.id, kind: question.kind, value, labels: label == null ? [] : [label] });
+          } else if (question.kind === 'text') {
+            const input = fieldset.querySelector(`[name="${CSS.escape(question.id)}"]`);
+            const value = input.value.trim();
+            if (!value && required) {
+              error.textContent = 'Please enter a response.';
+              valid = false;
+              continue;
+            }
+            answers.push({ questionId: question.id, kind: question.kind, value: value || null, labels: [] });
+          }
+        }
+
+        return { valid, answers };
+      }
+
+      function responseText(payload, answers) {
+        const requestData = payload.request;
+        const lines = [`Structured response: ${requestData.title}`];
+        if (payload.interactionId) lines.push(`Interaction ID: ${payload.interactionId}`);
+        lines.push('');
+
+        const answerById = new Map(answers.map((answer) => [answer.questionId, answer]));
+        requestData.questions.forEach((question, index) => {
+          const answer = answerById.get(question.id);
+          lines.push(`${index + 1}. ${question.prompt}`);
+          if (!answer || answer.value == null || (Array.isArray(answer.value) && answer.value.length === 0)) {
+            lines.push('   Answer: (no response)');
+            return;
+          }
+          if (answer.kind === 'text') {
+            lines.push(`   Answer: ${answer.value}`);
+          } else if (Array.isArray(answer.labels) && answer.labels.length > 0) {
+            lines.push(`   Answer: ${answer.labels.join(', ')}`);
+            const raw = Array.isArray(answer.value) ? answer.value.join(', ') : String(answer.value);
+            lines.push(`   Value: ${raw}`);
+          } else {
+            lines.push(`   Answer: ${String(answer.value)}`);
+          }
+        });
+
+        return lines.join('\n');
+      }
+
+      async function submitForm(payload, form, submitButton, status) {
+        const { valid, answers } = collectAnswers(payload.request, form);
+        if (!valid) {
+          sendSize();
+          return;
+        }
+
+        submitButton.disabled = true;
+        status.textContent = 'Sending…';
+        try {
+          const message = responseText(payload, answers);
+          await request('ui/message', {
+            role: 'user',
+            content: [{ type: 'text', text: message }],
+          });
+          for (const input of form.querySelectorAll('input, textarea, button')) input.disabled = true;
+          status.textContent = 'Submitted.';
+        } catch (error) {
+          submitButton.disabled = false;
+          status.textContent = `Could not send response: ${error?.message ?? error}`;
+        } finally {
+          sendSize();
+        }
+      }
+
+      function render() {
+        const payload = currentPayload();
+        if (!payload?.request?.questions) return;
+
+        root.replaceChildren();
+        root.append(make('h1', '', payload.request.title));
+        if (payload.request.description) root.append(make('p', 'description', payload.request.description));
+
+        const form = document.createElement('form');
+        form.className = 'card';
+        payload.request.questions.forEach((question, index) => form.append(renderQuestion(question, index)));
+
+        const actions = make('div', 'actions');
+        const submitButton = make('button', '', payload.request.submitLabel ?? 'Submit');
+        submitButton.type = 'submit';
+        const status = make('span', 'status');
+        if (!payload.interactionId) {
+          submitButton.disabled = true;
+          status.textContent = 'Preparing…';
+        }
+        actions.append(submitButton, status);
+        form.append(actions);
+        form.addEventListener('submit', (event) => {
+          event.preventDefault();
+          void submitForm(payload, form, submitButton, status);
+        });
+        root.append(form);
+        requestAnimationFrame(sendSize);
+      }
+
+      function showFatal(error) {
+        root.replaceChildren(make('div', 'fatal', `Unable to initialize interaction UI.\n${error?.message ?? error}`));
+      }
+
+      window.addEventListener('message', (event) => {
+        if (event.source !== window.parent) return;
+        const message = event.data;
+        if (!message || message.jsonrpc !== '2.0') return;
+
+        if (message.id !== undefined && pending.has(message.id)) {
+          const waiter = pending.get(message.id);
+          pending.delete(message.id);
+          if (message.error) waiter.reject(new Error(message.error.message ?? 'Host request failed'));
+          else waiter.resolve(message.result);
+          return;
+        }
+
+        if (message.method === 'ui/notifications/tool-input') {
+          latestInput = message.params;
+          render();
+        } else if (message.method === 'ui/notifications/tool-result') {
+          latestResult = message.params;
+          render();
+        } else if (message.method === 'ui/notifications/host-context-changed') {
+          setHostContext(message.params);
+        }
+      }, { passive: true });
+
+      void (async () => {
+        try {
+          const result = await request('ui/initialize', {
+            appInfo: { name: 'Agent VM structured user input', version: '1.0.0' },
+            appCapabilities: { availableDisplayModes: ['inline'] },
+            protocolVersion: APP_PROTOCOL_VERSION,
+          });
+          setHostContext(result?.hostContext);
+          notify('ui/notifications/initialized');
+          initialized = true;
+          startResizeObserver();
+          render();
+          sendSize();
+        } catch (error) {
+          showFatal(error);
+        }
+      })();
+    })();
+  </script>
+</body>
+</html>

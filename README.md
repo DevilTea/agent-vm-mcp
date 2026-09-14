@@ -72,7 +72,7 @@ The main configuration files are:
 | System audit | `system-audit.json` | `AGENT_MCP_SYSTEM_AUDIT_CONFIG` |
 | Shared Playwright stdio proxy | `playwright-shared-proxy.json` | `PLAYWRIGHT_SHARED_PROXY_CONFIG` |
 
-`AGENT_MCP_HOST` selects connection/deployment-specific host behavior. Supported values are `generic` (default) and `chatgpt`. Host-specific extensions are kept out of ordinary tool inputs; for example, ChatGPT file-input metadata is attached to `import_file` only when `AGENT_MCP_HOST=chatgpt`.
+`AGENT_MCP_HOST` selects connection/deployment-specific host behavior. Supported values are `generic` (default) and `chatgpt`. Host-specific extensions are kept out of ordinary tool inputs; for example, ChatGPT file-input metadata is attached to `import_file` only when `AGENT_MCP_HOST=chatgpt`. The ChatGPT profile also enables the structured interaction adapter described below.
 
 See [`config/README.md`](config/README.md) for bridge schema, fail-soft/fail-hard behavior, adapters, policies, capability discovery, system-audit configuration, and deployment examples.
 
@@ -87,6 +87,15 @@ The contract is:
 Examples of unavailable integrations include a missing stdio executable, connection refusal, an offline HTTP service, or an upstream handshake/tool-list failure. Those bridges are reported as `state: "unavailable"` by `mcp_bridge_status`, while other bridges and the native core continue.
 
 Invalid JSON, unsupported config versions, duplicate bridge IDs, invalid adapter/policy configuration, unsupported transport definitions, and deterministic exported-tool collisions are startup errors. Partial bridge initialization is rolled back before the error escapes.
+
+
+## Structured user input
+
+The interaction model is host-neutral. It currently supports single-select, multi-select, free-text, and boolean questions, with stable question/option IDs and optional recommendations. Host-specific rendering is implemented by adapters rather than encoded in the core request schema.
+
+When `AGENT_MCP_HOST=chatgpt`, the server exposes `request_user_input` and binds it to an MCP Apps resource at `ui://agent-vm/request-user-input/v1.html`. The ChatGPT adapter uses the standard MCP Apps `ui/*` bridge and submits the completed form through `ui/message`, making the answers the next user turn. The tool result also contains a plain-text fallback, so the request remains understandable if the UI cannot render.
+
+The generic host does not expose `request_user_input` yet. Future hosts can register their own adapter against the same interaction model without adding host-specific fields to the public schema. The interaction tool itself is stateless: each call returns an immutable interaction ID and request payload, while the host carries the eventual user response in a later turn.
 
 ## Artifacts and host presentation
 
