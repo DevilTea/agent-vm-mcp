@@ -1328,15 +1328,17 @@ try {
   if (!legacyDescription || legacyDescription.lifecycle !== 'active' || legacyDescription.legacy !== true || legacyDescription.resumable !== false) {
     throw new Error('Legacy active agent was not exposed as active non-resumable metadata');
   }
-  if ((await legacyModule.agentGet({ agentId: legacyId })).legacy !== true) throw new Error('Legacy agent get behavior was not preserved');
-  if (!(await legacyModule.agentRead({ agentId: legacyId, source: 'visible', lines: 20 })).text.includes('LEGACY READY')) {
-    throw new Error('Legacy agent read behavior was not preserved');
-  }
-  try {
-    await legacyModule.agentSuspend({ agentId: legacyId });
-    throw new Error('Legacy agent was unexpectedly suspendable');
-  } catch (error) {
-    if (error?.code !== 'agent_native_session_unavailable') throw error;
+  for (const operation of [
+    () => legacyModule.agentGet({ agentId: legacyId }),
+    () => legacyModule.agentRead({ agentId: legacyId, source: 'visible', lines: 20 }),
+    () => legacyModule.agentSuspend({ agentId: legacyId }),
+  ]) {
+    try {
+      await operation();
+      throw new Error('Legacy Codex agent unexpectedly remained usable without durable policy provenance');
+    } catch (error) {
+      if (error?.code !== 'agent_codex_policy_unverified') throw error;
+    }
   }
   await legacyModule.agentStop({ agentId: legacyId });
 
