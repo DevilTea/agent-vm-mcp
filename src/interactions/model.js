@@ -62,7 +62,7 @@ function withUniqueOptions(schema) {
 
 const commonQuestionShape = {
   id: identifierSchema,
-  prompt: z.string().min(1).max(600),
+  prompt: z.string().min(1).max(600).describe('Question text without ordinal numbering; the host UI numbers questions for display.'),
   description: z.string().min(1).max(1_200).optional(),
   required: z.boolean().default(true),
 };
