@@ -594,7 +594,7 @@ async function createServer() {
     'agent_capabilities',
     {
       description:
-        'Discover the Herdr agent runtime, configured persistent session, installed coding harnesses, active and suspended MCP-managed logical agents, native/runtime IDs, lifecycle states, resumability/legacy status, per-harness launch policy, installed skills, and resume support.',
+        'Discover the Herdr agent runtime, configured persistent session, installed coding harnesses, active/suspended/quarantined MCP-managed logical agents, native/runtime IDs, lifecycle states, resumability/legacy status, fixed MCP-managed Codex launch/downstream policy, installed skills, and resume support.',
       inputSchema: z.object({}),
     },
     async (_args, ctx) => jsonResult(await agentCapabilities({ signal: ctx.mcpReq.signal })),
@@ -604,15 +604,15 @@ async function createServer() {
     'agent_start',
     {
       description:
-        'Start a persistent interactive coding agent in a dedicated Herdr workspace. Use this, not exec or process_start, for coding-harness work; it is required for long-running, parallel, or cross-turn Codex/agy/Claude tasks. A deployment may enforce a fixed harness model/effort; inspect agent_capabilities.launchPolicy before choosing overrides. Production persistence requires the separately managed Herdr service; startup trust/auth prompts are reported, never auto-approved.',
+        'Start a persistent interactive coding agent in a dedicated Herdr workspace. Use this, not exec or process_start, for coding-harness work; it is required for long-running, parallel, or cross-turn Codex/agy/Claude tasks. MCP-managed Codex is always fixed to gpt-5.6-luna/max: omitted values are injected, the exact pair is accepted, and other explicit model/effort values are rejected. Production persistence requires the separately managed Herdr service; startup trust/auth prompts are reported, never auto-approved.',
       inputSchema: z.object({
         harness: z.enum(['codex', 'agy', 'claude']).describe('Coding harness to launch.'),
         cwd: z.string().min(1).describe('Existing directory to use as the agent workspace.'),
-        model: z.string().min(1).max(128).optional().describe('Optional harness model override; deployment launch policy may restrict or force this value.'),
+        model: z.string().min(1).max(128).optional().describe('Optional harness model override. For MCP-managed Codex, omission injects gpt-5.6-luna and any other explicit value is rejected.'),
         effort: z
           .enum(['low', 'medium', 'high', 'xhigh', 'max', 'ultra'])
           .optional()
-          .describe('Optional reasoning-effort override; supported values vary by harness and deployment launch policy may restrict or force this value.'),
+          .describe('Optional reasoning-effort override. For MCP-managed Codex, omission injects max and any other explicit value is rejected; other harnesses retain their existing behavior.'),
         timeoutMs: z
           .number()
           .int()
@@ -660,7 +660,7 @@ async function createServer() {
     'agent_prompt',
     {
       description:
-        'Submit a task to an MCP-managed coding agent after a positive readiness check. Preflight or pre-spawn rejection is not submitted; timeout/cancellation after Herdr starts is possibly submitted and unsafe to auto-retry.',
+        'Submit a task to an MCP-managed coding agent after a positive readiness check. Definite preflight rejection is not submitted; if another prompt is already in flight or timeout/cancellation occurs after Herdr starts, submission is uncertain/possibly submitted and unsafe to auto-retry.',
       inputSchema: z.object({
         agentId: agentIdSchema,
         task: z.string().min(1).max(100_000).refine((task) => !task.includes('\0'), 'task must not contain NUL characters'),
@@ -709,7 +709,7 @@ async function createServer() {
     'agent_resume',
     {
       description:
-        'Resume a suspended logical coding-agent session by creating a fresh Herdr workspace and launching the harness with its verified native session/conversation ID. This continues the same conversation; start a new agent for independent work. Fails clearly when native resume is unavailable.',
+        'Resume a suspended logical coding-agent session by creating a fresh Herdr workspace and launching the harness with its verified native session/conversation ID. This continues the same conversation; start a new agent for independent work. MCP-managed Codex resumes require verified fixed-policy provenance and launch at gpt-5.6-luna/max; absent or mismatched provenance is quarantined and fails closed. Fails clearly when native resume is unavailable.',
       inputSchema: z.object({ agentId: agentIdSchema }),
     },
     async (args, ctx) => jsonResult(await agentResume(args, ctx.mcpReq.signal)),

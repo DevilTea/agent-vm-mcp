@@ -169,9 +169,12 @@ Relevant settings include:
 - `AGENT_HERDR_BIN` — optional Herdr executable override;
 - `AGENT_HERDR_BOOTSTRAP` — `auto` or `external`;
 - `AGENT_STATE_DIR` — optional durable logical-agent metadata directory;
-- `AGENT_CODEX_ENFORCED_MODEL` + `AGENT_CODEX_ENFORCED_EFFORT` — optional paired Codex launch policy. When both are set, omitted Codex overrides are filled with these values and any explicit mismatch is rejected; resume uses the same policy. `agent_capabilities` reports the effective policy.
+- MCP-managed Codex policy — every Codex session launched or resumed through `agent_start`/`agent_resume` is fixed to `gpt-5.6-luna` with reasoning effort `max`. Omitting model/effort injects those values; the exact pair is accepted; any other explicit value is rejected. This invariant is built into the MCP runtime and is not controlled by deployment environment variables.
+- MCP-managed Codex provenance — each logical Codex agent gets a durable policy/profile fingerprint. Missing or mismatched provenance fails closed and is quarantined; `agent_stop` retains the exact-ownership cleanup path for the resulting runtime.
+- MCP-managed Codex downstream defaults — the session-scoped Codex profile sets subagent defaults and managed developer instructions requiring delegated Codex, including `x-review`, to remain `gpt-5.6-luna`/`max`. Codex CLI 0.153.2 has no immutable deny-override primitive, so an explicit in-session subagent override remains a documented residual limitation.
+- Ordinary/manual Codex processes outside MCP-managed `agent_start`/`agent_resume` sessions are out of this policy scope. Generic `exec`/`process_start` policy is unchanged.
 
-`agent_prompt` distinguishes submission certainty from whether retrying the same task is useful. A definitely unsubmitted request reports `submission.state="not_submitted"` and `retrySafe=true`; once prompt submission may have begun, ambiguous timeout/cancellation/failure is treated as `possibly_submitted` and is not safe to auto-retry.
+`agent_prompt` distinguishes submission certainty from whether retrying the same task is useful. A definitely unsubmitted request reports `submission.state="not_submitted"` and `retrySafe=true`; when another prompt is already in flight, or submission may have begun, the result is `possibly_submitted` and is not safe to auto-retry.
 
 Workspace trust, authentication, command approval, and similar harness interactions are surfaced to the caller. The runtime does not silently approve them.
 

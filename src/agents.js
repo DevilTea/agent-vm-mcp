@@ -2,7 +2,7 @@ import { spawn } from 'node:child_process';
 import { constants as fsConstants } from 'node:fs';
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 
 const DEFAULT_SESSION_NAME = 'agent-vm-mcp';
 const DEFAULT_COMMAND_TIMEOUT_MS = 30_000;
@@ -19,8 +19,15 @@ const SESSION_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const AGENT_ID_PATTERN = /^agent-[0-9a-f]{26}$/;
 const READY_STATUSES = new Set(['idle', 'done']);
 const BOOTSTRAP_MODES = new Set(['auto', 'external']);
-const LIFECYCLE_STATES = new Set(['active', 'suspending', 'suspended', 'resuming']);
+const AGENT_METADATA_VERSION = 2;
+const LIFECYCLE_STATES = new Set(['active', 'starting', 'suspending', 'suspended', 'resuming', 'quarantined']);
 const CODEX_SUPPORTED_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
+const CODEX_POLICY = Object.freeze({ model: 'gpt-5.6-luna', effort: 'max' });
+const CODEX_PROVENANCE_VERSION = 1;
+const CODEX_PROFILE_PREFIX = 'agent-vm-mcp-';
+const CODEX_PROFILE_SUFFIX = '.config.toml';
+const CODEX_MANAGED_DEVELOPER_INSTRUCTIONS =
+  'This is an agent-vm-mcp-managed Codex session. Every downstream Codex delegation, including x-review, must use model gpt-5.6-luna with reasoning effort max. This is the managed session policy and overrides model-routing defaults that would select Terra, Sol, or another effort. If a delegation API accepts model or reasoning_effort, pass gpt-5.6-luna and max explicitly.';
 
 let sessionBootstrapPromise = null;
 const promptAgentsInFlight = new Set();
@@ -52,24 +59,26 @@ function herdrSessionName() {
   return name;
 }
 
-function codexLaunchPolicy(env = process.env) {
-  const model = env.AGENT_CODEX_ENFORCED_MODEL?.trim() || null;
-  const effort = env.AGENT_CODEX_ENFORCED_EFFORT?.trim() || null;
-  if (model === null && effort === null) return { enforced: false };
-  if (model === null || effort === null) {
-    throw new Error('AGENT_CODEX_ENFORCED_MODEL and AGENT_CODEX_ENFORCED_EFFORT must be configured together.');
-  }
-  validateModel(model);
-  if (!CODEX_SUPPORTED_EFFORTS.includes(effort)) {
-    throw new Error(`AGENT_CODEX_ENFORCED_EFFORT must be one of: ${CODEX_SUPPORTED_EFFORTS.join(', ')}.`);
-  }
-  return { enforced: true, model, effort };
+function codexLaunchPolicy() {
+  return {
+    enforced: true,
+    scope: 'mcp-managed-agent_start-agent_resume',
+    model: CODEX_POLICY.model,
+    effort: CODEX_POLICY.effort,
+    downstream: {
+      model: CODEX_POLICY.model,
+      effort: CODEX_POLICY.effort,
+      enforcement: 'profile-defaults-and-managed-developer-instructions',
+      immutable: false,
+      residualLimitation:
+        'Codex CLI 0.153.2 has no immutable deny-override primitive for subagent model or reasoning effort; an explicit in-session subagent override can still bypass these defaults.',
+    },
+  };
 }
 
 function applyHarnessLaunchPolicy({ harness, model, effort }) {
   if (harness !== 'codex') return { model, effort };
   const policy = codexLaunchPolicy();
-  if (!policy.enforced) return { model, effort };
 
   if (model !== undefined && model !== policy.model) {
     const error = new Error(
@@ -103,14 +112,15 @@ function harnessDefinitions() {
       supportsEffort: true,
       startupGraceMs: 0,
       supportedEfforts: CODEX_SUPPORTED_EFFORTS,
-      buildArgs({ model, effort }) {
+      buildArgs({ model, effort, profile }) {
         const args = [];
         if (model) args.push('--model', model);
         if (effort) args.push('--config', `model_reasoning_effort=${JSON.stringify(effort)}`);
+        if (profile) args.push('--profile', profile);
         return args;
       },
-      buildResumeArgs({ nativeSessionId, model, effort }) {
-        return ['resume', nativeSessionId, ...this.buildArgs({ model, effort })];
+      buildResumeArgs({ nativeSessionId, model, effort, profile }) {
+        return ['resume', nativeSessionId, ...this.buildArgs({ model, effort, profile })];
       },
     },
     agy: {
@@ -168,7 +178,7 @@ async function readAgentMetadata() {
   try {
     const text = await fs.readFile(metadataPath(), 'utf8');
     const parsed = JSON.parse(text);
-    if (!parsed || parsed.version !== 1 || !parsed.agents || typeof parsed.agents !== 'object') {
+    if (!parsed || ![1, AGENT_METADATA_VERSION].includes(parsed.version) || !parsed.agents || typeof parsed.agents !== 'object') {
       throw new Error('Agent metadata has an unsupported format.');
     }
     for (const record of Object.values(parsed.agents)) {
@@ -176,9 +186,9 @@ async function readAgentMetadata() {
         throw new Error('Agent metadata contains an invalid logical-agent record.');
       }
     }
-    return parsed;
+    return { ...parsed, version: AGENT_METADATA_VERSION };
   } catch (error) {
-    if (error?.code === 'ENOENT') return { version: 1, agents: {} };
+    if (error?.code === 'ENOENT') return { version: AGENT_METADATA_VERSION, agents: {} };
     const wrapped = new Error(`Unable to read durable agent metadata: ${error.message}`);
     wrapped.code = 'agent_metadata_unreadable';
     throw wrapped;
@@ -299,10 +309,56 @@ async function closeExactlyOwnedWorkspace(runtimeAgentId, workspace, signal) {
   return true;
 }
 
+async function quarantineCodexRecord(record, reason, snapshot = null, signal) {
+  const next = {
+    ...record,
+    lifecycle: 'quarantined',
+    policyStatus: 'unverified',
+    quarantineReason: reason,
+    updatedAt: new Date().toISOString(),
+  };
+
+  if (snapshot && record.runtimeAgentId) {
+    const observation = runtimeObservation(snapshot, record);
+    if (observation === 'absent') {
+      next.runtimeAgentId = null;
+      next.runtimeWorkspaceId = null;
+    } else if (observation?.status === 'owned' || observation?.status === 'orphan') {
+      const closed = await closeExactlyOwnedWorkspace(record.runtimeAgentId, observation.workspace, signal);
+      if (closed) {
+        next.runtimeAgentId = null;
+        next.runtimeWorkspaceId = null;
+        next.lastRuntimeAgentId = record.runtimeAgentId;
+        next.lastWorkspaceId = observation.workspace.workspace_id;
+      } else {
+        next.quarantineRuntime = {
+          runtimeAgentId: record.runtimeAgentId,
+          workspaceId: observation.workspace.workspace_id,
+          closeAttempted: true,
+        };
+      }
+    } else if (observation === 'ambiguous') {
+      next.quarantineRuntime = {
+        runtimeAgentId: record.runtimeAgentId,
+        workspaceId: record.runtimeWorkspaceId ?? null,
+        closeAttempted: false,
+      };
+    }
+  }
+  return await updateAgentMetadata(record.agentId, next);
+}
+
 async function reconcileAgentMetadata(snapshot = null, signal) {
-  const metadata = await readAgentMetadata();
+  let metadata = await readAgentMetadata();
   if (!snapshot) return metadata;
   for (const record of Object.values(metadata.agents)) {
+    if (record.harness === 'codex' && ['active', 'starting', 'suspending', 'suspended', 'resuming'].includes(record.lifecycle)) {
+      const compliance = await verifyCodexProvenance(record);
+      if (!compliance.ok) {
+        await quarantineCodexRecord(record, compliance.reason, snapshot, signal);
+        continue;
+      }
+    }
     if (record.lifecycle !== 'suspending' && record.lifecycle !== 'resuming') continue;
     const observation = runtimeObservation(snapshot, record);
     if (observation?.status === 'orphan') {
@@ -338,13 +394,17 @@ async function reconcileAgentMetadata(snapshot = null, signal) {
       };
     });
   }
-  return await readAgentMetadata();
+  metadata = await readAgentMetadata();
+  return metadata;
 }
 
 async function reconcileBeforeOperation(signal) {
   const metadata = await readAgentMetadata();
   if (!Object.values(metadata.agents).some((record) => (
-    record.lifecycle === 'suspending' || record.lifecycle === 'resuming'
+    record.lifecycle === 'starting' ||
+    record.lifecycle === 'suspending' ||
+    record.lifecycle === 'resuming' ||
+    (record.harness === 'codex' && ['active', 'suspended'].includes(record.lifecycle))
   ))) return metadata;
   const snapshot = await snapshotOutcome({ signal, timeoutMs: 2_000 });
   return await reconcileAgentMetadata(snapshot.ok ? snapshot.result.snapshot : null, signal);
@@ -658,10 +718,10 @@ async function findRecentFiles(root, suffix) {
   return files;
 }
 
-async function captureNativeSessionSnapshot(harness, cwd) {
+async function captureNativeSessionSnapshot(harness, cwd, { codexHome = null } = {}) {
   const home = homeDirectory();
   if (harness === 'codex') {
-    const files = await findRecentFiles(path.join(home, '.codex', 'sessions'), '.jsonl');
+    const files = await findRecentFiles(path.join(codexHome ?? path.join(home, '.codex'), 'sessions'), '.jsonl');
     const sessions = new Map();
     for (const file of files) {
       let firstLine;
@@ -711,10 +771,10 @@ async function captureNativeSessionSnapshot(harness, cwd) {
   return new Map();
 }
 
-async function discoverNativeSessionId(before, harness, cwd, startedAt) {
+async function discoverNativeSessionId(before, harness, cwd, startedAt, options = {}) {
   let lastCandidates = [];
   for (let attempt = 0; attempt < 5; attempt += 1) {
-    const after = await captureNativeSessionSnapshot(harness, cwd);
+    const after = await captureNativeSessionSnapshot(harness, cwd, options);
     lastCandidates = [...after.values()].filter((candidate) => (
       !before.has(candidate.sessionId) && candidate.timestamp + 5_000 >= startedAt
     ));
@@ -768,6 +828,123 @@ function validateModel(model) {
   if (!model || model.length > 128 || model.includes('\0') || /[\r\n]/.test(model)) {
     throw new Error('model must be a non-empty single-line identifier up to 128 characters.');
   }
+}
+
+function codexHomeDirectory() {
+  const configured = process.env.CODEX_HOME?.trim();
+  return path.resolve(configured || path.join(homeDirectory(), '.codex'));
+}
+
+function codexProfileName(agentId) {
+  if (!AGENT_ID_PATTERN.test(agentId)) throw new Error(`Invalid MCP-managed agent ID for Codex profile: ${agentId}`);
+  return `${CODEX_PROFILE_PREFIX}${agentId}`;
+}
+
+function codexProfilePath(codexHome, profileName) {
+  return path.join(codexHome, `${profileName}${CODEX_PROFILE_SUFFIX}`);
+}
+
+function sha256Text(text) {
+  return createHash('sha256').update(text, 'utf8').digest('hex');
+}
+
+function codexProfileContent() {
+  return [
+    `model = ${JSON.stringify(CODEX_POLICY.model)}`,
+    `model_reasoning_effort = ${JSON.stringify(CODEX_POLICY.effort)}`,
+    `developer_instructions = ${JSON.stringify(CODEX_MANAGED_DEVELOPER_INSTRUCTIONS)}`,
+    '',
+    '[agents]',
+    `default_subagent_model = ${JSON.stringify(CODEX_POLICY.model)}`,
+    `default_subagent_reasoning_effort = ${JSON.stringify(CODEX_POLICY.effort)}`,
+    '',
+  ].join('\n');
+}
+
+async function prepareCodexProvenance(agentId) {
+  const codexHome = codexHomeDirectory();
+  const profileName = codexProfileName(agentId);
+  const profilePath = codexProfilePath(codexHome, profileName);
+  const content = codexProfileContent();
+  const profileSha256 = sha256Text(content);
+
+  await fs.mkdir(codexHome, { recursive: true, mode: 0o700 });
+  let existing = null;
+  try {
+    existing = await fs.readFile(profilePath, 'utf8');
+  } catch (error) {
+    if (error?.code !== 'ENOENT') throw error;
+  }
+  if (existing !== null && existing !== content) {
+    const conflict = new Error(`Codex managed profile already exists with different content: ${profilePath}`);
+    conflict.code = 'agent_codex_profile_conflict';
+    throw conflict;
+  }
+  if (existing === null) {
+    const temporaryPath = `${profilePath}.tmp-${process.pid}-${randomUUID()}`;
+    try {
+      await fs.writeFile(temporaryPath, content, { encoding: 'utf8', mode: 0o600 });
+      await fs.rename(temporaryPath, profilePath);
+    } catch (error) {
+      await fs.rm(temporaryPath, { force: true }).catch(() => {});
+      throw error;
+    }
+  }
+
+  return {
+    version: CODEX_PROVENANCE_VERSION,
+    managedBy: 'agent-vm-mcp',
+    policy: { ...CODEX_POLICY },
+    codexHome,
+    profileName,
+    profilePath,
+    profileSha256,
+    developerInstructionsSha256: sha256Text(CODEX_MANAGED_DEVELOPER_INSTRUCTIONS),
+  };
+}
+
+async function verifyCodexProvenance(record) {
+  const provenance = record?.codexProvenance;
+  if (record?.harness !== 'codex') return { ok: true };
+  if (record.model !== CODEX_POLICY.model || record.effort !== CODEX_POLICY.effort) {
+    return { ok: false, reason: 'durable root model/effort provenance does not match the fixed Codex policy.' };
+  }
+  if (
+    !provenance ||
+    provenance.version !== CODEX_PROVENANCE_VERSION ||
+    provenance.managedBy !== 'agent-vm-mcp' ||
+    provenance.policy?.model !== CODEX_POLICY.model ||
+    provenance.policy?.effort !== CODEX_POLICY.effort ||
+    typeof provenance.codexHome !== 'string' ||
+    !path.isAbsolute(provenance.codexHome) ||
+    provenance.codexHome !== codexHomeDirectory() ||
+    provenance.profileName !== codexProfileName(record.agentId) ||
+    provenance.profilePath !== codexProfilePath(provenance.codexHome, provenance.profileName) ||
+    typeof provenance.profileSha256 !== 'string' ||
+    provenance.developerInstructionsSha256 !== sha256Text(CODEX_MANAGED_DEVELOPER_INSTRUCTIONS)
+  ) {
+    return { ok: false, reason: 'durable Codex policy/profile provenance is absent or mismatched.' };
+  }
+
+  const expectedContent = codexProfileContent();
+  let content;
+  try {
+    content = await fs.readFile(provenance.profilePath, 'utf8');
+  } catch (error) {
+    return { ok: false, reason: `managed Codex profile could not be read: ${error.message}` };
+  }
+  if (content !== expectedContent || sha256Text(content) !== provenance.profileSha256) {
+    return { ok: false, reason: 'managed Codex profile fingerprint does not match the fixed policy.' };
+  }
+  return { ok: true, provenance };
+}
+
+function codexPolicyError(record, reason) {
+  const error = new Error(`MCP-managed Codex agent ${record?.agentId ?? 'unknown'} is quarantined: ${reason}`);
+  error.code = 'agent_codex_policy_unverified';
+  error.retryable = false;
+  error.policy = codexLaunchPolicy();
+  return error;
 }
 
 async function resolveCwd(cwd) {
@@ -922,13 +1099,17 @@ function normalizeAgent(agent, logical = null) {
     nativeSessionAttribution: logical?.nativeSessionAttribution ?? (logical ? 'unavailable' : 'legacy_backend_reported'),
     legacy: logical?.legacy ?? logical === null,
     resumable: Boolean(logical?.resumable ?? false),
+    ...(logical?.harness === 'codex' ? {
+      policyStatus: logical.policyStatus ?? 'unverified',
+      codexPolicy: logical.codexProvenance?.policy ?? null,
+    } : {}),
   };
 }
 
-function ownedAgentRecords(snapshot, metadata = { agents: {} }) {
-  const logicalByRuntimeId = new Map(
+function ownedAgentRecords(snapshot, metadata = { agents: {} }, { includeTransitional = false } = {}) {
+  const durableByRuntimeId = new Map(
     Object.values(metadata.agents ?? {})
-      .filter((record) => record?.lifecycle === 'active' && typeof record.runtimeAgentId === 'string')
+      .filter((record) => typeof record?.runtimeAgentId === 'string')
       .map((record) => [record.runtimeAgentId, record]),
   );
   const workspaceById = new Map(
@@ -940,13 +1121,19 @@ function ownedAgentRecords(snapshot, metadata = { agents: {} }) {
     .filter((agent) => {
       if (!AGENT_ID_PATTERN.test(agent.name ?? '')) return false;
       if (typeof agent.workspace_id !== 'string' || agent.workspace_id.length === 0) return false;
+      const durable = durableByRuntimeId.get(agent.name);
+      if (
+        durable &&
+        durable.lifecycle !== 'active' &&
+        !(includeTransitional && ['starting', 'suspending', 'resuming'].includes(durable.lifecycle))
+      ) return false;
       const workspace = workspaceById.get(agent.workspace_id);
       return Boolean(workspace && workspace.label === agent.name && workspace.workspace_id === agent.workspace_id);
     })
     .map((agent) => ({
       agent,
       workspace: workspaceById.get(agent.workspace_id),
-      logical: logicalByRuntimeId.get(agent.name) ?? (metadata.agents?.[agent.name]?.lifecycle === 'active' ? metadata.agents[agent.name] : null),
+      logical: durableByRuntimeId.get(agent.name) ?? (metadata.agents?.[agent.name]?.lifecycle === 'active' ? metadata.agents[agent.name] : null),
     }));
 }
 
@@ -956,6 +1143,17 @@ function ownedAgentRecord(snapshot, agentId, metadata = { agents: {} }) {
 
 async function requireOwnedAgent(agentId, { signal, timeoutMs = DEFAULT_COMMAND_TIMEOUT_MS } = {}) {
   const metadata = await readAgentMetadata();
+  const durable = metadata.agents[agentId] ?? null;
+  if (durable?.lifecycle === 'quarantined') {
+    throw codexPolicyError(durable, durable.quarantineReason ?? 'policy provenance is unavailable.');
+  }
+  if (durable?.harness === 'codex' && durable.lifecycle === 'active') {
+    const compliance = await verifyCodexProvenance(durable);
+    if (!compliance.ok) {
+      await quarantineCodexRecord(durable, compliance.reason, null, signal);
+      throw codexPolicyError(durable, compliance.reason);
+    }
+  }
   const snapshot = await ensureHerdrSession(signal, { timeoutMs });
   const owned = ownedAgentRecord(snapshot, agentId, metadata);
   if (!owned) {
@@ -1295,7 +1493,8 @@ async function recoverOwnedAgent(agentId) {
   const snapshot = await snapshotOutcome({ timeoutMs: 2_000 });
   if (!snapshot.ok) return null;
   const metadata = await readAgentMetadata();
-  const owned = ownedAgentRecord(snapshot.result.snapshot, agentId, metadata);
+  const owned = ownedAgentRecords(snapshot.result.snapshot, metadata, { includeTransitional: true })
+    .find(({ agent, logical }) => agent.name === agentId || logical?.agentId === agentId) ?? null;
   if (!owned) return null;
   const runtimeAgentId = owned.agent.name;
   const get = await runHerdr(['agent', 'get', runtimeAgentId], { timeoutMs: 2_000 });
@@ -1383,14 +1582,14 @@ export async function agentCapabilities({ signal } = {}) {
   const activeLogicalIds = new Set(session.agents.map((agent) => agent.agentId));
   for (const logical of Object.values(metadata.agents)) {
     if (!logical?.agentId || activeLogicalIds.has(logical.agentId)) continue;
-    if (logical.lifecycle === 'suspended' || logical.lifecycle === 'suspending' || logical.lifecycle === 'resuming') {
+    if (['starting', 'suspended', 'suspending', 'resuming', 'quarantined'].includes(logical.lifecycle)) {
       session.agents.push({
         agentId: logical.agentId,
         logicalSessionId: logical.agentId,
         runtimeAgentId: logical.runtimeAgentId ?? null,
         lifecycle: logical.lifecycle,
         harness: logical.harness,
-        status: 'suspended',
+        status: logical.lifecycle === 'suspended' ? 'suspended' : logical.lifecycle,
         interactiveReady: false,
         cwd: logical.cwd,
         foregroundCwd: null,
@@ -1401,7 +1600,15 @@ export async function agentCapabilities({ signal } = {}) {
         nativeSessionId: logical.nativeSessionId ?? null,
         nativeSessionAttribution: logical.nativeSessionAttribution ?? 'unavailable',
         legacy: false,
-        resumable: Boolean(logical.resumable && definitions[logical.harness]?.resume?.supported),
+        resumable: Boolean(
+          logical.resumable &&
+          logical.policyStatus !== 'unverified' &&
+          definitions[logical.harness]?.resume?.supported,
+        ),
+        ...(logical.harness === 'codex' ? {
+          policyStatus: logical.policyStatus ?? 'unverified',
+          codexPolicy: logical.codexProvenance?.policy ?? null,
+        } : {}),
         resume: definitions[logical.harness]?.resume ?? { supported: false },
       });
     }
@@ -1421,7 +1628,18 @@ export async function agentCapabilities({ signal } = {}) {
 }
 
 async function startAgentRuntime(
-  { agentId, runtimeAgentId, harness, cwd, model, effort, timeoutMs = DEFAULT_START_TIMEOUT_MS, nativeSessionId = null, resuming = false },
+  {
+    agentId,
+    runtimeAgentId,
+    harness,
+    cwd,
+    model,
+    effort,
+    timeoutMs = DEFAULT_START_TIMEOUT_MS,
+    nativeSessionId = null,
+    codexProvenance = null,
+    resuming = false,
+  },
   signal,
 ) {
   const definitions = harnessDefinitions();
@@ -1437,13 +1655,56 @@ async function startAgentRuntime(
   const resolvedCwd = await resolveCwd(cwd);
   await ensureHerdrSession(signal, { timeoutMs: Math.min(2_000, timeoutMs) });
 
+  if (harness === 'codex') {
+    codexProvenance = codexProvenance ?? await prepareCodexProvenance(agentId);
+    const compliance = await verifyCodexProvenance({
+      agentId,
+      harness,
+      model,
+      effort,
+      codexProvenance,
+    });
+    if (!compliance.ok) throw codexPolicyError({ agentId }, compliance.reason);
+  }
+
   let workspaceId = null;
   let cleanupAttempt = null;
   let nativeLaunchRelease = null;
+  let startingMetadataWritten = false;
   if (!resuming) nativeLaunchRelease = await acquireNativeLaunchLock();
   try {
+    if (!resuming && harness === 'codex') {
+      await updateAgentMetadata(agentId, {
+        version: AGENT_METADATA_VERSION,
+        agentId,
+        harness,
+        cwd: resolvedCwd,
+        model: model ?? null,
+        effort: effort ?? null,
+        codexProvenance,
+        policyStatus: 'verified',
+        nativeSessionId: null,
+        nativeSessionAttribution: 'unavailable',
+        resumable: false,
+        runtimeAgentId,
+        runtimeWorkspaceId: null,
+        lifecycle: 'starting',
+        updatedAt: new Date().toISOString(),
+      });
+      startingMetadataWritten = true;
+    }
+
     const create = await runHerdr(
-      ['workspace', 'create', '--cwd', resolvedCwd, '--label', runtimeAgentId, '--no-focus'],
+      [
+        'workspace',
+        'create',
+        '--cwd',
+        resolvedCwd,
+        '--label',
+        runtimeAgentId,
+        '--no-focus',
+        ...(harness === 'codex' ? ['--env', `CODEX_HOME=${codexProvenance.codexHome}`] : []),
+      ],
       { timeoutMs, signal },
     );
     if (!create.ok) {
@@ -1489,9 +1750,17 @@ async function startAgentRuntime(
     }
     workspaceId = createdWorkspaceId;
 
+    if (!resuming && harness === 'codex') {
+      await updateAgentMetadata(agentId, (current) => current ? {
+        ...current,
+        runtimeWorkspaceId: workspaceId,
+        updatedAt: new Date().toISOString(),
+      } : current);
+    }
+
     const harnessArgs = resuming
-      ? definition.buildResumeArgs({ nativeSessionId, model, effort })
-      : definition.buildArgs({ model, effort });
+      ? definition.buildResumeArgs({ nativeSessionId, model, effort, profile: codexProvenance?.profileName })
+      : definition.buildArgs({ model, effort, profile: codexProvenance?.profileName });
     const startArgs = [
       'agent',
       'start',
@@ -1505,18 +1774,21 @@ async function startAgentRuntime(
     ];
     if (harnessArgs.length > 0) startArgs.push('--', ...harnessArgs);
 
-    const nativeSnapshotBefore = resuming ? null : await captureNativeSessionSnapshot(harness, resolvedCwd);
+    const nativeSnapshotBefore = resuming ? null : await captureNativeSessionSnapshot(harness, resolvedCwd, {
+      codexHome: codexProvenance?.codexHome,
+    });
     const nativeLaunchStartedAt = Date.now();
     const start = await runHerdr(startArgs, { timeoutMs: timeoutMs + 2_000, signal });
     if (!start.ok) {
       const recoveredNativeSessionId = nativeSessionId ?? nativeSessionIdFromAgent(start.result?.agent);
       const recoveredMetadata = {
-        version: 1,
+        version: AGENT_METADATA_VERSION,
         agentId,
         harness,
         cwd: resolvedCwd,
         model: model ?? null,
         effort: effort ?? null,
+        ...(harness === 'codex' ? { codexProvenance, policyStatus: 'verified' } : {}),
         nativeSessionId: recoveredNativeSessionId,
         nativeSessionAttribution: recoveredNativeSessionId ? 'backend_reported' : 'unavailable',
         resumable: Boolean(recoveredNativeSessionId && definition.resume.supported),
@@ -1550,14 +1822,17 @@ async function startAgentRuntime(
       ? { sessionId: nativeSessionId, attribution: 'verified' }
       : backendNativeSessionId
         ? { sessionId: backendNativeSessionId, attribution: 'backend_reported' }
-        : await discoverNativeSessionId(nativeSnapshotBefore, harness, resolvedCwd, nativeLaunchStartedAt);
+        : await discoverNativeSessionId(nativeSnapshotBefore, harness, resolvedCwd, nativeLaunchStartedAt, {
+          codexHome: codexProvenance?.codexHome,
+        });
     await updateAgentMetadata(agentId, {
-      version: 1,
+      version: AGENT_METADATA_VERSION,
       agentId,
       harness,
       cwd: resolvedCwd,
       model: model ?? null,
       effort: effort ?? null,
+      ...(harness === 'codex' ? { codexProvenance, policyStatus: 'verified' } : {}),
       nativeSessionId: nativeDiscovery.sessionId,
       nativeSessionAttribution: nativeDiscovery.attribution,
       resumable: Boolean(nativeDiscovery.sessionId && definition.resume.supported),
@@ -1637,13 +1912,29 @@ async function startAgentRuntime(
       }));
     }
     if (!cleanupAttempt.cleaned) attachCleanupFailure(error, cleanupAttempt.error);
+    if (startingMetadataWritten && !resuming) {
+      if (cleanupAttempt.cleaned) {
+        await updateAgentMetadata(agentId, null).catch(() => {});
+      } else {
+        await updateAgentMetadata(agentId, (current) => current ? {
+          ...current,
+          lifecycle: 'quarantined',
+          policyStatus: 'unverified',
+          quarantineReason: `Codex launch failed and cleanup was not confirmed: ${error.message}`,
+          updatedAt: new Date().toISOString(),
+        } : current).catch(() => {});
+      }
+    }
     throw error;
   }
 }
 
 export async function agentStart({ harness, cwd, model, effort, timeoutMs = DEFAULT_START_TIMEOUT_MS }, signal) {
   const agentId = `agent-${randomUUID().replaceAll('-', '').slice(0, 26)}`;
-  return await startAgentRuntime({ agentId, runtimeAgentId: agentId, harness, cwd, model, effort, timeoutMs }, signal);
+  return await withLifecycleLock(agentId, async () => await startAgentRuntime(
+    { agentId, runtimeAgentId: agentId, harness, cwd, model, effort, timeoutMs },
+    signal,
+  ));
 }
 
 // Kept outside the MCP tool surface so the metadata serialization contract can be tested without a harness.
@@ -1676,7 +1967,7 @@ export async function agentPrompt(
   const preflightRetryable = (error) => {
     if (typeof error?.retryable === 'boolean') return error.retryable;
     const code = error?.herdr?.code ?? error?.code;
-    return ['timeout', 'deadline_exceeded', 'herdr_unavailable', 'spawn_failed', 'agent_prompt_in_flight'].includes(code);
+    return ['timeout', 'deadline_exceeded', 'herdr_unavailable', 'spawn_failed'].includes(code);
   };
   const notSubmitted = (error, { agent = null, transcript = '', retryable = preflightRetryable(error) } = {}) => ({
     accepted: false,
@@ -1698,9 +1989,21 @@ export async function agentPrompt(
   };
 
   if (promptAgentsInFlight.has(agentId)) {
-    return notSubmitted(Object.assign(new Error(`Agent ${agentId} already has a prompt in flight.`), {
-      code: 'agent_prompt_in_flight',
-    }));
+    return {
+      accepted: null,
+      submission: {
+        state: 'possibly_submitted',
+        retrySafe: false,
+        waitCompleted: false,
+      },
+      error: {
+        code: 'agent_prompt_in_flight',
+        message: `Agent ${agentId} already has a prompt in flight; the new task was not submitted, but submission state is uncertain. Do not automatically retry it.`,
+        retryable: false,
+      },
+      agent: null,
+      transcript: '',
+    };
   }
   promptAgentsInFlight.add(agentId);
 
@@ -1860,7 +2163,7 @@ function durableAgentState(record, definition) {
     runtimeAgentId: record.runtimeAgentId ?? null,
     lifecycle: record.lifecycle,
     harness: record.harness,
-    status: 'suspended',
+    status: record.lifecycle === 'suspended' ? 'suspended' : record.lifecycle,
     interactiveReady: false,
     cwd: record.cwd,
     foregroundCwd: null,
@@ -1871,11 +2174,19 @@ function durableAgentState(record, definition) {
     nativeSessionId: record.nativeSessionId ?? null,
     nativeSessionAttribution: record.nativeSessionAttribution ?? 'unavailable',
     legacy: false,
-    resumable: Boolean(record.resumable && definition?.resume?.supported),
+    resumable: Boolean(
+      record.resumable &&
+      record.policyStatus !== 'unverified' &&
+      definition?.resume?.supported,
+    ),
     interaction: null,
     transient: null,
     screenReliable: false,
     screenError: null,
+    ...(record.harness === 'codex' ? {
+      policyStatus: record.policyStatus ?? 'unverified',
+      codexPolicy: record.codexProvenance?.policy ?? null,
+    } : {}),
     resume: definition?.resume ?? { supported: false },
   };
 }
@@ -1903,6 +2214,13 @@ export async function agentSuspend({ agentId }, signal) {
       throw error;
     }
     const definition = record ? harnessDefinitions()[record.harness] : null;
+    if (record?.harness === 'codex') {
+      const compliance = await verifyCodexProvenance(record);
+      if (!compliance.ok) {
+        await quarantineCodexRecord(record, compliance.reason, null, signal);
+        throw codexPolicyError(record, compliance.reason);
+      }
+    }
     if (record?.lifecycle === 'suspended') {
       return { agentId, harness: record.harness, suspended: true, alreadySuspended: true, runtimeAgentId: null };
     }
@@ -1983,6 +2301,13 @@ export async function agentResume({ agentId }, signal) {
       throw error;
     }
     const definition = harnessDefinitions()[record.harness];
+    if (record.harness === 'codex') {
+      const compliance = await verifyCodexProvenance(record);
+      if (!compliance.ok) {
+        await quarantineCodexRecord(record, compliance.reason, null, signal);
+        throw codexPolicyError(record, compliance.reason);
+      }
+    }
     if (record.lifecycle === 'active') {
       const state = await getAgentState(agentId, { signal, includeInteraction: true, verifyOwnership: true });
       return { ...state, resumed: false, alreadyResumed: true };
@@ -2018,6 +2343,7 @@ export async function agentResume({ agentId }, signal) {
         cwd: record.cwd,
         model: record.model ?? undefined,
         effort: record.effort ?? undefined,
+        codexProvenance: record.codexProvenance ?? null,
         nativeSessionId: record.nativeSessionId,
         resuming: true,
       }, signal);
@@ -2042,7 +2368,18 @@ export async function agentStop({ agentId }, signal) {
   return await withLifecycleLock(agentId, async () => {
   const metadata = await reconcileBeforeOperation(signal);
   const durable = metadata.agents[agentId];
-  if (durable?.lifecycle === 'suspending' || durable?.lifecycle === 'resuming') {
+  if (durable?.lifecycle === 'quarantined' && !durable.runtimeAgentId) {
+    await updateAgentMetadata(agentId, null);
+    return {
+      agentId,
+      harness: durable.harness,
+      workspaceId: durable.lastWorkspaceId ?? null,
+      runtimeAgentId: null,
+      stopped: true,
+      discarded: true,
+    };
+  }
+  if (durable?.lifecycle === 'starting' || durable?.lifecycle === 'suspending' || durable?.lifecycle === 'resuming' || durable?.lifecycle === 'quarantined') {
     const snapshot = await snapshotOutcome({ signal, timeoutMs: 5_000 });
     if (!snapshot.ok) throwHerdrFailure(snapshot);
     const observation = runtimeObservation(snapshot.result.snapshot, durable);

@@ -251,7 +251,9 @@ The audit is fail-soft for source/network failures: affected items remain visibl
 
 ## Host profile
 
-`AGENT_CODEX_ENFORCED_MODEL` and `AGENT_CODEX_ENFORCED_EFFORT` are an optional paired deployment policy for Codex agents. Set both to force every MCP-managed Codex launch/resume to the specified model and reasoning effort. Callers may omit model/effort and receive the enforced values; explicit conflicting values fail with `agent_launch_policy_violation`. The policy is exposed through `agent_capabilities`.
+MCP-managed Codex launches and resumes are always fixed to `gpt-5.6-luna` with reasoning effort `max`; this is an invariant of `agent-vm-mcp`, not optional deployment configuration. Omitted model/effort values are injected, the exact pair is accepted, and any other explicit model or effort fails with `agent_launch_policy_violation`. Durable logical-agent metadata records a policy/profile fingerprint; absent or mismatched provenance is quarantined and cannot resume. `agent_stop` preserves exact-ownership cleanup for quarantined launch/runtime records.
+
+Each MCP-managed Codex workspace receives a session-scoped Codex profile with fixed root and default subagent model/effort plus managed developer instructions requiring downstream Codex delegation, including `x-review`, to remain `gpt-5.6-luna`/`max`. Codex CLI 0.153.2 exposes no immutable deny-override primitive, so an explicit in-session subagent override remains a residual limitation. Ordinary/manual Codex usage outside `agent_start`/`agent_resume`, including generic `exec`/`process_start`, is not covered by this policy.
 
 `AGENT_MCP_HOST` is connection/deployment context rather than a normal tool argument.
 

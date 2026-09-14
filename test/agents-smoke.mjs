@@ -116,6 +116,12 @@ if (args[0] === 'server') {
   const workspaceId = 'w' + n;
   const paneId = workspaceId + ':p1';
   const tabId = workspaceId + ':t1';
+  const workspaceEnv = {};
+  for (let index = 0; index < args.length; index += 1) {
+    if (args[index] !== '--env') continue;
+    const [key, ...value] = String(args[index + 1] ?? '').split('=');
+    if (key) workspaceEnv[key] = value.join('=');
+  }
   const workspace = {
     workspace_id: workspaceId,
     active_tab_id: tabId,
@@ -126,7 +132,7 @@ if (args[0] === 'server') {
     pane_count: 1,
     tab_count: 1,
   };
-  const workspaceRecord = { workspace, paneId, tabId, cwd };
+  const workspaceRecord = { workspace, paneId, tabId, cwd, env: workspaceEnv };
   if (state.delayCreateAfterFailure) {
     writeState(state);
     const delayedCode = "const fs=require('fs');const statePath=process.env.AGENT_DELAY_STATE;const record=JSON.parse(process.env.AGENT_DELAY_RECORD);setTimeout(()=>{const delayedState=JSON.parse(fs.readFileSync(statePath,'utf8'));delayedState.workspaces[record.workspace.workspace_id]=record;const temporaryPath=statePath+'.tmp-delayed-'+process.pid;fs.writeFileSync(temporaryPath,JSON.stringify(delayedState,null,2)+'\\n');fs.renameSync(temporaryPath,statePath);},1250);";
@@ -195,7 +201,7 @@ if (args[0] === 'server') {
     ? kind + '-session-' + name
     : launchArgs[resumeIndex + 1];
   if (state.emitAmbiguousNativeSessions && kind === 'codex') {
-    const sessionDirectory = path.join(process.env.HOME, '.codex', 'sessions', '2099', '01', '01');
+    const sessionDirectory = path.join(workspace.env.CODEX_HOME ?? path.join(process.env.HOME, '.codex'), 'sessions', '2099', '01', '01');
     fs.mkdirSync(sessionDirectory, { recursive: true });
     for (const suffix of ['a', 'b']) {
       const candidateId = 'ambiguous-' + name + '-' + process.pid + '-' + suffix;
@@ -206,7 +212,7 @@ if (args[0] === 'server') {
       }) + '\n');
     }
   } else if (state.emitSingleNativeSession && kind === 'codex') {
-    const sessionDirectory = path.join(process.env.HOME, '.codex', 'sessions', '2099', '01', '01');
+    const sessionDirectory = path.join(workspace.env.CODEX_HOME ?? path.join(process.env.HOME, '.codex'), 'sessions', '2099', '01', '01');
     fs.mkdirSync(sessionDirectory, { recursive: true });
     const candidateId = 'single-' + name + '-' + process.pid;
     fs.writeFileSync(path.join(sessionDirectory, candidateId + '.jsonl'), JSON.stringify({
@@ -316,8 +322,9 @@ process.env.PATH = `${bin}:${previous.PATH}`;
 process.env.AGENT_HERDR_BIN = herdrPath;
 process.env.AGENT_HERDR_SESSION = 'fake-session';
 process.env.AGENT_HERDR_FAKE_STATE = statePath;
-process.env.AGENT_CODEX_ENFORCED_MODEL = 'gpt-5.6-luna';
-process.env.AGENT_CODEX_ENFORCED_EFFORT = 'max';
+// These legacy deployment variables must not control the built-in MCP policy.
+process.env.AGENT_CODEX_ENFORCED_MODEL = 'gpt-5.6-terra';
+process.env.AGENT_CODEX_ENFORCED_EFFORT = 'ultra';
 
 try {
   const capabilities = await agentCapabilities();
@@ -362,9 +369,43 @@ try {
   const codexLaunch = state.agents[codex.agent.agentId].launch_args;
   if (
     JSON.stringify(codexLaunch) !==
-    JSON.stringify(['--model', 'gpt-5.6-luna', '--config', 'model_reasoning_effort="max"'])
+    JSON.stringify([
+      '--model',
+      'gpt-5.6-luna',
+      '--config',
+      'model_reasoning_effort="max"',
+      '--profile',
+      `agent-vm-mcp-${codex.agent.agentId}`,
+    ])
   ) {
     throw new Error(`Unexpected Codex launch args: ${JSON.stringify(codexLaunch)}`);
+  }
+  const codexWorkspace = state.workspaces[state.agents[codex.agent.agentId].workspace_id];
+  const codexProfilePath = path.join(home, '.codex', `agent-vm-mcp-${codex.agent.agentId}.config.toml`);
+  const codexProfile = await fs.readFile(codexProfilePath, 'utf8');
+  if (codexWorkspace.env?.CODEX_HOME !== path.join(home, '.codex')) {
+    throw new Error(`MCP Codex workspace did not receive scoped CODEX_HOME: ${JSON.stringify(codexWorkspace.env)}`);
+  }
+  for (const requiredLine of [
+    'model = "gpt-5.6-luna"',
+    'model_reasoning_effort = "max"',
+    'default_subagent_model = "gpt-5.6-luna"',
+    'default_subagent_reasoning_effort = "max"',
+    'x-review',
+    'model-routing',
+  ]) {
+    if (!codexProfile.includes(requiredLine)) throw new Error(`Managed Codex profile omitted ${requiredLine}`);
+  }
+  const codexMetadata = JSON.parse(await fs.readFile(path.join(home, '.local', 'state', 'agent-vm-mcp', 'agents.json'), 'utf8')).agents[codex.agent.agentId];
+  if (
+    codexMetadata.lifecycle !== 'active' ||
+    codexMetadata.policyStatus !== 'verified' ||
+    codexMetadata.codexProvenance?.policy?.model !== 'gpt-5.6-luna' ||
+    codexMetadata.codexProvenance?.policy?.effort !== 'max' ||
+    codexMetadata.codexProvenance?.profilePath !== codexProfilePath ||
+    codexMetadata.codexProvenance?.profileSha256?.length !== 64
+  ) {
+    throw new Error(`MCP Codex provenance was not durably persisted: ${JSON.stringify(codexMetadata)}`);
   }
 
   const prompted = await agentPrompt({
@@ -760,11 +801,11 @@ try {
     timeoutMs: 1_000,
   });
   if (
-    serializedSecond.accepted !== false ||
-    serializedSecond.submission?.state !== 'not_submitted' ||
-    serializedSecond.submission?.retrySafe !== true ||
-    serializedSecond.error?.retryable !== true ||
-    serializedSecond.error?.cause?.code !== 'agent_prompt_in_flight'
+    serializedSecond.accepted !== null ||
+    serializedSecond.submission?.state !== 'possibly_submitted' ||
+    serializedSecond.submission?.retrySafe !== false ||
+    serializedSecond.error?.retryable !== false ||
+    serializedSecond.error?.code !== 'agent_prompt_in_flight'
   ) {
     throw new Error('Concurrent prompt was not rejected by per-agent serialization');
   }
@@ -966,7 +1007,13 @@ try {
   }
   await agentStop({ agentId: agy.agent.agentId });
 
-  const resumable = await agentStart({ harness: 'codex', cwd: root, timeoutMs: 10_000 });
+  const resumable = await agentStart({
+    harness: 'codex',
+    cwd: root,
+    model: 'gpt-5.6-luna',
+    effort: 'max',
+    timeoutMs: 10_000,
+  });
   await agentPrompt({ agentId: resumable.agent.agentId, task: 'PERSIST_THIS_NATIVE_SESSION', timeoutMs: 10_000 });
   state = JSON.parse(await fs.readFile(statePath, 'utf8'));
   const resumableRuntimeId = resumable.agent.runtimeAgentId;
@@ -1011,6 +1058,8 @@ try {
         'gpt-5.6-luna',
         '--config',
         'model_reasoning_effort="max"',
+        '--profile',
+        `agent-vm-mcp-${resumable.agent.agentId}`,
       ]) ||
     !resumedRuntime.transcript.includes('PERSIST_THIS_NATIVE_SESSION')
   ) {
@@ -1037,6 +1086,22 @@ try {
   await agentResume({ agentId: resumable.agent.agentId });
   const resumedAgain = await agentGet({ agentId: resumable.agent.agentId });
   await agentStop({ agentId: resumedAgain.agentId });
+
+  const mismatchedProvenance = await agentStart({ harness: 'codex', cwd: root, timeoutMs: 10_000 });
+  await agentSuspend({ agentId: mismatchedProvenance.agent.agentId });
+  const mismatchedMetadata = JSON.parse(await fs.readFile(metadataPath, 'utf8')).agents[mismatchedProvenance.agent.agentId];
+  await fs.appendFile(mismatchedMetadata.codexProvenance.profilePath, '# unexpected mutation\n', 'utf8');
+  try {
+    await agentResume({ agentId: mismatchedProvenance.agent.agentId });
+    throw new Error('Codex resume with a mutated managed profile unexpectedly succeeded');
+  } catch (error) {
+    if (error?.code !== 'agent_codex_policy_unverified') throw error;
+  }
+  const quarantinedMismatch = JSON.parse(await fs.readFile(metadataPath, 'utf8')).agents[mismatchedProvenance.agent.agentId];
+  if (quarantinedMismatch?.lifecycle !== 'quarantined' || quarantinedMismatch.policyStatus !== 'unverified') {
+    throw new Error('Mismatched Codex provenance was not durably quarantined');
+  }
+  await agentStop({ agentId: mismatchedProvenance.agent.agentId });
 
   const agyResumable = await agentStart({ harness: 'agy', cwd: root, timeoutMs: 10_000 });
   await agentPrompt({ agentId: agyResumable.agent.agentId, task: 'PERSIST_THIS_AGY_CONVERSATION', timeoutMs: 10_000 });
@@ -1132,7 +1197,7 @@ try {
     recoveryMetadata.agents[recoveryIds[index]] = {
       version: 1,
       agentId: recoveryIds[index],
-      harness: 'codex',
+      harness: 'agy',
       cwd: root,
       model: null,
       effort: null,
@@ -1156,7 +1221,7 @@ try {
       cwd: root,
     };
     state.agents[runtimeAgentId] = {
-      agent: 'codex', agent_status: 'idle', cwd: root, foreground_cwd: root,
+      agent: 'agy', agent_status: 'idle', cwd: root, foreground_cwd: root,
       interactive_ready: true, name: runtimeAgentId, pane_id: `${workspaceId}:p1`,
       tab_id: `${workspaceId}:t1`, terminal_id: `term-${runtimeAgentId}`,
       workspace_id: workspaceId, transcript: 'RECOVERY READY', native_session_id: `recovery-native-${index}`,
@@ -1187,6 +1252,60 @@ try {
     throw new Error('Resuming crash reconciliation left the exact orphan workspace behind');
   }
   for (const agentId of recoveryIds) await recoveryModule.agentStop({ agentId });
+
+  const missingProvenanceId = 'agent-66666666666666666666666666';
+  const missingProvenanceRuntimeId = 'agent-77777777777777777777777777';
+  const missingProvenanceWorkspaceId = 'missing-provenance-workspace';
+  await recoveryModule.__testUpdateAgentMetadata(missingProvenanceId, {
+    version: 1,
+    agentId: missingProvenanceId,
+    harness: 'codex',
+    cwd: root,
+    model: 'gpt-5.6-luna',
+    effort: 'max',
+    nativeSessionId: 'missing-provenance-native',
+    nativeSessionAttribution: 'verified',
+    resumable: true,
+    runtimeAgentId: missingProvenanceRuntimeId,
+    runtimeWorkspaceId: missingProvenanceWorkspaceId,
+    lifecycle: 'active',
+    updatedAt: new Date().toISOString(),
+  });
+  state = JSON.parse(await fs.readFile(statePath, 'utf8'));
+  state.workspaces[missingProvenanceWorkspaceId] = {
+    workspace: { workspace_id: missingProvenanceWorkspaceId, label: missingProvenanceRuntimeId, number: 1 },
+    paneId: `${missingProvenanceWorkspaceId}:p1`, tabId: `${missingProvenanceWorkspaceId}:t1`, cwd: root,
+  };
+  state.agents[missingProvenanceRuntimeId] = {
+    agent: 'codex', agent_status: 'idle', cwd: root, foreground_cwd: root,
+    interactive_ready: true, name: missingProvenanceRuntimeId,
+    pane_id: `${missingProvenanceWorkspaceId}:p1`, tab_id: `${missingProvenanceWorkspaceId}:t1`,
+    terminal_id: `term-${missingProvenanceRuntimeId}`, workspace_id: missingProvenanceWorkspaceId,
+    transcript: 'MISSING PROVENANCE READY',
+  };
+  await fs.writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, 'utf8');
+  const missingProvenanceCapabilities = await recoveryModule.agentCapabilities();
+  const missingProvenanceMetadata = JSON.parse(await fs.readFile(metadataPath, 'utf8')).agents[missingProvenanceId];
+  const missingProvenanceDescription = missingProvenanceCapabilities.runtime.session.agents.find((agent) => agent.agentId === missingProvenanceId);
+  if (
+    missingProvenanceMetadata?.lifecycle !== 'quarantined' ||
+    missingProvenanceMetadata.runtimeAgentId !== null ||
+    missingProvenanceDescription?.lifecycle !== 'quarantined' ||
+    missingProvenanceDescription.policyStatus !== 'unverified'
+  ) {
+    throw new Error('Persistent MCP Codex metadata without provenance was not fail-closed/quarantined');
+  }
+  state = JSON.parse(await fs.readFile(statePath, 'utf8'));
+  if (state.workspaces[missingProvenanceWorkspaceId] || state.agents[missingProvenanceRuntimeId]) {
+    throw new Error('Quarantine did not close the exactly owned noncompliant Codex workspace');
+  }
+  try {
+    await recoveryModule.agentResume({ agentId: missingProvenanceId });
+    throw new Error('Codex resume without durable provenance unexpectedly succeeded');
+  } catch (error) {
+    if (error?.code !== 'agent_codex_policy_unverified') throw error;
+  }
+  await recoveryModule.agentStop({ agentId: missingProvenanceId });
 
   const legacyId = 'agent-eeeeeeeeeeeeeeeeeeeeeeeeee';
   const legacyWorkspaceId = 'legacy-workspace';
@@ -1225,7 +1344,7 @@ try {
   const metadataModuleA = await import(`../src/agents.js?metadata-a=${Date.now()}`);
   const metadataModuleB = await import(`../src/agents.js?metadata-b=${Date.now()}`);
   const concurrentMetadataA = {
-    version: 1, agentId: 'agent-f1111111111111111111111111', harness: 'codex', cwd: root,
+    version: 1, agentId: 'agent-f1111111111111111111111111', harness: 'agy', cwd: root,
     nativeSessionId: 'metadata-native-a', nativeSessionAttribution: 'verified', resumable: true,
     runtimeAgentId: null, runtimeWorkspaceId: null, lifecycle: 'suspended', updatedAt: new Date().toISOString(),
   };
@@ -1247,7 +1366,7 @@ try {
   const staleLockTime = new Date(Date.now() - 5_000);
   await fs.utimes(metadataLockPath, staleLockTime, staleLockTime);
   await metadataModuleA.__testUpdateAgentMetadata('agent-f4444444444444444444444444', {
-    version: 1, agentId: 'agent-f4444444444444444444444', harness: 'codex', cwd: root,
+    version: 1, agentId: 'agent-f4444444444444444444444', harness: 'agy', cwd: root,
     nativeSessionId: 'metadata-native-stale-lock', nativeSessionAttribution: 'verified', resumable: true,
     runtimeAgentId: null, runtimeWorkspaceId: null, lifecycle: 'suspended', updatedAt: new Date().toISOString(),
   });
@@ -1256,7 +1375,7 @@ try {
   const ambiguousTransitionRuntimeId = 'agent-ffffffffffffffffffffffffff';
   const ambiguousTransitionWorkspaceId = 'ambiguous-transition-workspace';
   await metadataModuleA.__testUpdateAgentMetadata(ambiguousTransitionId, {
-    version: 1, agentId: ambiguousTransitionId, harness: 'codex', cwd: root,
+    version: 1, agentId: ambiguousTransitionId, harness: 'agy', cwd: root,
     nativeSessionId: 'transition-native', nativeSessionAttribution: 'verified', resumable: true,
     runtimeAgentId: ambiguousTransitionRuntimeId, runtimeWorkspaceId: ambiguousTransitionWorkspaceId,
     lifecycle: 'suspending', updatedAt: new Date().toISOString(),
@@ -1267,7 +1386,7 @@ try {
     paneId: `${ambiguousTransitionWorkspaceId}:p1`, tabId: `${ambiguousTransitionWorkspaceId}:t1`, cwd: root,
   };
   state.agents[ambiguousTransitionRuntimeId] = {
-    agent: 'codex', agent_status: 'idle', cwd: root, foreground_cwd: root,
+    agent: 'agy', agent_status: 'idle', cwd: root, foreground_cwd: root,
     interactive_ready: true, name: ambiguousTransitionRuntimeId,
     pane_id: `${ambiguousTransitionWorkspaceId}:p1`, tab_id: `${ambiguousTransitionWorkspaceId}:t1`,
     terminal_id: `term-${ambiguousTransitionRuntimeId}`, workspace_id: ambiguousTransitionWorkspaceId, transcript: 'AMBIGUOUS',
@@ -1289,7 +1408,7 @@ try {
   const orphanStopRuntimeId = 'agent-88888888888888888888888888';
   const orphanStopWorkspaceId = 'orphan-stop-workspace';
   await metadataModuleB.__testUpdateAgentMetadata(orphanStopId, {
-    version: 1, agentId: orphanStopId, harness: 'codex', cwd: root,
+    version: 1, agentId: orphanStopId, harness: 'agy', cwd: root,
     nativeSessionId: 'orphan-stop-native', nativeSessionAttribution: 'verified', resumable: true,
     runtimeAgentId: orphanStopRuntimeId, runtimeWorkspaceId: orphanStopWorkspaceId,
     lifecycle: 'resuming', updatedAt: new Date().toISOString(),
