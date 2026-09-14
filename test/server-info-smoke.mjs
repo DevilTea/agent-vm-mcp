@@ -171,6 +171,8 @@ const info = buildServerInfo({ runtime, catalogTracker: forward.tracker });
 assert.equal(info.catalog.marker, baseMarker);
 assert.equal(info.catalog.totalToolCount, 3);
 assert.match(serverInfoToolDescription(baseMarker), new RegExp(baseMarker.replace(':', '\\:')));
+assert.match(serverInfoToolDescription(baseMarker), /terminal boundary/);
+assert.match(serverInfoToolDescription(baseMarker), /do not call or rediscover any other tools/);
 
 const listToolsProjection = [...forward.server.tools.values()].map(({ handler: _handler, ...tool }) => tool);
 assert.equal(

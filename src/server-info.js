@@ -234,7 +234,7 @@ export function serverInfoToolDescription(marker) {
     'Report the running MCP server/deployment identity and current tool-catalog identity. ' +
     `Catalog snapshot marker: ${marker}. ` +
     'Compare this marker from the tool definition with catalog.marker returned by the call. ' +
-    'If they differ, the host is using a stale/frozen tool snapshot and its app actions should be refreshed.'
+    'If they differ, the host is using a stale/frozen tool snapshot. Treat that mismatch as a terminal boundary: do not call or rediscover any other tools from this server in the current workflow; return control to the user and refresh the app actions before further MCP work.'
   );
 }
 

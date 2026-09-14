@@ -142,7 +142,7 @@ Both `read_file` and artifact resource reads enforce their source-size limit dur
 
 The same tool reports a deterministic SHA-256 identity for the active MCP action catalog. The hash covers the public tool definitions that matter to a host snapshot—name, title/description, input/output schemas, annotations, icons, execution metadata, and `_meta`—including connected bridge tools. Handler implementation changes alone do not change the catalog hash. `server_info` is excluded from its own hash to avoid self-reference.
 
-The `server_info` tool description embeds the catalog marker that ChatGPT saw when it fetched that tool definition. Compare that embedded marker with `catalog.marker` returned by a live `server_info` call. If they differ, the running server and the host's frozen action snapshot disagree and the app actions should be refreshed. `catalog.toolNames` and the reported counts provide an additional sanity check.
+The `server_info` tool description embeds the catalog marker that ChatGPT saw when it fetched that tool definition. Compare that embedded marker with `catalog.marker` returned by a live `server_info` call. If they differ, the running server and the host's frozen action snapshot disagree. Treat that mismatch as a terminal workflow boundary: do not call or rediscover any other tools from that server in the same workflow; return control to the user and refresh the app actions before continuing. For self-deployment, finish cleanup and ancillary work before restarting the MCP/tunnel process, then use one post-restart `server_info` call as the deployment acceptance check. `catalog.toolNames` and the reported counts provide an additional sanity check.
 
 ## Workspaces and Git
 
