@@ -594,7 +594,7 @@ async function createServer() {
     'agent_capabilities',
     {
       description:
-        'Discover the Herdr agent runtime, configured persistent session, installed coding harnesses, active and suspended MCP-managed logical agents, native/runtime IDs, lifecycle states, resumability/legacy status, and per-harness installed skills/resume support.',
+        'Discover the Herdr agent runtime, configured persistent session, installed coding harnesses, active and suspended MCP-managed logical agents, native/runtime IDs, lifecycle states, resumability/legacy status, per-harness launch policy, installed skills, and resume support.',
       inputSchema: z.object({}),
     },
     async (_args, ctx) => jsonResult(await agentCapabilities({ signal: ctx.mcpReq.signal })),
@@ -604,15 +604,15 @@ async function createServer() {
     'agent_start',
     {
       description:
-        'Start a persistent interactive coding agent in a dedicated Herdr workspace. Use this, not exec or process_start, for coding-harness work; it is required for long-running, parallel, or cross-turn Codex/agy/Claude tasks. Production persistence requires the separately managed Herdr service; startup trust/auth prompts are reported, never auto-approved.',
+        'Start a persistent interactive coding agent in a dedicated Herdr workspace. Use this, not exec or process_start, for coding-harness work; it is required for long-running, parallel, or cross-turn Codex/agy/Claude tasks. A deployment may enforce a fixed harness model/effort; inspect agent_capabilities.launchPolicy before choosing overrides. Production persistence requires the separately managed Herdr service; startup trust/auth prompts are reported, never auto-approved.',
       inputSchema: z.object({
         harness: z.enum(['codex', 'agy', 'claude']).describe('Coding harness to launch.'),
         cwd: z.string().min(1).describe('Existing directory to use as the agent workspace.'),
-        model: z.string().min(1).max(128).optional().describe('Optional harness model override.'),
+        model: z.string().min(1).max(128).optional().describe('Optional harness model override; deployment launch policy may restrict or force this value.'),
         effort: z
           .enum(['low', 'medium', 'high', 'xhigh', 'max', 'ultra'])
           .optional()
-          .describe('Optional reasoning-effort override; supported values vary by harness.'),
+          .describe('Optional reasoning-effort override; supported values vary by harness and deployment launch policy may restrict or force this value.'),
         timeoutMs: z
           .number()
           .int()

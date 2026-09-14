@@ -105,7 +105,7 @@ Set `AGENT_MCP_SKILL_PROJECTION_ROOT` to use another projection root. The native
 
 ## Structured user input
 
-The interaction model is host-neutral. It currently supports single-select, multi-select, free-text, and boolean questions, with stable question/option IDs and optional recommendations. Host-specific rendering is implemented by adapters rather than encoded in the core request schema.
+The interaction model is host-neutral. It currently supports single-select, multi-select, free-text, and boolean questions, with stable question/option IDs and optional recommendations. Select options can also set `allowCustomInput: true` (and optionally `customInputPlaceholder`) to require an inline free-form detail only when that option is selected; this works for both single- and multi-select questions without giving `other` any special protocol meaning. Host-specific rendering is implemented by adapters rather than encoded in the core request schema.
 
 When `AGENT_MCP_HOST=chatgpt`, the server exposes `request_user_input` and binds it to an MCP Apps resource at `ui://agent-vm/request-user-input/v1.html`. The ChatGPT adapter uses the standard MCP Apps `ui/*` bridge and submits the completed form through `ui/message`, making the answers the next user turn. The tool result also contains a plain-text fallback, so the request remains understandable if the UI cannot render.
 
@@ -167,7 +167,8 @@ Relevant settings include:
 - `AGENT_HERDR_SESSION` — Herdr session name, default `agent-vm-mcp`;
 - `AGENT_HERDR_BIN` — optional Herdr executable override;
 - `AGENT_HERDR_BOOTSTRAP` — `auto` or `external`;
-- `AGENT_STATE_DIR` — optional durable logical-agent metadata directory.
+- `AGENT_STATE_DIR` — optional durable logical-agent metadata directory;
+- `AGENT_CODEX_ENFORCED_MODEL` + `AGENT_CODEX_ENFORCED_EFFORT` — optional paired Codex launch policy. When both are set, omitted Codex overrides are filled with these values and any explicit mismatch is rejected; resume uses the same policy. `agent_capabilities` reports the effective policy.
 
 `agent_prompt` distinguishes submission certainty from whether retrying the same task is useful. A definitely unsubmitted request reports `submission.state="not_submitted"` and `retrySafe=true`; once prompt submission may have begun, ambiguous timeout/cancellation/failure is treated as `possibly_submitted` and is not safe to auto-retry.
 

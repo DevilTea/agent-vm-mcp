@@ -251,6 +251,8 @@ The audit is fail-soft for source/network failures: affected items remain visibl
 
 ## Host profile
 
+`AGENT_CODEX_ENFORCED_MODEL` and `AGENT_CODEX_ENFORCED_EFFORT` are an optional paired deployment policy for Codex agents. Set both to force every MCP-managed Codex launch/resume to the specified model and reasoning effort. Callers may omit model/effort and receive the enforced values; explicit conflicting values fail with `agent_launch_policy_violation`. The policy is exposed through `agent_capabilities`.
+
 `AGENT_MCP_HOST` is connection/deployment context rather than a normal tool argument.
 
 Supported values:
