@@ -184,6 +184,7 @@ try {
     assert.equal(interactionTool._meta?.ui?.resourceUri, CHATGPT_INTERACTION_RESOURCE_URI);
     assert.equal(interactionTool._meta?.['ui/resourceUri'], CHATGPT_INTERACTION_RESOURCE_URI);
     assert.deepEqual(interactionTool._meta?.ui?.visibility, ['model']);
+    assert.match(interactionTool.description ?? '', /Do not prefix question prompts with ordinal numbers/);
     assert.match(interactionTool.description ?? '', /Prefer single_select for binary choices too/);
     assert.match(JSON.stringify(interactionTool.inputSchema), /allowCustomInput/);
     assert.match(JSON.stringify(interactionTool.inputSchema), /customInputPlaceholder/);
@@ -218,7 +219,9 @@ try {
     assert.match(content.text, /FORM_STATE_PREFIX/);
     assert.match(content.text, /window\.localStorage\.setItem/);
     assert.match(content.text, /restorePersistedForm/);
-    assert.match(content.text, /#root\s*\{[\s\S]*padding:\s*12px/);
+    assert.match(content.text, /fieldset\s*\{[\s\S]*padding:\s*0 12px/);
+    assert.match(content.text, /function displayQuestionPrompt/);
+    assert.match(content.text, /prompt\.startsWith\(ordinal\)/);
 
     const scriptMatch = content.text.match(/<script>([\s\S]*?)<\/script>/i);
     assert.ok(scriptMatch, 'interaction UI script missing');

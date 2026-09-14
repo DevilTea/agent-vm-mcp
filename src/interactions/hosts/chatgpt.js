@@ -61,7 +61,7 @@ export function registerChatgptInteractionAdapter(server) {
       title: 'Request user input',
       description:
         'Present a compact structured form when the user must make a real choice or provide information before the discussion can continue. ' +
-        'Use this for architecture, design, issue, planning, or other decisions with meaningful tradeoffs. Prefer 1-4 focused questions, concise options, and mark at most one recommendation when you have one. ' +
+        'Use this for architecture, design, issue, planning, or other decisions with meaningful tradeoffs. Prefer 1-4 focused questions, concise options, and mark at most one recommendation when you have one. Do not prefix question prompts with ordinal numbers; the UI numbers them for display. ' +
         'Prefer single_select for binary choices too; boolean remains available only for compatibility with existing callers. ' +
         'Do not use it when you can safely make a reversible decision yourself. After calling this tool, wait for the form response instead of answering the questions yourself.',
       inputSchema: interactionRequestSchema,

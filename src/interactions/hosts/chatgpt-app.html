@@ -17,7 +17,7 @@
 
     #root {
       width: 100%;
-      padding: 12px;
+      padding: 0;
     }
 
     .card {
@@ -27,7 +27,7 @@
     }
 
     h1 {
-      margin: 0;
+      margin: 12px 12px 0;
       font-size: 1rem;
       line-height: 1.4;
       font-weight: 650;
@@ -50,8 +50,9 @@
 
     fieldset {
       border: 0;
-      padding: 0;
+      padding: 0 12px;
       margin: 0;
+      min-width: 0;
       display: grid;
       gap: 8px;
     }
@@ -64,6 +65,10 @@
     }
 
     .required::after { content: " *"; }
+
+    #root > .description {
+      margin-inline: 12px;
+    }
 
     .options {
       display: grid;
@@ -163,6 +168,7 @@
       display: flex;
       align-items: center;
       gap: 10px;
+      margin: 0 12px 12px;
     }
 
     button {
@@ -181,6 +187,7 @@
     .status { font-size: 0.82rem; }
 
     .fatal {
+      margin: 12px;
       padding: 10px;
       border: 1px solid var(--color-border-danger, #d92d20);
       border-radius: 9px;
@@ -393,13 +400,22 @@
         );
       }
 
+      function displayQuestionPrompt(question, index) {
+        const ordinal = `${index + 1}.`;
+        let prompt = text(question.prompt).trimStart();
+        if (prompt.startsWith(ordinal) && /^\s/.test(prompt.slice(ordinal.length))) {
+          prompt = prompt.slice(ordinal.length).trimStart();
+        }
+        return `${ordinal} ${prompt}`;
+      }
+
       function renderQuestion(question, index) {
         const section = document.createElement('fieldset');
         section.dataset.questionId = question.id;
         section.dataset.kind = question.kind;
         section.dataset.required = question.required === false ? 'false' : 'true';
 
-        const legend = make('legend', question.required === false ? '' : 'required', `${index + 1}. ${question.prompt}`);
+        const legend = make('legend', question.required === false ? '' : 'required', displayQuestionPrompt(question, index));
         section.append(legend);
         if (question.description) section.append(make('p', 'question-description', question.description));
 
