@@ -201,6 +201,9 @@ try {
     assert.match(content.text, /data-custom-input/);
     assert.match(content.text, /Please provide additional details/);
     assert.match(content.text, /Custom value \[/);
+    assert.match(content.text, /FORM_STATE_PREFIX/);
+    assert.match(content.text, /window\.localStorage\.setItem/);
+    assert.match(content.text, /restorePersistedForm/);
 
     const scriptMatch = content.text.match(/<script>([\s\S]*?)<\/script>/i);
     assert.ok(scriptMatch, 'interaction UI script missing');

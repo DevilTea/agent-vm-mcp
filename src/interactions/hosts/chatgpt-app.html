@@ -193,6 +193,8 @@
       'use strict';
 
       const APP_PROTOCOL_VERSION = '2026-01-26';
+      const FORM_STATE_VERSION = 1;
+      const FORM_STATE_PREFIX = 'agent-vm:request-user-input:v1:';
       const pending = new Map();
       let nextRequestId = 1;
       let initialized = false;
@@ -264,6 +266,42 @@
           };
         }
         return null;
+      }
+
+      function formStateKey(payload) {
+        return payload?.interactionId ? `${FORM_STATE_PREFIX}${payload.interactionId}` : null;
+      }
+
+      function readPersistedFormState(payload) {
+        const key = formStateKey(payload);
+        if (!key) return null;
+        try {
+          const parsed = JSON.parse(window.localStorage.getItem(key) ?? 'null');
+          if (
+            parsed?.version !== FORM_STATE_VERSION ||
+            parsed?.interactionId !== payload.interactionId ||
+            !parsed.fields ||
+            typeof parsed.fields !== 'object'
+          ) return null;
+          return parsed;
+        } catch {
+          return null;
+        }
+      }
+
+      function writePersistedFormState(payload, state) {
+        const key = formStateKey(payload);
+        if (!key) return;
+        try {
+          window.localStorage.setItem(key, JSON.stringify({
+            version: FORM_STATE_VERSION,
+            interactionId: payload.interactionId,
+            savedAt: new Date().toISOString(),
+            ...state,
+          }));
+        } catch {
+          // Storage may be unavailable in a host sandbox; the in-memory form still works.
+        }
       }
 
       function make(tag, className, value) {
@@ -521,6 +559,90 @@
         return { valid, answers };
       }
 
+      function snapshotFormFields(requestData, form) {
+        const fields = {};
+
+        for (const question of requestData.questions) {
+          const fieldset = form.querySelector(`[data-question-id="${CSS.escape(question.id)}"]`);
+          if (!fieldset) continue;
+
+          const customValues = {};
+          for (const input of fieldset.querySelectorAll('[data-custom-input="true"]')) {
+            customValues[input.dataset.optionId] = input.value;
+          }
+
+          if (question.kind === 'single_select' || question.kind === 'boolean') {
+            const checked = fieldset.querySelector(`input[name="${CSS.escape(question.id)}"]:checked`);
+            fields[question.id] = { value: checked?.value ?? null, customValues };
+          } else if (question.kind === 'multi_select') {
+            const values = [...fieldset.querySelectorAll(`input[name="${CSS.escape(question.id)}"]:checked`)]
+              .map((input) => input.value);
+            fields[question.id] = { value: values, customValues };
+          } else if (question.kind === 'text') {
+            const input = fieldset.querySelector(`[name="${CSS.escape(question.id)}"]`);
+            fields[question.id] = { value: input?.value ?? '' };
+          }
+        }
+
+        return fields;
+      }
+
+      function persistCurrentForm(payload, form, submitted = false) {
+        writePersistedFormState(payload, {
+          submitted,
+          fields: snapshotFormFields(payload.request, form),
+        });
+      }
+
+      function restorePersistedForm(payload, form) {
+        const persisted = readPersistedFormState(payload);
+        if (!persisted) return { restored: false, submitted: false };
+
+        for (const question of payload.request.questions) {
+          const saved = persisted.fields[question.id];
+          if (!saved || typeof saved !== 'object') continue;
+          const fieldset = form.querySelector(`[data-question-id="${CSS.escape(question.id)}"]`);
+          if (!fieldset) continue;
+
+          if (question.kind === 'single_select' || question.kind === 'boolean') {
+            const allowed = new Set(
+              question.kind === 'boolean'
+                ? ['true', 'false']
+                : (question.options ?? []).map((option) => option.id),
+            );
+            if (typeof saved.value === 'string' && allowed.has(saved.value)) {
+              const input = fieldset.querySelector(
+                `input[name="${CSS.escape(question.id)}"][value="${CSS.escape(saved.value)}"]`,
+              );
+              if (input) input.checked = true;
+            }
+          } else if (question.kind === 'multi_select' && Array.isArray(saved.value)) {
+            const allowed = new Set((question.options ?? []).map((option) => option.id));
+            for (const value of saved.value) {
+              if (typeof value !== 'string' || !allowed.has(value)) continue;
+              const input = fieldset.querySelector(
+                `input[name="${CSS.escape(question.id)}"][value="${CSS.escape(value)}"]`,
+              );
+              if (input) input.checked = true;
+            }
+          } else if (question.kind === 'text' && typeof saved.value === 'string') {
+            const input = fieldset.querySelector(`[name="${CSS.escape(question.id)}"]`);
+            if (input) input.value = saved.value.slice(0, Number(question.maxLength ?? 2000));
+          }
+
+          if (saved.customValues && typeof saved.customValues === 'object') {
+            for (const input of fieldset.querySelectorAll('[data-custom-input="true"]')) {
+              const value = saved.customValues[input.dataset.optionId];
+              if (typeof value === 'string') input.value = value;
+            }
+          }
+
+          syncOptionState(fieldset);
+        }
+
+        return { restored: true, submitted: persisted.submitted === true };
+      }
+
       function responseText(payload, answers) {
         const requestData = payload.request;
         const lines = [`Structured response: ${requestData.title}`];
@@ -574,6 +696,7 @@
             role: 'user',
             content: [{ type: 'text', text: message }],
           });
+          persistCurrentForm(payload, form, true);
           for (const input of form.querySelectorAll('input, textarea, button')) input.disabled = true;
           status.textContent = 'Submitted.';
         } catch (error) {
@@ -606,6 +729,17 @@
         }
         actions.append(submitButton, status);
         form.append(actions);
+        const restored = restorePersistedForm(payload, form);
+        if (restored.submitted) {
+          for (const input of form.querySelectorAll('input, textarea, button')) input.disabled = true;
+          status.textContent = 'Submitted.';
+        }
+        form.addEventListener('input', () => {
+          if (!restored.submitted) persistCurrentForm(payload, form, false);
+        });
+        form.addEventListener('change', () => {
+          if (!restored.submitted) persistCurrentForm(payload, form, false);
+        });
         form.addEventListener('submit', (event) => {
           event.preventDefault();
           void submitForm(payload, form, submitButton, status);
