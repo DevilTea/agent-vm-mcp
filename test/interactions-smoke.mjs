@@ -195,7 +195,14 @@ try {
     const content = resource.contents[0];
     assert.equal(content.mimeType, 'text/html;profile=mcp-app');
     assert.equal(typeof content.text, 'string');
-    const resourceDigest = createHash('sha256').update(content.text).digest('hex').slice(0, 12);
+    assert.equal(content._meta?.['openai/widgetPrefersBorder'], true);
+    assert.equal(content._meta?.ui?.prefersBorder, true);
+    const resourceDigest = createHash('sha256')
+      .update(content.text)
+      .update('\0')
+      .update(JSON.stringify(content._meta))
+      .digest('hex')
+      .slice(0, 12);
     assert.equal(
       CHATGPT_INTERACTION_RESOURCE_URI,
       `ui://agent-vm/request-user-input/v1-${resourceDigest}.html`,
