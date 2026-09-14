@@ -15,6 +15,7 @@ The native MCP surface includes:
 - persistent interactive process sessions;
 - persistent coding-agent orchestration through Herdr for supported harnesses such as Codex, Antigravity CLI, and Claude Code;
 - CLI capability discovery and a read-only system maintenance audit;
+- host-facing `skill_list`/`skill_read` access to the published dot-agents skill projection;
 - opaque MCP artifact resources and host-native file/image presentation;
 - upstream MCP bridging over stdio or Streamable HTTP, with tool filtering, prefixing, renaming, adapters, and call policies.
 
@@ -88,6 +89,19 @@ Examples of unavailable integrations include a missing stdio executable, connect
 
 Invalid JSON, unsupported config versions, duplicate bridge IDs, invalid adapter/policy configuration, unsupported transport definitions, and deterministic exported-tool collisions are startup errors. Partial bridge initialization is rolled back before the error escapes.
 
+## Dot-agents skill projection
+
+The native `skill_list` and `skill_read` tools consume only the dot-agents host-facing projection. They do not scan harness directories and do not infer or expose Codex system skills. The projection is published as a version 1 directory containing `catalog.json` and `skills/<name>/...`; the catalog `source` must be `dot-agents`.
+
+The default projection root is:
+
+```text
+${XDG_DATA_HOME:-$HOME/.local/share}/dot-agents/skill-projection/v1/
+```
+
+Set `AGENT_MCP_SKILL_PROJECTION_ROOT` to use another projection root. `skill_list` returns the projection availability, root source, and catalog entries without filesystem paths. Its optional `query` is a case-insensitive substring filter over skill names and descriptions. When reusable guidance may apply, the host should inspect `skill_list`, then call `skill_read` for the relevant `SKILL.md` before acting.
+
+`skill_read` defaults to `SKILL.md` and can read bounded UTF-8 text from safe relative paths under the named skill, including references and scripts as text. It rejects traversal, symlink/escape paths, binary or non-UTF-8 content, and oversized files. Missing or invalid projections produce an explicit unavailable result and do not prevent MCP startup. Projection content is instructions/data, not executable capability.
 
 ## Structured user input
 

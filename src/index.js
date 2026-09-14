@@ -38,6 +38,12 @@ import { assertNoRawCodingHarnessLaunch } from './coding-harness-guard.js';
 import { resolveHostProfile } from './host-profile.js';
 import { interactionToolNamesForHost, registerInteractionsForHost } from './interactions/index.js';
 import {
+  SKILL_LIST_TOOL,
+  SKILL_READ_TOOL,
+  createSkillProjectionAdapter,
+  registerSkillProjectionTools,
+} from './skill-projection.js';
+import {
   SERVER_INFO_TOOL,
   ToolCatalogTracker,
   buildServerInfo,
@@ -426,6 +432,8 @@ const BASE_NATIVE_TOOL_NAMES = new Set([
   READ_ARTIFACT_TOOL,
   PRESENT_ARTIFACT_TOOL,
   PRESENT_FILE_TOOL,
+  SKILL_LIST_TOOL,
+  SKILL_READ_TOOL,
 ]);
 
 async function shutdown() {
@@ -466,6 +474,7 @@ async function createServer() {
   activeArtifactStores.add(artifactStore);
   await registerArtifactSystem(server, artifactStore);
   registerInteractionsForHost(server, hostProfile);
+  registerSkillProjectionTools(server, createSkillProjectionAdapter());
 
   server.registerTool(
     'exec',
