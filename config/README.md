@@ -194,6 +194,8 @@ Automatic discovery covers:
 
 An installed item without a safe inferred update source, explicit `latestSources` entry, or `managedBy` owner is surfaced under `coverage.untracked` rather than silently disappearing.
 
+For curated commands that are also selected by mise, the audit keeps the version observed from the executable that `PATH` actually resolves instead of overwriting it with mise metadata. If that resolved version differs from mise's active/configured version, the item is reported with `status: "mismatch"`, a structured `versionMismatch`, and is included in the top-level `mismatches` list / `summary.mismatches` count. This catches provider collisions such as a stale Node/Corepack `pnpm` shim shadowing the separately pinned mise pnpm.
+
 ### Repository state
 
 Repository status separates local tracking ancestry from live remote observation.

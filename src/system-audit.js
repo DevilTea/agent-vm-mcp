@@ -252,6 +252,8 @@ function ensureItem(inventory, rawId, config) {
       installed: false,
       available: null,
       currentVersion: null,
+      resolvedVersion: null,
+      resolvedPath: null,
       installedVersions: [],
       activeVersion: null,
       requestedVersion: null,
@@ -266,6 +268,7 @@ function ensureItem(inventory, rawId, config) {
       changeKind: null,
       status: 'unknown',
       lookupError: null,
+      versionMismatch: null,
     });
   }
   return inventory.get(id);
@@ -320,8 +323,13 @@ async function discoverCurated({ inventory, config, capabilitiesConfig, agentRun
       }
     }
 
-    if (executable) pushUnique(item.paths, executable);
+    if (executable) {
+      pushUnique(item.paths, executable);
+      item.resolvedPath ??= executable;
+    }
     if (item.available) item.installed = true;
+    const resolvedVersion = extractVersion(version);
+    if (resolvedVersion) item.resolvedVersion ??= resolvedVersion;
     addVersion(item, version);
     if (!item.updateSource && systemManagedPath(executable)) item.managedBy = 'apt/system';
   }
@@ -358,11 +366,19 @@ async function discoverMise({ inventory, config, deps, sourceErrors }) {
       });
       if (entry.active) {
         item.activeVersion = extractVersion(entry.version);
-        item.currentVersion = item.activeVersion ?? item.currentVersion;
+        item.currentVersion ??= item.activeVersion;
       }
       if (entry.requested_version) item.requestedVersion = extractVersion(entry.requested_version) ?? entry.requested_version;
     }
     if (!item.currentVersion) item.currentVersion = item.requestedVersion ?? item.installedVersions[0] ?? null;
+    if (item.resolvedVersion && item.activeVersion && item.resolvedVersion !== item.activeVersion) {
+      item.versionMismatch = {
+        configuredVersion: item.requestedVersion ?? item.activeVersion,
+        activeVersion: item.activeVersion,
+        resolvedVersion: item.resolvedVersion,
+        resolvedPath: item.resolvedPath,
+      };
+    }
     if (tool.startsWith('npm:')) {
       setSource(item, { kind: 'npm', package: tool.slice(4) }, 'inferred:mise-npm');
     } else {
@@ -506,6 +522,10 @@ function finalizeInventory({ inventory, config, checkLatest }) {
     if (managedElsewhere[item.id]) item.managedBy ??= 'configured-managed-elsewhere';
     if (!item.installed) {
       item.status = 'unavailable';
+      continue;
+    }
+    if (item.versionMismatch) {
+      item.status = 'mismatch';
       continue;
     }
     if (!item.updateSource) {
@@ -723,6 +743,7 @@ function compactItem(item) {
     latestVersion: item.latestVersion,
     changeKind: item.changeKind,
     status: item.status,
+    versionMismatch: item.versionMismatch,
   };
 }
 
@@ -822,6 +843,7 @@ export async function collectSystemAudit(options = {}) {
     }));
   const updates = items.filter((item) => item.status === 'update').map(compactItem);
   const current = items.filter((item) => item.status === 'current').map(compactItem);
+  const mismatches = items.filter((item) => item.status === 'mismatch').map(compactItem);
   const unknown = items.filter((item) => ['unknown', 'unchecked', 'untracked'].includes(item.status)).map(compactItem);
 
   const result = {
@@ -830,6 +852,7 @@ export async function collectSystemAudit(options = {}) {
     summary: {
       updates: updates.length,
       current: current.length,
+      mismatches: mismatches.length,
       unknown: unknown.length,
       untracked: untracked.length,
       unavailable: items.filter((item) => item.status === 'unavailable').length,
@@ -845,6 +868,7 @@ export async function collectSystemAudit(options = {}) {
     },
     updates,
     current,
+    mismatches,
     unknown,
     coverage: {
       discoveredCount: items.length,

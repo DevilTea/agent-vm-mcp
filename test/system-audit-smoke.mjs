@@ -273,6 +273,59 @@ function isolatedConfig(overrides = {}) {
   };
 }
 
+const pnpmProviderCollisionAudit = await collectSystemAudit({
+  checkLatest: false,
+  home: '/fake/home',
+  config: isolatedConfig(),
+  capabilitiesConfig: {
+    version: 1,
+    commands: [
+      { name: 'pnpm', category: 'runtime', summary: 'pnpm package manager', versionArgs: ['--version'] },
+    ],
+    probes: [],
+  },
+  agentRuntime: { runtime: null, harnesses: [] },
+  bridgeStatus: { bridges: [] },
+  deps: {
+    ...isolatedAuditDeps(async (command, args) => {
+      if (command === '/fake/mise/shims/pnpm' && args.join(' ') === '--version') return result('12.4.1\n');
+      if (command === 'mise' && args.join(' ') === 'ls --json') {
+        return result(JSON.stringify({
+          pnpm: [
+            {
+              version: '11.25.0',
+              requested_version: '11.25.0',
+              install_path: '/fake/mise/installs/pnpm/11.25.0',
+              installed: true,
+              active: true,
+            },
+          ],
+        }));
+      }
+      if (command === 'npm' && args.join(' ') === 'ls -g --depth=0 --json') return result('{"dependencies":{}}');
+      if (command === 'apt' && args.join(' ') === 'list --upgradable') return result('Listing...\n');
+      throw new Error(`unexpected pnpm collision command: ${command} ${args.join(' ')}`);
+    }),
+    findExecutable: async (name) => (name === 'pnpm' ? '/fake/mise/shims/pnpm' : null),
+  },
+});
+const pnpmCollision = pnpmProviderCollisionAudit.inventory.find((item) => item.id === 'pnpm');
+assert.equal(pnpmCollision.currentVersion, '12.4.1');
+assert.equal(pnpmCollision.resolvedVersion, '12.4.1');
+assert.equal(pnpmCollision.activeVersion, '11.25.0');
+assert.equal(pnpmCollision.requestedVersion, '11.25.0');
+assert.equal(pnpmCollision.status, 'mismatch');
+assert.deepEqual(pnpmCollision.versionMismatch, {
+  configuredVersion: '11.25.0',
+  activeVersion: '11.25.0',
+  resolvedVersion: '12.4.1',
+  resolvedPath: '/fake/mise/shims/pnpm',
+});
+assert.equal(pnpmProviderCollisionAudit.summary.mismatches, 1);
+assert.equal(pnpmProviderCollisionAudit.mismatches[0].id, 'pnpm');
+assert.equal(pnpmProviderCollisionAudit.current.some((item) => item.id === 'pnpm'), false);
+console.log('PASS system audit resolved/configured tool mismatch');
+
 const repositoryCases = {
   '/repo/sync': {
     head: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
