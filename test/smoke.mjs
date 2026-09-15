@@ -487,6 +487,25 @@ exec /usr/bin/git "$@"
     throw new Error('workspace_create tag checkout resolved the wrong content');
   }
 
+  const sharedRepositoryPath = `${repositoryRoot}/${defaultWorkspace.repositoryKey}.git`;
+  await execFileAsync('/usr/bin/git', ['-C', sharedRepositoryPath, 'update-ref', 'refs/heads/main', defaultWorkspace.head]);
+  await fs.writeFile(`${workspaceSeedRoot}/fixture.txt`, 'remote-main\n', 'utf8');
+  await execFileAsync('/usr/bin/git', ['-C', workspaceSeedRoot, 'commit', '-am', 'remote main']);
+  await execFileAsync('/usr/bin/git', ['-C', workspaceSeedRoot, 'push', 'origin', 'main']);
+  const remoteMainHead = (await execFileAsync('/usr/bin/git', ['-C', workspaceSeedRoot, 'rev-parse', 'HEAD'])).stdout.trim();
+  const remoteBranchWorkspace = parseJsonToolResult(
+    await client.callTool({
+      name: 'workspace_create',
+      arguments: { repository: workspaceOrigin, revision: 'main', timeoutMs: 30_000 },
+    }),
+  );
+  if (remoteBranchWorkspace.revision !== 'main' || remoteBranchWorkspace.head !== remoteMainHead) {
+    throw new Error('workspace_create unqualified branch did not prefer the freshly fetched remote branch');
+  }
+  if ((await fs.readFile(`${remoteBranchWorkspace.path}/fixture.txt`, 'utf8')) !== 'remote-main\n') {
+    throw new Error('workspace_create unqualified branch checked out stale local branch content');
+  }
+
   await fs.writeFile(workspaceConcurrencyTriggerPath, '1\n', 'utf8');
   const [concurrentResultA, concurrentResultB] = await Promise.all([
     client.callTool({
@@ -518,7 +537,6 @@ exec /usr/bin/git "$@"
   const repositoryEntries = (await fs.readdir(repositoryRoot)).filter((name) => name.endsWith('.git'));
   if (repositoryEntries.length !== 1) throw new Error('workspace repository store was not deduplicated');
 
-  const sharedRepositoryPath = `${repositoryRoot}/${defaultWorkspace.repositoryKey}.git`;
   await execFileAsync('/usr/bin/git', [
     '-C',
     sharedRepositoryPath,
@@ -636,7 +654,7 @@ exec /usr/bin/git "$@"
     const rediscovered = parseJsonToolResult(
       await rediscoveryClient.callTool({ name: 'workspace_list', arguments: {} }),
     ).workspaces.filter((workspace) => workspace.state === 'ready');
-    if (rediscovered.length !== 4 || rediscovered.some((workspace) => workspace.repositoryKey !== defaultWorkspace.repositoryKey)) {
+    if (rediscovered.length !== 5 || rediscovered.some((workspace) => workspace.repositoryKey !== defaultWorkspace.repositoryKey)) {
       throw new Error('workspace_list did not reconstruct durable state in a fresh MCP process');
     }
   } finally {
@@ -696,7 +714,7 @@ exec /usr/bin/git "$@"
   }
   if (!tagWorkspaceRemoved) throw new Error('workspace_delete cancellation interrupted committed removal');
 
-  for (const workspace of [concurrentWorkspaceA, concurrentWorkspaceB]) {
+  for (const workspace of [remoteBranchWorkspace, concurrentWorkspaceA, concurrentWorkspaceB]) {
     parseJsonToolResult(
       await client.callTool({ name: 'workspace_delete', arguments: { workspaceId: workspace.id } }),
     );
