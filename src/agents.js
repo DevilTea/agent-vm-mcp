@@ -9,7 +9,7 @@ const DEFAULT_COMMAND_TIMEOUT_MS = 30_000;
 const DEFAULT_START_TIMEOUT_MS = 60_000;
 const WORKSPACE_CLEANUP_DISCOVERY_MS = 5_000;
 const METADATA_LOCK_TIMEOUT_MS = 5_000;
-const METADATA_LOCK_STALE_MS = 1_000;
+const METADATA_LOCK_STALE_MS = 10_000;
 const NATIVE_LAUNCH_LOCK_TIMEOUT_MS = DEFAULT_START_TIMEOUT_MS + 5_000;
 const NATIVE_LAUNCH_LOCK_STALE_MS = DEFAULT_START_TIMEOUT_MS + 30_000;
 const MAX_COMMAND_OUTPUT_BYTES = 1024 * 1024;
@@ -20,6 +20,9 @@ const AGENT_ID_PATTERN = /^agent-[0-9a-f]{26}$/;
 const READY_STATUSES = new Set(['idle', 'done']);
 const BOOTSTRAP_MODES = new Set(['auto', 'external']);
 const AGENT_METADATA_VERSION = 2;
+const TERMINAL_METADATA_RETENTION_MS = 30 * 24 * 60 * 60 * 1_000;
+const MAX_TERMINAL_METADATA_RECORDS = 100;
+const TERMINAL_METADATA_LIFECYCLES = new Set(['orphaned', 'quarantined']);
 const LIFECYCLE_STATES = new Set(['active', 'starting', 'suspending', 'suspended', 'resuming', 'orphaned', 'quarantined']);
 const CODEX_SUPPORTED_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
 const CODEX_POLICY = Object.freeze({ model: 'gpt-5.6-luna', effort: 'max' });
@@ -213,13 +216,47 @@ function metadataLockPath() {
   return `${metadataPath()}.lock`;
 }
 
+function lockOwnerIsAlive(owner) {
+  if (!Number.isInteger(owner?.pid) || owner.pid <= 0) return false;
+  try {
+    process.kill(owner.pid, 0);
+    return true;
+  } catch (error) {
+    if (error?.code === 'ESRCH') return false;
+    return true;
+  }
+}
+
+async function readDirectoryLockOwner(lockPath) {
+  try {
+    const parsed = JSON.parse(await fs.readFile(path.join(lockPath, 'owner.json'), 'utf8'));
+    return parsed && typeof parsed.token === 'string' ? parsed : null;
+  } catch (error) {
+    if (error?.code === 'ENOENT' || error instanceof SyntaxError) return null;
+    throw error;
+  }
+}
+
 async function acquireDirectoryLock(lockPath, { timeoutMs, staleMs } = {}) {
   const deadline = Date.now() + timeoutMs;
   await fs.mkdir(metadataDirectory(), { recursive: true, mode: 0o700 });
   while (Date.now() < deadline) {
+    const owner = { pid: process.pid, token: randomUUID() };
     try {
       await fs.mkdir(lockPath, { mode: 0o700 });
+      try {
+        await fs.writeFile(path.join(lockPath, 'owner.json'), `${JSON.stringify(owner)}\n`, {
+          encoding: 'utf8',
+          mode: 0o600,
+          flag: 'wx',
+        });
+      } catch (ownerError) {
+        await fs.rm(lockPath, { recursive: true, force: true }).catch(() => {});
+        throw ownerError;
+      }
       return async () => {
+        const currentOwner = await readDirectoryLockOwner(lockPath);
+        if (!currentOwner || currentOwner.pid !== owner.pid || currentOwner.token !== owner.token) return;
         await fs.rm(lockPath, { recursive: true, force: false }).catch((error) => {
           if (error?.code !== 'ENOENT') throw error;
         });
@@ -229,8 +266,11 @@ async function acquireDirectoryLock(lockPath, { timeoutMs, staleMs } = {}) {
       try {
         const stat = await fs.stat(lockPath);
         if (Date.now() - stat.mtimeMs > staleMs) {
-          await fs.rm(lockPath, { recursive: true, force: false });
-          continue;
+          const currentOwner = await readDirectoryLockOwner(lockPath);
+          if (!currentOwner || !lockOwnerIsAlive(currentOwner)) {
+            await fs.rm(lockPath, { recursive: true, force: false });
+            continue;
+          }
         }
       } catch (statError) {
         if (statError?.code !== 'ENOENT') throw statError;
@@ -258,6 +298,57 @@ async function acquireNativeLaunchLock() {
   });
 }
 
+function isDetachedTerminalMetadata(record) {
+  return Boolean(
+    record &&
+    TERMINAL_METADATA_LIFECYCLES.has(record.lifecycle) &&
+    !record.runtimeAgentId &&
+    !record.runtimeWorkspaceId &&
+    !record.quarantineRuntime
+  );
+}
+
+function terminalMetadataTimestamp(record) {
+  const value = record?.terminalAt ?? record?.updatedAt;
+  if (typeof value !== 'string') return null;
+  const parsed = Date.parse(value);
+  if (!Number.isFinite(parsed)) return null;
+  return new Date(parsed).toISOString() === value ? parsed : null;
+}
+
+function pruneDetachedTerminalMetadata(metadata, nowMs = Date.now()) {
+  const removable = Object.entries(metadata.agents)
+    .filter(([agentId, record]) => agentId === record?.agentId && isDetachedTerminalMetadata(record))
+    .map(([agentId, record]) => ({ agentId, record, timestamp: terminalMetadataTimestamp(record) }))
+    .filter(({ timestamp }) => timestamp !== null && timestamp <= nowMs);
+  const removedIds = new Set();
+
+  for (const { agentId, timestamp } of removable) {
+    if (nowMs - timestamp >= TERMINAL_METADATA_RETENTION_MS) removedIds.add(agentId);
+  }
+
+  const retained = removable
+    .filter(({ agentId }) => !removedIds.has(agentId))
+    .sort((left, right) => right.timestamp - left.timestamp);
+  for (const { agentId } of retained.slice(MAX_TERMINAL_METADATA_RECORDS)) removedIds.add(agentId);
+
+  if (removedIds.size === 0) return { metadata, removedIds: [] };
+  for (const agentId of removedIds) delete metadata.agents[agentId];
+  return { metadata, removedIds: [...removedIds] };
+}
+
+async function collectAgentMetadata() {
+  const release = await acquireMetadataLock();
+  try {
+    const metadata = await readAgentMetadata();
+    const collected = pruneDetachedTerminalMetadata(metadata);
+    if (collected.removedIds.length > 0) await writeAgentMetadata(collected.metadata);
+    return collected.metadata;
+  } finally {
+    await release();
+  }
+}
+
 async function updateAgentMetadata(agentId, update) {
   const release = await acquireMetadataLock();
   try {
@@ -266,6 +357,7 @@ async function updateAgentMetadata(agentId, update) {
     const next = typeof update === 'function' ? update(current) : update;
     if (next === null) delete metadata.agents[agentId];
     else metadata.agents[agentId] = next;
+    pruneDetachedTerminalMetadata(metadata);
     await writeAgentMetadata(metadata);
     return next;
   } finally {
@@ -310,12 +402,14 @@ async function closeExactlyOwnedWorkspace(runtimeAgentId, workspace, signal) {
 }
 
 async function quarantineCodexRecord(record, reason, snapshot = null, signal) {
+  const now = new Date().toISOString();
   const next = {
     ...record,
     lifecycle: 'quarantined',
     policyStatus: 'unverified',
     quarantineReason: reason,
-    updatedAt: new Date().toISOString(),
+    terminalAt: record.lifecycle === 'quarantined' ? (record.terminalAt ?? now) : now,
+    updatedAt: now,
   };
 
   if (snapshot && record.runtimeAgentId) {
@@ -372,7 +466,7 @@ async function reconcileAgentMetadata(snapshot = null, signal) {
             runtimeWorkspaceId: null,
             lastRuntimeAgentId: current.runtimeAgentId ?? current.lastRuntimeAgentId ?? null,
             lastWorkspaceId: current.runtimeWorkspaceId ?? current.lastWorkspaceId ?? null,
-            ...(recoverable ? {} : { orphanedReason: 'runtime_absent' }),
+            ...(recoverable ? {} : { orphanedReason: 'runtime_absent', terminalAt: new Date().toISOString() }),
             updatedAt: new Date().toISOString(),
           };
         });
@@ -389,7 +483,7 @@ async function reconcileAgentMetadata(snapshot = null, signal) {
               runtimeWorkspaceId: null,
               lastRuntimeAgentId: current.runtimeAgentId ?? current.lastRuntimeAgentId ?? null,
               lastWorkspaceId: observation.workspace.workspace_id,
-              ...(recoverable ? {} : { orphanedReason: 'runtime_agent_missing' }),
+              ...(recoverable ? {} : { orphanedReason: 'runtime_agent_missing', terminalAt: new Date().toISOString() }),
               updatedAt: new Date().toISOString(),
             };
           });
@@ -437,7 +531,7 @@ async function reconcileAgentMetadata(snapshot = null, signal) {
 }
 
 async function reconcileBeforeOperation(signal) {
-  const metadata = await readAgentMetadata();
+  const metadata = await collectAgentMetadata();
   if (!Object.values(metadata.agents).some((record) => (
     record.lifecycle === 'active' ||
     record.lifecycle === 'starting' ||
@@ -1590,7 +1684,7 @@ async function safePromptDiagnostics(agentId) {
 
 export async function agentCapabilities({ signal } = {}) {
   const definitions = harnessDefinitions();
-  let metadata = await readAgentMetadata();
+  let metadata = await collectAgentMetadata();
   const configuredHerdr = configuredHerdrExecutable();
   const herdrPath = await resolveExecutable(configuredHerdr);
   const herdrAvailable = herdrPath !== null;
@@ -1991,6 +2085,7 @@ async function startAgentRuntime(
           lifecycle: 'quarantined',
           policyStatus: 'unverified',
           quarantineReason: `Codex launch failed and cleanup was not confirmed: ${error.message}`,
+          terminalAt: current.terminalAt ?? new Date().toISOString(),
           updatedAt: new Date().toISOString(),
         } : current).catch(() => {});
       }
@@ -2010,6 +2105,10 @@ export async function agentStart({ harness, cwd, model, effort, timeoutMs = DEFA
 // Kept outside the MCP tool surface so the metadata serialization contract can be tested without a harness.
 export async function __testUpdateAgentMetadata(agentId, update) {
   return await updateAgentMetadata(agentId, update);
+}
+
+export async function __testCollectAgentMetadata() {
+  return await collectAgentMetadata();
 }
 
 export async function agentGet({ agentId }, signal) {
