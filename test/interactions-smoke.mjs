@@ -9,6 +9,7 @@ import { Client } from '@modelcontextprotocol/client';
 import { StdioClientTransport } from '@modelcontextprotocol/client/stdio';
 
 import {
+  OTHER_OPTION_ID,
   REQUEST_USER_INPUT_TOOL,
   interactionRequestSchema,
 } from '../src/interactions/model.js';
@@ -84,7 +85,12 @@ try {
         required: false,
         options: [
           { id: 'a', label: 'A' },
-          { id: 'b', label: 'B' },
+          {
+            id: 'b',
+            label: 'B',
+            allowCustomInput: true,
+            customInputPlaceholder: 'Explain B',
+          },
         ],
         maxSelections: 2,
       },
@@ -109,8 +115,74 @@ try {
   assert.equal(normalized.questions[0].required, true);
   assert.equal(normalized.questions[0].options[2].allowCustomInput, true);
   assert.equal(normalized.questions[0].options[2].customInputPlaceholder, 'Describe the storage option');
+  assert.equal(normalized.questions[0].options.filter((option) => option.id === OTHER_OPTION_ID).length, 1);
+  assert.equal(normalized.questions[1].options[1].allowCustomInput, true);
+  assert.equal(normalized.questions[1].options[1].customInputPlaceholder, 'Explain B');
   assert.equal('allowCustomInput' in normalized.questions[0].options[0], false);
   assert.equal(normalized.questions[2].maxLength, 2_000);
+
+  const automaticOther = interactionRequestSchema.parse({
+    title: 'Automatic Other choices',
+    questions: [
+      {
+        id: 'single',
+        kind: 'single_select',
+        prompt: 'Choose one.',
+        options: [
+          { id: 'a', label: 'A' },
+          { id: 'b', label: 'B' },
+        ],
+      },
+      {
+        id: 'multi',
+        kind: 'multi_select',
+        prompt: 'Choose any.',
+        options: [
+          { id: 'a', label: 'A' },
+          { id: 'b', label: 'B' },
+        ],
+        minSelections: 1,
+        maxSelections: 3,
+      },
+    ],
+  });
+  for (const question of automaticOther.questions) {
+    assert.deepEqual(question.options.map((option) => option.id), ['a', 'b', OTHER_OPTION_ID]);
+    assert.equal(question.options.filter((option) => option.id === OTHER_OPTION_ID).length, 1);
+    assert.deepEqual(question.options.at(-1), {
+      id: OTHER_OPTION_ID,
+      label: 'Other',
+      recommended: false,
+      allowCustomInput: true,
+      customInputPlaceholder: 'Please specify another option',
+    });
+  }
+  assert.equal(automaticOther.questions[1].options.length, 3);
+  assert.equal(automaticOther.questions[1].minSelections, 1);
+  assert.equal(automaticOther.questions[1].maxSelections, 3);
+
+  const normalizedByLabel = interactionRequestSchema.parse({
+    title: 'Existing Other label',
+    questions: [
+      {
+        id: 'choice',
+        kind: 'single_select',
+        prompt: 'Choose.',
+        options: [
+          { id: 'a', label: 'A' },
+          { id: 'custom-route', label: '  other  ', allowCustomInput: false },
+        ],
+      },
+    ],
+  });
+  assert.deepEqual(normalizedByLabel.questions[0].options.map((option) => option.id), ['a', OTHER_OPTION_ID]);
+  assert.deepEqual(normalizedByLabel.questions[0].options[1], {
+    id: OTHER_OPTION_ID,
+    label: 'Other',
+    recommended: false,
+    allowCustomInput: true,
+    customInputPlaceholder: 'Please specify another option',
+  });
 
   assert.throws(
     () =>
@@ -186,8 +258,12 @@ try {
     assert.deepEqual(interactionTool._meta?.ui?.visibility, ['model']);
     assert.match(interactionTool.description ?? '', /Do not prefix question prompts with ordinal numbers/);
     assert.match(interactionTool.description ?? '', /Prefer single_select for binary choices too/);
+    assert.match(interactionTool.description ?? '', /automatically includes exactly one reserved option/);
+    assert.match(interactionTool.description ?? '', /required inline free-text input/);
+    assert.match(interactionTool.description ?? '', /do not add Other yourself/);
     assert.match(JSON.stringify(interactionTool.inputSchema), /allowCustomInput/);
     assert.match(JSON.stringify(interactionTool.inputSchema), /customInputPlaceholder/);
+    assert.match(JSON.stringify(interactionTool.inputSchema), /reserved `other` choice/);
     const capabilities = parseJsonToolResult(await chatgpt.callTool({ name: 'capabilities', arguments: {} }));
     assert.equal(capabilities.mcp.nativeTools.includes(REQUEST_USER_INPUT_TOOL), true);
 
@@ -213,9 +289,12 @@ try {
     assert.match(content.text, /ui\/message/);
     assert.match(content.text, /2026-01-26/);
     assert.match(content.text, /option\.allowCustomInput === true/);
+    assert.match(content.text, /for \(const option of question\.options \?\? \[\]\)/);
     assert.match(content.text, /data-custom-input/);
+    assert.match(content.text, /const customValue = input\.value\.trim\(\)/);
     assert.match(content.text, /Please provide additional details/);
     assert.match(content.text, /Custom value \[/);
+    assert.match(content.text, /customValues\[optionId\]/);
     assert.match(content.text, /FORM_STATE_PREFIX/);
     assert.match(content.text, /window\.localStorage\.setItem/);
     assert.match(content.text, /restorePersistedForm/);
@@ -240,13 +319,17 @@ try {
             options: [
               { id: 'git', label: 'Git' },
               { id: 'external', label: 'External storage', recommended: true },
-              {
-                id: 'other',
-                label: 'Other',
-                allowCustomInput: true,
-                customInputPlaceholder: 'Describe another storage strategy',
-              },
             ],
+          },
+          {
+            id: 'formats',
+            kind: 'multi_select',
+            prompt: 'Which formats should be supported?',
+            options: [
+              { id: 'markdown', label: 'Markdown' },
+              { id: 'html', label: 'HTML' },
+            ],
+            maxSelections: 2,
           },
         ],
       },
@@ -256,12 +339,25 @@ try {
     assert.equal(result.structuredContent?.schemaVersion, 1);
     assert.match(result.structuredContent?.interactionId ?? '', /^[0-9a-f-]{36}$/i);
     assert.equal(result.structuredContent?.request?.questions?.[0]?.required, true);
+    assert.deepEqual(
+      result.structuredContent?.request?.questions?.[0]?.options?.map((option) => option.id),
+      ['git', 'external', OTHER_OPTION_ID],
+    );
+    assert.equal(result.structuredContent?.request?.questions?.[0]?.options?.[2]?.label, 'Other');
     assert.equal(result.structuredContent?.request?.questions?.[0]?.options?.[2]?.allowCustomInput, true);
     assert.equal(
       result.structuredContent?.request?.questions?.[0]?.options?.[2]?.customInputPlaceholder,
-      'Describe another storage strategy',
+      'Please specify another option',
     );
+    assert.deepEqual(
+      result.structuredContent?.request?.questions?.[1]?.options?.map((option) => option.id),
+      ['markdown', 'html', OTHER_OPTION_ID],
+    );
+    assert.equal(result.structuredContent?.request?.questions?.[1]?.options?.[2]?.allowCustomInput, true);
+    assert.equal(result.structuredContent?.request?.questions?.[1]?.maxSelections, 2);
+    assert.equal(result.structuredContent?.request?.questions?.[1]?.options?.length, 3);
     assert.match(result.content?.[0]?.text ?? '', /custom input required/);
+    assert.match(result.content?.[0]?.text ?? '', /other: Other/);
     assert.match(result.content?.[0]?.text ?? '', /Wait for the user response/);
   } finally {
     await chatgpt.close().catch(() => {});
