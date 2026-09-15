@@ -154,40 +154,52 @@ function patchPathStyle(header) {
   return 'cwd';
 }
 
-function patchStripComponents(patch) {
-  let pendingOld = null;
-  let mode = null;
-
-  for (const line of patch.split('\n')) {
-    const gitDiffHeader = line.startsWith('diff --git a/') || line.startsWith('diff --git "a/');
-    if (gitDiffHeader) {
-      if (mode === 'cwd') {
-        throw new Error('Patch mixes cwd-relative paths with git a/ and b/ path prefixes. Use one path style per patch.');
-      }
-      mode = 'git';
-      continue;
-    }
-    if (line.startsWith('--- ')) {
-      pendingOld = patchPathStyle(line.slice(4));
-      continue;
-    }
-    if (!line.startsWith('+++ ') || pendingOld === null) continue;
-
-    const next = patchPathStyle(line.slice(4));
-    const gitStyle =
-      (pendingOld === 'null' || pendingOld === 'git-old') &&
-      (next === 'null' || next === 'git-new') &&
-      !(pendingOld === 'null' && next === 'null');
-    const pairMode = gitStyle ? 'git' : 'cwd';
-
-    if (mode !== null && mode !== pairMode) {
-      throw new Error('Patch mixes cwd-relative paths with git a/ and b/ path prefixes. Use one path style per patch.');
-    }
-    mode = pairMode;
-    pendingOld = null;
+function patchHeaderPairs(patch) {
+  const lines = patch.split('\n');
+  const pairs = [];
+  for (let index = 0; index + 2 < lines.length; index += 1) {
+    const oldLine = lines[index];
+    const newLine = lines[index + 1];
+    const nextLine = lines[index + 2];
+    if (!oldLine.startsWith('--- ') || !newLine.startsWith('+++ ') || !nextLine.startsWith('@@')) continue;
+    pairs.push({ oldStyle: patchPathStyle(oldLine.slice(4)), newStyle: patchPathStyle(newLine.slice(4)) });
   }
+  return pairs;
+}
 
-  return mode === 'git' ? 1 : 0;
+function inferPatchPathStyle(patch, requestedStyle = 'auto') {
+  if (requestedStyle === 'cwd' || requestedStyle === 'git') return requestedStyle;
+  if (requestedStyle !== 'auto') throw new Error(`Unsupported patch path style: ${requestedStyle}`);
+
+  const hasGitDiffHeader = patch.split('\n').some((line) => (
+    line.startsWith('diff --git a/') || line.startsWith('diff --git "a/')
+  ));
+  const headerPairs = patchHeaderPairs(patch);
+  const pairIsGitLike = ({ oldStyle, newStyle }) => (
+    (oldStyle === 'null' || oldStyle === 'git-old') &&
+    (newStyle === 'null' || newStyle === 'git-new') &&
+    !(oldStyle === 'null' && newStyle === 'null')
+  );
+  const hasCwdPair = headerPairs.some((pair) => !pairIsGitLike(pair));
+  const hasGitLikePair = headerPairs.some(pairIsGitLike);
+
+  if (hasGitDiffHeader) {
+    if (hasCwdPair) {
+      throw new Error('Patch mixes git diff metadata with cwd-relative file headers. Use one path style per patch.');
+    }
+    return 'git';
+  }
+  if (hasGitLikePair) {
+    throw new Error(
+      'Patch path style is ambiguous: a/ and b/ may be real cwd-relative directories or synthetic git prefixes. ' +
+      'Set pathStyle to "cwd" or "git" explicitly.',
+    );
+  }
+  return 'cwd';
+}
+
+function patchStripComponents(pathStyle) {
+  return pathStyle === 'git' ? 1 : 0;
 }
 
 function strictGitApplyArgs({ check, stripComponents }) {
@@ -322,7 +334,7 @@ function parseNumstat(buffer) {
   return files;
 }
 
-export async function applyUnifiedPatch({ patch, cwd }, requestSignal) {
+export async function applyUnifiedPatch({ patch, cwd, pathStyle = 'auto' }, requestSignal) {
   const patchBytes = Buffer.byteLength(patch, 'utf8');
   if (patchBytes > MAX_PATCH_BYTES) {
     throw new Error(`Patch is ${patchBytes} bytes; apply_patch supports at most ${MAX_PATCH_BYTES} bytes.`);
@@ -331,7 +343,8 @@ export async function applyUnifiedPatch({ patch, cwd }, requestSignal) {
   const resolvedCwd = path.resolve(cwd ?? process.env.HOME);
   const cwdStat = await fs.stat(resolvedCwd);
   if (!cwdStat.isDirectory()) throw new Error(`Patch cwd is not a directory: ${resolvedCwd}`);
-  const stripComponents = patchStripComponents(patch);
+  const resolvedPathStyle = inferPatchPathStyle(patch, pathStyle);
+  const stripComponents = patchStripComponents(resolvedPathStyle);
 
   const numstat = await runGitApply({
     cwd: resolvedCwd,
@@ -360,6 +373,7 @@ export async function applyUnifiedPatch({ patch, cwd }, requestSignal) {
   return {
     cwd: resolvedCwd,
     bytes: patchBytes,
+    pathStyle: resolvedPathStyle,
     files,
   };
 }
