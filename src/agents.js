@@ -2026,6 +2026,116 @@ export async function agentRead({ agentId, source = 'recent-unwrapped', lines = 
   return { agentId, source, lines: Math.max(1, Math.min(MAX_AGENT_READ_LINES, lines)), text };
 }
 
+async function finalizeCompletedPromptRuntime(agentId, completedAgent, signal) {
+  if (completedAgent?.status !== 'done') {
+    return { action: 'retained', reason: 'status_not_done', status: completedAgent?.status ?? 'unknown' };
+  }
+
+  try {
+    return await withLifecycleLock(agentId, async () => {
+      const metadata = await reconcileBeforeOperation(signal);
+      const record = metadata.agents[agentId] ?? null;
+      if (!record || record.lifecycle !== 'active') {
+        return {
+          action: 'already_finalized',
+          lifecycle: record?.lifecycle ?? null,
+        };
+      }
+
+      const owned = await requireOwnedAgent(agentId, { signal, timeoutMs: 5_000 });
+      if (owned.agent.agent_status !== 'done') {
+        return {
+          action: 'retained',
+          reason: 'status_changed',
+          status: owned.agent.agent_status ?? 'unknown',
+        };
+      }
+
+      const workspaceId = owned.workspace.workspace_id;
+      const verify = await runHerdr(['workspace', 'get', workspaceId], { timeoutMs: 5_000, signal });
+      if (!verify.ok) throwHerdrFailure(verify);
+      if (verify.result.workspace?.label !== owned.runtimeAgentId) {
+        const error = new Error(`Workspace ${workspaceId} is no longer owned by runtime agent ${owned.runtimeAgentId}.`);
+        error.code = 'agent_not_managed';
+        throw error;
+      }
+
+      const latest = await requireOwnedAgent(agentId, { signal, timeoutMs: 5_000 });
+      if (
+        latest.runtimeAgentId !== owned.runtimeAgentId ||
+        latest.workspace.workspace_id !== workspaceId ||
+        latest.agent.workspace_id !== workspaceId
+      ) {
+        const error = new Error(`Agent ${agentId} changed workspace before completion cleanup.`);
+        error.code = 'agent_not_managed';
+        throw error;
+      }
+      if (latest.agent.agent_status !== 'done') {
+        return {
+          action: 'retained',
+          reason: 'status_changed',
+          status: latest.agent.agent_status ?? 'unknown',
+        };
+      }
+
+      const definition = harnessDefinitions()[record.harness];
+      const resumable = Boolean(record.resumable && record.nativeSessionId && definition?.resume?.supported);
+      if (resumable) {
+        await updateAgentMetadata(agentId, {
+          ...record,
+          lifecycle: 'suspending',
+          runtimeWorkspaceId: workspaceId,
+          updatedAt: new Date().toISOString(),
+        });
+        const outcome = await runHerdr(['workspace', 'close', workspaceId], { timeoutMs: 30_000, signal });
+        if (!outcome.ok) throwHerdrFailure(outcome);
+        await verifyRuntimeClosed(owned.runtimeAgentId, workspaceId);
+        await updateAgentMetadata(agentId, {
+          ...record,
+          lifecycle: 'suspended',
+          runtimeAgentId: null,
+          runtimeWorkspaceId: null,
+          lastRuntimeAgentId: owned.runtimeAgentId,
+          lastWorkspaceId: workspaceId,
+          updatedAt: new Date().toISOString(),
+        });
+        return {
+          action: 'suspended',
+          agentId,
+          harness: record.harness,
+          workspaceId,
+          runtimeAgentId: owned.runtimeAgentId,
+          nativeSessionId: record.nativeSessionId,
+        };
+      }
+
+      const outcome = await runHerdr(['workspace', 'close', workspaceId], { timeoutMs: 30_000, signal });
+      if (!outcome.ok) throwHerdrFailure(outcome);
+      await verifyRuntimeClosed(owned.runtimeAgentId, workspaceId);
+      await updateAgentMetadata(agentId, null);
+      return {
+        action: 'stopped',
+        agentId,
+        harness: record.harness,
+        workspaceId,
+        runtimeAgentId: owned.runtimeAgentId,
+        discarded: true,
+      };
+    });
+  } catch (error) {
+    const metadata = await readAgentMetadata().catch(() => null);
+    return {
+      action: 'cleanup_failed',
+      lifecycle: metadata?.agents?.[agentId]?.lifecycle ?? null,
+      error: {
+        code: error?.herdr?.code ?? error?.code ?? 'agent_completion_cleanup_failed',
+        message: error?.message ?? String(error),
+        retryable: true,
+      },
+    };
+  }
+}
+
 export async function agentPrompt(
   { agentId, task, skills = [], wait = true, until = [], timeoutMs = 120_000 },
   signal,
@@ -2199,12 +2309,16 @@ export async function agentPrompt(
     }
 
     const diagnostics = await safePromptDiagnostics(agentId);
+    const runtimeDisposition = wait
+      ? await finalizeCompletedPromptRuntime(agentId, diagnostics.agent, signal)
+      : { action: 'retained', reason: 'wait_disabled', status: diagnostics.agent?.status ?? 'unknown' };
     return {
       accepted: true,
       submission: { state: 'submitted', retrySafe: false, waitCompleted: wait },
       skills,
       agent: diagnostics.agent,
       transcript: diagnostics.transcript,
+      runtimeDisposition,
     };
   } finally {
     promptAgentsInFlight.delete(agentId);

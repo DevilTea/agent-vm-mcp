@@ -178,6 +178,7 @@ if (args[0] === 'server') {
   emit('cli:workspace:get', { type: 'workspace_info', workspace: responseWorkspace });
 } else if (args[0] === 'workspace' && args[1] === 'close') {
   const workspaceId = args[2];
+  if (state.failWorkspaceCloseFor === workspaceId) fail('workspace_close_failed', 'synthetic workspace close failure');
   for (const [name, agent] of Object.entries(state.agents)) {
     if (agent.workspace_id === workspaceId) {
       state.sessions ??= {};
@@ -281,6 +282,7 @@ if (args[0] === 'server') {
   const prompt = args[3];
   agent.transcript += '\n> ' + prompt + '\nFAKE_RESPONSE';
   agent.state_change_seq += 2;
+  if (state.promptResultStatus) agent.agent_status = state.promptResultStatus;
   state.sessions ??= {};
   state.sessions[agent.native_session_id] = { transcript: agent.transcript };
   writeState(state);
@@ -430,6 +432,107 @@ try {
   }
   if (!prompted.transcript.includes('Commit the verified change.')) throw new Error('Task text missing from prompt transcript');
   if (prompted.submission?.state !== 'submitted') throw new Error('Successful prompt did not report submitted state');
+  if (prompted.runtimeDisposition?.action !== 'retained' || prompted.runtimeDisposition.reason !== 'status_not_done') {
+    throw new Error(`Idle prompt was unexpectedly finalized: ${JSON.stringify(prompted.runtimeDisposition)}`);
+  }
+
+  const completedResumable = await agentStart({ harness: 'agy', cwd: root, timeoutMs: 10_000 });
+  state = JSON.parse(await fs.readFile(statePath, 'utf8'));
+  const completedResumableRuntimeId = completedResumable.agent.runtimeAgentId;
+  const completedResumableWorkspaceId = state.agents[completedResumableRuntimeId].workspace_id;
+  state.promptResultStatus = 'done';
+  await fs.writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, 'utf8');
+  const completedResumablePrompt = await agentPrompt({
+    agentId: completedResumable.agent.agentId,
+    task: 'COMPLETE_AND_SUSPEND',
+    wait: true,
+    timeoutMs: 10_000,
+  });
+  if (completedResumablePrompt.runtimeDisposition?.action !== 'suspended') {
+    throw new Error(`Completed resumable prompt was not auto-suspended: ${JSON.stringify(completedResumablePrompt.runtimeDisposition)}`);
+  }
+  state = JSON.parse(await fs.readFile(statePath, 'utf8'));
+  const completedResumableMetadata = JSON.parse(await fs.readFile(path.join(home, '.local', 'state', 'agent-vm-mcp', 'agents.json'), 'utf8')).agents[completedResumable.agent.agentId];
+  if (
+    state.agents[completedResumableRuntimeId] ||
+    state.workspaces[completedResumableWorkspaceId] ||
+    completedResumableMetadata?.lifecycle !== 'suspended' ||
+    !completedResumableMetadata.nativeSessionId
+  ) {
+    throw new Error('Completed resumable prompt did not release runtime while preserving durable resume metadata');
+  }
+  delete state.promptResultStatus;
+  await fs.writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, 'utf8');
+  await agentStop({ agentId: completedResumable.agent.agentId });
+
+  state = JSON.parse(await fs.readFile(statePath, 'utf8'));
+  state.omitNativeSessionId = true;
+  await fs.writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, 'utf8');
+  const completedNonResumable = await agentStart({ harness: 'agy', cwd: root, timeoutMs: 10_000 });
+  state = JSON.parse(await fs.readFile(statePath, 'utf8'));
+  const completedNonResumableRuntimeId = completedNonResumable.agent.runtimeAgentId;
+  const completedNonResumableWorkspaceId = state.agents[completedNonResumableRuntimeId].workspace_id;
+  delete state.omitNativeSessionId;
+  state.promptResultStatus = 'done';
+  await fs.writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, 'utf8');
+  const completedNonResumablePrompt = await agentPrompt({
+    agentId: completedNonResumable.agent.agentId,
+    task: 'COMPLETE_AND_STOP',
+    wait: true,
+    timeoutMs: 10_000,
+  });
+  if (completedNonResumablePrompt.runtimeDisposition?.action !== 'stopped' || !completedNonResumablePrompt.runtimeDisposition.discarded) {
+    throw new Error(`Completed non-resumable prompt was not auto-stopped: ${JSON.stringify(completedNonResumablePrompt.runtimeDisposition)}`);
+  }
+  state = JSON.parse(await fs.readFile(statePath, 'utf8'));
+  const completedNonResumableMetadata = JSON.parse(await fs.readFile(path.join(home, '.local', 'state', 'agent-vm-mcp', 'agents.json'), 'utf8')).agents[completedNonResumable.agent.agentId];
+  if (state.agents[completedNonResumableRuntimeId] || state.workspaces[completedNonResumableWorkspaceId] || completedNonResumableMetadata) {
+    throw new Error('Completed non-resumable prompt left runtime or durable metadata behind');
+  }
+  delete state.promptResultStatus;
+  await fs.writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, 'utf8');
+
+  const noWaitDone = await agentStart({ harness: 'agy', cwd: root, timeoutMs: 10_000 });
+  state = JSON.parse(await fs.readFile(statePath, 'utf8'));
+  state.promptResultStatus = 'done';
+  await fs.writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, 'utf8');
+  const noWaitDonePrompt = await agentPrompt({
+    agentId: noWaitDone.agent.agentId,
+    task: 'DONE_BUT_DONT_WAIT',
+    wait: false,
+    timeoutMs: 10_000,
+  });
+  if (noWaitDonePrompt.runtimeDisposition?.action !== 'retained' || noWaitDonePrompt.runtimeDisposition.reason !== 'wait_disabled') {
+    throw new Error(`wait=false prompt was unexpectedly auto-finalized: ${JSON.stringify(noWaitDonePrompt.runtimeDisposition)}`);
+  }
+  delete state.promptResultStatus;
+  await fs.writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, 'utf8');
+  await agentStop({ agentId: noWaitDone.agent.agentId });
+
+  const cleanupFailureAgent = await agentStart({ harness: 'agy', cwd: root, timeoutMs: 10_000 });
+  state = JSON.parse(await fs.readFile(statePath, 'utf8'));
+  const cleanupFailureWorkspaceId = state.agents[cleanupFailureAgent.agent.runtimeAgentId].workspace_id;
+  state.promptResultStatus = 'done';
+  state.failWorkspaceCloseFor = cleanupFailureWorkspaceId;
+  await fs.writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, 'utf8');
+  const cleanupFailurePrompt = await agentPrompt({
+    agentId: cleanupFailureAgent.agent.agentId,
+    task: 'COMPLETE_WITH_CLEANUP_FAILURE',
+    wait: true,
+    timeoutMs: 10_000,
+  });
+  if (!cleanupFailurePrompt.accepted || cleanupFailurePrompt.runtimeDisposition?.action !== 'cleanup_failed') {
+    throw new Error(`Completion cleanup failure corrupted successful prompt semantics: ${JSON.stringify(cleanupFailurePrompt)}`);
+  }
+  const cleanupFailureMetadata = JSON.parse(await fs.readFile(path.join(home, '.local', 'state', 'agent-vm-mcp', 'agents.json'), 'utf8')).agents[cleanupFailureAgent.agent.agentId];
+  if (cleanupFailureMetadata?.lifecycle !== 'suspending') {
+    throw new Error(`Completion cleanup failure did not retain recoverable transitional metadata: ${JSON.stringify(cleanupFailureMetadata)}`);
+  }
+  state = JSON.parse(await fs.readFile(statePath, 'utf8'));
+  delete state.promptResultStatus;
+  delete state.failWorkspaceCloseFor;
+  await fs.writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, 'utf8');
+  await agentStop({ agentId: cleanupFailureAgent.agent.agentId });
 
   state = JSON.parse(await fs.readFile(statePath, 'utf8'));
   const ownedWorkspaceId = state.agents[codex.agent.agentId].workspace_id;
