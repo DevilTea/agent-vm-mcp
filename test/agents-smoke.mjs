@@ -408,6 +408,16 @@ try {
     throw new Error(`MCP Codex provenance was not durably persisted: ${JSON.stringify(codexMetadata)}`);
   }
 
+  await fs.appendFile(
+    codexProfilePath,
+    `\n[projects.${JSON.stringify(root)}]\ntrust_level = "trusted"\n`,
+    'utf8',
+  );
+  const trustedCodex = await agentGet({ agentId: codex.agent.agentId });
+  if (trustedCodex.policyStatus !== 'verified' || trustedCodex.lifecycle !== 'active') {
+    throw new Error(`Codex-owned project trust state invalidated managed policy provenance: ${JSON.stringify(trustedCodex)}`);
+  }
+
   const prompted = await agentPrompt({
     agentId: codex.agent.agentId,
     task: 'Commit the verified change.',

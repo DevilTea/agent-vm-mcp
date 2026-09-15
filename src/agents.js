@@ -861,6 +861,26 @@ function codexProfileContent() {
   ].join('\n');
 }
 
+function isAllowedCodexProfileContent(content) {
+  const expected = codexProfileContent();
+  if (content === expected) return true;
+  if (!content.startsWith(expected)) return false;
+
+  const lines = content.slice(expected.length).split(/\r?\n/);
+  let index = 0;
+  let trustBlocks = 0;
+  while (index < lines.length) {
+    while (index < lines.length && lines[index] === '') index += 1;
+    if (index >= lines.length) break;
+    if (!/^\[projects\."(?:[^"\\]|\\.)+"\]$/.test(lines[index])) return false;
+    index += 1;
+    if (lines[index] !== 'trust_level = "trusted"') return false;
+    index += 1;
+    trustBlocks += 1;
+  }
+  return trustBlocks > 0;
+}
+
 async function prepareCodexProvenance(agentId) {
   const codexHome = codexHomeDirectory();
   const profileName = codexProfileName(agentId);
@@ -920,20 +940,19 @@ async function verifyCodexProvenance(record) {
     provenance.codexHome !== codexHomeDirectory() ||
     provenance.profileName !== codexProfileName(record.agentId) ||
     provenance.profilePath !== codexProfilePath(provenance.codexHome, provenance.profileName) ||
-    typeof provenance.profileSha256 !== 'string' ||
+    provenance.profileSha256 !== sha256Text(codexProfileContent()) ||
     provenance.developerInstructionsSha256 !== sha256Text(CODEX_MANAGED_DEVELOPER_INSTRUCTIONS)
   ) {
     return { ok: false, reason: 'durable Codex policy/profile provenance is absent or mismatched.' };
   }
 
-  const expectedContent = codexProfileContent();
   let content;
   try {
     content = await fs.readFile(provenance.profilePath, 'utf8');
   } catch (error) {
     return { ok: false, reason: `managed Codex profile could not be read: ${error.message}` };
   }
-  if (content !== expectedContent || sha256Text(content) !== provenance.profileSha256) {
+  if (!isAllowedCodexProfileContent(content)) {
     return { ok: false, reason: 'managed Codex profile fingerprint does not match the fixed policy.' };
   }
   return { ok: true, provenance };
