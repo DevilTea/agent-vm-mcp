@@ -789,6 +789,7 @@ exec /usr/bin/git "$@"
   );
   if (
     (await fs.readFile(`${filesystemRoot}/subdir/direct.txt`, 'utf8')) !== 'after\n' ||
+    cwdRelativeResult.pathStyle !== 'cwd' ||
     cwdRelativeResult.files[0]?.path !== 'subdir/direct.txt'
   ) {
     throw new Error('apply_patch cwd-relative path handling failed');
@@ -805,11 +806,12 @@ exec /usr/bin/git "$@"
   const appliedPatch = parseJsonToolResult(
     await client.callTool({
       name: 'apply_patch',
-      arguments: { patch: exactPatch, cwd: filesystemRoot },
+      arguments: { patch: exactPatch, cwd: filesystemRoot, pathStyle: 'git' },
     }),
   );
   if (
     (await fs.readFile(`${filesystemRoot}/a.txt`, 'utf8')) !== 'one\nTWO\nthree\n' ||
+    appliedPatch.pathStyle !== 'git' ||
     appliedPatch.files.length !== 1 ||
     appliedPatch.files[0].path !== 'a.txt' ||
     appliedPatch.files[0].additions !== 1 ||
@@ -818,7 +820,71 @@ exec /usr/bin/git "$@"
     throw new Error('apply_patch exact patch failed');
   }
 
-  const mixedStylePatch = `--- a/a.txt
+  await fs.mkdir(`${filesystemRoot}/b`, { recursive: true });
+  const ambiguousCreatePatch = `--- /dev/null
++++ b/ambiguous.txt
+@@ -0,0 +1 @@
++cwd-b-directory
+`;
+  await expectToolFailure('apply_patch', { patch: ambiguousCreatePatch, cwd: filesystemRoot });
+  if (
+    await fs.access(`${filesystemRoot}/ambiguous.txt`).then(() => true, () => false) ||
+    await fs.access(`${filesystemRoot}/b/ambiguous.txt`).then(() => true, () => false)
+  ) {
+    throw new Error('apply_patch ambiguous auto path style was not zero-write');
+  }
+  const explicitCwdCreate = parseJsonToolResult(
+    await client.callTool({
+      name: 'apply_patch',
+      arguments: { patch: ambiguousCreatePatch, cwd: filesystemRoot, pathStyle: 'cwd' },
+    }),
+  );
+  if (
+    explicitCwdCreate.pathStyle !== 'cwd' ||
+    (await fs.readFile(`${filesystemRoot}/b/ambiguous.txt`, 'utf8')) !== 'cwd-b-directory\n' ||
+    await fs.access(`${filesystemRoot}/ambiguous.txt`).then(() => true, () => false)
+  ) {
+    throw new Error('apply_patch explicit cwd path style targeted the wrong path');
+  }
+
+  const explicitGitCreate = parseJsonToolResult(
+    await client.callTool({
+      name: 'apply_patch',
+      arguments: { patch: ambiguousCreatePatch, cwd: filesystemRoot, pathStyle: 'git' },
+    }),
+  );
+  if (
+    explicitGitCreate.pathStyle !== 'git' ||
+    (await fs.readFile(`${filesystemRoot}/ambiguous.txt`, 'utf8')) !== 'cwd-b-directory\n'
+  ) {
+    throw new Error('apply_patch explicit git path style did not strip synthetic prefixes');
+  }
+
+  await fs.writeFile(`${filesystemRoot}/marker-lines.txt`, 'before\n-- old\nafter\n', 'utf8');
+  const markerContentPatch = `diff --git a/marker-lines.txt b/marker-lines.txt
+--- a/marker-lines.txt
++++ b/marker-lines.txt
+@@ -1,3 +1,3 @@
+ before
+--- old
++++ new
+ after
+`;
+  const markerContentResult = parseJsonToolResult(
+    await client.callTool({
+      name: 'apply_patch',
+      arguments: { patch: markerContentPatch, cwd: filesystemRoot },
+    }),
+  );
+  if (
+    markerContentResult.pathStyle !== 'git' ||
+    (await fs.readFile(`${filesystemRoot}/marker-lines.txt`, 'utf8')) !== 'before\n++ new\nafter\n'
+  ) {
+    throw new Error('apply_patch misclassified hunk content as file headers');
+  }
+
+  const mixedStylePatch = `diff --git a/a.txt b/a.txt
+--- a/a.txt
 +++ b/a.txt
 @@ -1,3 +1,3 @@
  one
@@ -848,7 +914,7 @@ exec /usr/bin/git "$@"
 +TWO
  three
 `;
-  await expectToolFailure('apply_patch', { patch: offsetPatch, cwd: filesystemRoot });
+  await expectToolFailure('apply_patch', { patch: offsetPatch, cwd: filesystemRoot, pathStyle: 'git' });
   if ((await fs.readFile(`${filesystemRoot}/offset.txt`, 'utf8')) !== 'zero\none\ntwo\nthree\n') {
     throw new Error('apply_patch offset mismatch modified target');
   }
@@ -868,7 +934,7 @@ exec /usr/bin/git "$@"
 -b2
 +B2
 `;
-  await expectToolFailure('apply_patch', { patch: multiFailurePatch, cwd: filesystemRoot });
+  await expectToolFailure('apply_patch', { patch: multiFailurePatch, cwd: filesystemRoot, pathStyle: 'git' });
   if (
     (await fs.readFile(`${filesystemRoot}/multi-a.txt`, 'utf8')) !== 'a1\na2\n' ||
     (await fs.readFile(`${filesystemRoot}/multi-b.txt`, 'utf8')) !== 'b1\nb2\n'
@@ -919,7 +985,7 @@ new mode 100755
 @@ -0,0 +1 @@
 +escape
 `;
-  await expectToolFailure('apply_patch', { patch: traversalPatch, cwd: filesystemRoot });
+  await expectToolFailure('apply_patch', { patch: traversalPatch, cwd: filesystemRoot, pathStyle: 'git' });
   try {
     await fs.access(`/tmp/${traversalName}`);
     throw new Error('apply_patch traversal escaped cwd');
@@ -933,7 +999,7 @@ new mode 100755
 -outside
 +escaped
 `;
-  await expectToolFailure('apply_patch', { patch: symlinkEscapePatch, cwd: filesystemRoot });
+  await expectToolFailure('apply_patch', { patch: symlinkEscapePatch, cwd: filesystemRoot, pathStyle: 'git' });
   if ((await fs.readFile(`${filesystemOutsideRoot}/outside.txt`, 'utf8')) !== 'outside\n') {
     throw new Error('apply_patch followed a symlink outside cwd');
   }
@@ -950,7 +1016,7 @@ new mode 100755
   const cancellablePatch = client.callTool(
     {
       name: 'apply_patch',
-      arguments: { patch: cancellationPatch, cwd: filesystemRoot },
+      arguments: { patch: cancellationPatch, cwd: filesystemRoot, pathStyle: 'git' },
     },
     { signal: patchAbortController.signal },
   );

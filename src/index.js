@@ -539,10 +539,14 @@ async function createServer() {
     'apply_patch',
     {
       description:
-        'Apply a strict standard unified diff relative to cwd. Accepts cwd-relative file headers (for example --- src/file / +++ src/file) and conventional git a/ and b/ prefixes. Do not mix path styles within one patch. All hunks are validated before mutation; context mismatch rejects the entire patch without fuzzy or partial fallback.',
+        'Apply a strict standard unified diff relative to cwd. pathStyle="cwd" applies headers literally (-p0); pathStyle="git" strips conventional synthetic a/ and b/ prefixes (-p1). auto recognizes git style only from diff --git metadata and rejects ambiguous bare a/ / b/ headers. Do not mix path styles within one patch. All hunks are validated before mutation; context mismatch rejects the entire patch without fuzzy or partial fallback. Validation is cancellable, but once mutation begins the patch runs to completion; inspect state before retrying a call cancelled after that boundary.',
       inputSchema: z.object({
         patch: z.string().min(1).describe('Standard unified diff to validate and apply.'),
         cwd: z.string().optional().describe('Patch root directory. Defaults to the agent user home directory.'),
+        pathStyle: z
+          .enum(['auto', 'cwd', 'git'])
+          .default('auto')
+          .describe('Path interpretation: auto infers git only from diff --git metadata, cwd uses -p0, and git uses -p1.'),
       }),
     },
     async (args, ctx) => jsonResult(await applyUnifiedPatch(args, ctx.mcpReq.signal)),
