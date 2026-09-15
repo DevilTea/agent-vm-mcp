@@ -49,6 +49,9 @@ pnpm_version=11.25.0
 herdr_version=0.8.2
 herdr_session=agent-vm-mcp
 node_bin="$mise_data_dir/installs/node/$node_version/bin/node"
+node_bin_dir="$(dirname "$node_bin")"
+node_corepack_bin="$node_bin_dir/corepack"
+pnpm_bin="$mise_data_dir/installs/pnpm/$pnpm_version/pnpm"
 herdr_bin="$mise_data_dir/installs/herdr/$herdr_version/herdr"
 herdr_service_template="$repo_root/config/systemd/agent-herdr.service.template"
 legacy_pnpm_bin="$agent_home/.local/share/pnpm/bin"
@@ -155,10 +158,25 @@ run_as_agent() {
 }
 
 run_as_agent /usr/bin/mise install "node@$node_version" "pnpm@$pnpm_version" "herdr@$herdr_version"
+
+# A legacy `corepack enable` can leave pnpm/pnpx shims inside the pinned Node
+# installation. Those binaries precede the standalone mise-managed pnpm in
+# mise's tool PATH and silently route `pnpm` through Corepack. Disable only
+# pnpm's Corepack shims before rebuilding mise shims so the dedicated pnpm
+# tool remains the resolved provider.
+if [[ -x $node_corepack_bin ]]; then
+  run_as_agent env \
+    PATH="$node_bin_dir:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+    "$node_corepack_bin" disable pnpm --install-directory "$node_bin_dir"
+fi
 run_as_agent /usr/bin/mise reshim
 
 if [[ ! -x $node_bin ]]; then
   echo "Pinned mise-managed Node executable is missing: $node_bin" >&2
+  exit 1
+fi
+if [[ ! -x $pnpm_bin ]]; then
+  echo "Pinned mise-managed pnpm executable is missing: $pnpm_bin" >&2
   exit 1
 fi
 if [[ ! -x $herdr_bin ]]; then
@@ -244,9 +262,16 @@ fi
 systemctl daemon-reload
 systemctl enable agent-herdr.service
 
-run_as_agent env PATH="$mise_shims:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" node --version
-run_as_agent env PATH="$mise_shims:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" pnpm --version
-run_as_agent env PATH="$mise_shims:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" herdr --version
+tool_path="$mise_shims:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+run_as_agent env PATH="$tool_path" node --version
+resolved_pnpm_path=$(run_as_agent /usr/bin/mise which pnpm)
+resolved_pnpm_version=$(run_as_agent env PATH="$tool_path" pnpm --version)
+if [[ $resolved_pnpm_path != "$pnpm_bin" || $resolved_pnpm_version != "$pnpm_version" ]]; then
+  echo "Pinned pnpm resolution mismatch: expected $pnpm_bin ($pnpm_version), got $resolved_pnpm_path ($resolved_pnpm_version)" >&2
+  exit 1
+fi
+printf 'pnpm %s (%s)\n' "$resolved_pnpm_version" "$resolved_pnpm_path"
+run_as_agent env PATH="$tool_path" herdr --version
 
 if $cleanup_legacy; then
   stale_refs=$(rg -l --fixed-strings "$legacy_pnpm_bin" \

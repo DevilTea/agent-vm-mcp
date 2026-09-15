@@ -19,6 +19,10 @@ grep -Fq 'baseline_arch=$(dpkg --print-architecture)' "$provision"
 grep -Fq "Architectures: {arch}" "$provision"
 grep -Fq 'apt-get update' "$provision"
 grep -Fq 'install -d -m 0755 -o "$agent_user" -g "$agent_group" "$agent_config_root"' "$provision"
+grep -Fq '"$node_corepack_bin" disable pnpm --install-directory "$node_bin_dir"' "$provision"
+grep -Fq 'resolved_pnpm_path=$(run_as_agent /usr/bin/mise which pnpm)' "$provision"
+grep -Fq 'Pinned pnpm resolution mismatch:' "$provision"
+bash -n "$provision"
 
 # Optional tunnel integration remains an example, not something the core provisioner installs.
 grep -Fq 'Requires=agent-herdr.service' "$tunnel_example"
