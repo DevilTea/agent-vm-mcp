@@ -20,7 +20,7 @@ const AGENT_ID_PATTERN = /^agent-[0-9a-f]{26}$/;
 const READY_STATUSES = new Set(['idle', 'done']);
 const BOOTSTRAP_MODES = new Set(['auto', 'external']);
 const AGENT_METADATA_VERSION = 2;
-const LIFECYCLE_STATES = new Set(['active', 'starting', 'suspending', 'suspended', 'resuming', 'quarantined']);
+const LIFECYCLE_STATES = new Set(['active', 'starting', 'suspending', 'suspended', 'resuming', 'orphaned', 'quarantined']);
 const CODEX_SUPPORTED_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
 const CODEX_POLICY = Object.freeze({ model: 'gpt-5.6-luna', effort: 'max' });
 const CODEX_PROVENANCE_VERSION = 1;
@@ -359,6 +359,44 @@ async function reconcileAgentMetadata(snapshot = null, signal) {
         continue;
       }
     }
+    if (record.lifecycle === 'active') {
+      const observation = runtimeObservation(snapshot, record);
+      if (observation === 'absent') {
+        await updateAgentMetadata(record.agentId, (current) => {
+          if (!current || current.lifecycle !== 'active' || current.runtimeAgentId !== record.runtimeAgentId) return current;
+          const recoverable = Boolean(current.resumable && current.nativeSessionId);
+          return {
+            ...current,
+            lifecycle: recoverable ? 'suspended' : 'orphaned',
+            runtimeAgentId: null,
+            runtimeWorkspaceId: null,
+            lastRuntimeAgentId: current.runtimeAgentId ?? current.lastRuntimeAgentId ?? null,
+            lastWorkspaceId: current.runtimeWorkspaceId ?? current.lastWorkspaceId ?? null,
+            ...(recoverable ? {} : { orphanedReason: 'runtime_absent' }),
+            updatedAt: new Date().toISOString(),
+          };
+        });
+      } else if (observation?.status === 'orphan') {
+        const closed = await closeExactlyOwnedWorkspace(record.runtimeAgentId, observation.workspace, signal);
+        if (closed) {
+          await updateAgentMetadata(record.agentId, (current) => {
+            if (!current || current.lifecycle !== 'active' || current.runtimeAgentId !== record.runtimeAgentId) return current;
+            const recoverable = Boolean(current.resumable && current.nativeSessionId);
+            return {
+              ...current,
+              lifecycle: recoverable ? 'suspended' : 'orphaned',
+              runtimeAgentId: null,
+              runtimeWorkspaceId: null,
+              lastRuntimeAgentId: current.runtimeAgentId ?? current.lastRuntimeAgentId ?? null,
+              lastWorkspaceId: observation.workspace.workspace_id,
+              ...(recoverable ? {} : { orphanedReason: 'runtime_agent_missing' }),
+              updatedAt: new Date().toISOString(),
+            };
+          });
+        }
+      }
+      continue;
+    }
     if (record.lifecycle !== 'suspending' && record.lifecycle !== 'resuming') continue;
     const observation = runtimeObservation(snapshot, record);
     if (observation?.status === 'orphan') {
@@ -401,10 +439,11 @@ async function reconcileAgentMetadata(snapshot = null, signal) {
 async function reconcileBeforeOperation(signal) {
   const metadata = await readAgentMetadata();
   if (!Object.values(metadata.agents).some((record) => (
+    record.lifecycle === 'active' ||
     record.lifecycle === 'starting' ||
     record.lifecycle === 'suspending' ||
     record.lifecycle === 'resuming' ||
-    (record.harness === 'codex' && ['active', 'suspended'].includes(record.lifecycle))
+    (record.harness === 'codex' && record.lifecycle === 'suspended')
   ))) return metadata;
   const snapshot = await snapshotOutcome({ signal, timeoutMs: 2_000 });
   return await reconcileAgentMetadata(snapshot.ok ? snapshot.result.snapshot : null, signal);
@@ -1610,7 +1649,7 @@ export async function agentCapabilities({ signal } = {}) {
   const activeLogicalIds = new Set(session.agents.map((agent) => agent.agentId));
   for (const logical of Object.values(metadata.agents)) {
     if (!logical?.agentId || activeLogicalIds.has(logical.agentId)) continue;
-    if (['starting', 'suspended', 'suspending', 'resuming', 'quarantined'].includes(logical.lifecycle)) {
+    if (['starting', 'suspended', 'suspending', 'resuming', 'orphaned', 'quarantined'].includes(logical.lifecycle)) {
       session.agents.push({
         agentId: logical.agentId,
         logicalSessionId: logical.agentId,
@@ -1698,7 +1737,7 @@ async function startAgentRuntime(
   let workspaceId = null;
   let cleanupAttempt = null;
   let nativeLaunchRelease = null;
-  let startingMetadataWritten = false;
+  let launchMetadataWritten = false;
   if (!resuming) nativeLaunchRelease = await acquireNativeLaunchLock();
   try {
     if (!resuming && harness === 'codex') {
@@ -1719,7 +1758,7 @@ async function startAgentRuntime(
         lifecycle: 'starting',
         updatedAt: new Date().toISOString(),
       });
-      startingMetadataWritten = true;
+      launchMetadataWritten = true;
     }
 
     const create = await runHerdr(
@@ -1869,6 +1908,7 @@ async function startAgentRuntime(
       lifecycle: 'active',
       updatedAt: new Date().toISOString(),
     });
+    if (!resuming) launchMetadataWritten = true;
     await nativeLaunchRelease?.();
     nativeLaunchRelease = null;
 
@@ -1940,7 +1980,7 @@ async function startAgentRuntime(
       }));
     }
     if (!cleanupAttempt.cleaned) attachCleanupFailure(error, cleanupAttempt.error);
-    if (startingMetadataWritten && !resuming) {
+    if (launchMetadataWritten && !resuming) {
       if (cleanupAttempt.cleaned) {
         await updateAgentMetadata(agentId, null).catch(() => {});
       } else {
@@ -2396,7 +2436,7 @@ export async function agentStop({ agentId }, signal) {
   return await withLifecycleLock(agentId, async () => {
   const metadata = await reconcileBeforeOperation(signal);
   const durable = metadata.agents[agentId];
-  if (durable?.lifecycle === 'quarantined' && !durable.runtimeAgentId) {
+  if (['orphaned', 'quarantined'].includes(durable?.lifecycle) && !durable.runtimeAgentId) {
     await updateAgentMetadata(agentId, null);
     return {
       agentId,

@@ -161,7 +161,7 @@ Workspace lifecycle does not install dependencies, trust repository toolchains, 
 
 `process_*` tools manage generic interactive processes owned by the running MCP server. On graceful shutdown, managed process groups receive `SIGTERM` and are escalated to `SIGKILL` after a bounded grace period. These sessions are not persisted across server restarts.
 
-Coding harnesses use a different lifecycle. `agent_start` launches supported harnesses through Herdr in dedicated Herdr workspaces. Production deployments can run Herdr as a separately managed service; `AGENT_HERDR_BOOTSTRAP=external` requires that arrangement, while `auto` allows development self-bootstrap.
+Coding harnesses use a different lifecycle. `agent_start` launches supported harnesses through Herdr in dedicated Herdr workspaces. Production deployments can run Herdr as a separately managed service; `AGENT_HERDR_BOOTSTRAP=external` requires that arrangement, while `auto` allows development self-bootstrap. Durable `active` metadata is reconciled against the current Herdr snapshot; when the runtime is definitively gone, a record with a verified resumable native session becomes `suspended`, while an unrecoverable record becomes `orphaned` rather than disappearing or remaining falsely active. Exact orphan workspaces are closed only when ownership is unambiguous, and `agent_stop` can explicitly discard an orphaned logical record.
 
 Relevant settings include:
 
