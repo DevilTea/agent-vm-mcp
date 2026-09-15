@@ -473,7 +473,7 @@ async function createServer() {
   const artifactStore = new ArtifactStore();
   activeArtifactStores.add(artifactStore);
   await registerArtifactSystem(server, artifactStore);
-  registerInteractionsForHost(server, hostProfile);
+  const interactionStore = await registerInteractionsForHost(server, hostProfile);
   const sepSkillsAdapter = createSepSkillsAdapter();
   registerSepSkillsExtension(server, sepSkillsAdapter);
   registerSkillProjectionTools(server, {
@@ -1012,6 +1012,7 @@ async function createServer() {
     await bridgeManager.close();
     activeArtifactStores.delete(artifactStore);
     await artifactStore.close();
+    await interactionStore?.close();
     await originalClose();
   };
 

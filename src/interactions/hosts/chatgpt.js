@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from 'node:crypto';
+import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 
 import {
@@ -6,16 +6,28 @@ import {
   registerAppResource,
   registerAppTool,
 } from '@modelcontextprotocol/ext-apps/server';
+import * as z from 'zod/v4';
 
 import {
   INTERACTION_SCHEMA_VERSION,
   REQUEST_USER_INPUT_TOOL,
   formatInteractionFallback,
+  interactionAnswersSchema,
+  interactionSubmissionResultSchema,
+  interactionStateSchema,
   interactionRequestSchema,
   interactionResultSchema,
 } from '../model.js';
+import { InteractionStore, stateFromRecord } from '../store.js';
 
 const CHATGPT_INTERACTION_RESOURCE_NAME = 'Agent VM structured user input';
+export const REQUEST_USER_INPUT_STATE_TOOL = 'request_user_input_state';
+export const REQUEST_USER_INPUT_SUBMIT_TOOL = 'request_user_input_submit';
+export const CHATGPT_INTERACTION_TOOL_NAMES = [
+  REQUEST_USER_INPUT_TOOL,
+  REQUEST_USER_INPUT_STATE_TOOL,
+  REQUEST_USER_INPUT_SUBMIT_TOOL,
+];
 const CHATGPT_UI_PATH = new URL('./chatgpt-app.html', import.meta.url);
 const CHATGPT_UI_HTML = readFileSync(CHATGPT_UI_PATH, 'utf8');
 const CHATGPT_UI_RESOURCE_META = {
@@ -33,7 +45,30 @@ const CHATGPT_UI_REVISION = createHash('sha256')
 export const CHATGPT_INTERACTION_RESOURCE_URI =
   `ui://agent-vm/request-user-input/v1-${CHATGPT_UI_REVISION}.html`;
 
-export function registerChatgptInteractionAdapter(server) {
+function appToolMeta() {
+  return {
+    ui: {
+      resourceUri: CHATGPT_INTERACTION_RESOURCE_URI,
+      visibility: ['app'],
+    },
+  };
+}
+
+function stateToolResult(state) {
+  return {
+    structuredContent: state,
+    content: [
+      {
+        type: 'text',
+        text: JSON.stringify(state),
+      },
+    ],
+  };
+}
+
+export async function registerChatgptInteractionAdapter(server) {
+  const interactionStore = await InteractionStore.open();
+
   registerAppResource(
     server,
     CHATGPT_INTERACTION_RESOURCE_NAME,
@@ -83,11 +118,13 @@ export function registerChatgptInteractionAdapter(server) {
       },
     },
     async (request) => {
-      const interactionId = randomUUID();
+      const record = await interactionStore.create(request);
+      const interactionId = record.interactionId;
       const structuredContent = {
         schemaVersion: INTERACTION_SCHEMA_VERSION,
         interactionId,
         request,
+        state: stateFromRecord(record),
       };
       return {
         structuredContent,
@@ -100,4 +137,47 @@ export function registerChatgptInteractionAdapter(server) {
       };
     },
   );
+
+  registerAppTool(
+    server,
+    REQUEST_USER_INPUT_STATE_TOOL,
+    {
+      title: 'Read request user input state',
+      description: 'Read the authoritative server-side state for one request_user_input interaction from this App.',
+      inputSchema: z.object({ interactionId: z.string().uuid() }).strict(),
+      outputSchema: interactionStateSchema,
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+      _meta: appToolMeta(),
+    },
+    async ({ interactionId }) => stateToolResult(await interactionStore.getState(interactionId)),
+  );
+
+  registerAppTool(
+    server,
+    REQUEST_USER_INPUT_SUBMIT_TOOL,
+    {
+      title: 'Submit request user input',
+      description: 'Persist validated structured answers for one request_user_input interaction from this App.',
+      inputSchema: z.object({
+        interactionId: z.string().uuid(),
+        answers: interactionAnswersSchema,
+      }).strict(),
+      outputSchema: interactionSubmissionResultSchema,
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: false,
+        openWorldHint: false,
+      },
+      _meta: appToolMeta(),
+    },
+    async ({ interactionId, answers }) => stateToolResult(await interactionStore.submit(interactionId, answers)),
+  );
+
+  return interactionStore;
 }

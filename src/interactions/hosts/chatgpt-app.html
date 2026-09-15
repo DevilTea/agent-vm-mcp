@@ -206,11 +206,17 @@
       const APP_PROTOCOL_VERSION = '2026-01-26';
       const FORM_STATE_VERSION = 1;
       const FORM_STATE_PREFIX = 'agent-vm:request-user-input:v1:';
+      const SERVER_STATE_TOOL = 'request_user_input_state';
+      const SERVER_SUBMIT_TOOL = 'request_user_input_submit';
       const pending = new Map();
       let nextRequestId = 1;
       let initialized = false;
+      let hostCapabilities = null;
       let latestInput = null;
       let latestResult = null;
+      let authoritativeState = null;
+      let authoritativeInteractionId = null;
+      let renderGeneration = 0;
       let resizeObserver = null;
 
       const root = document.getElementById('root');
@@ -233,6 +239,19 @@
 
       function text(value) {
         return value == null ? '' : String(value);
+      }
+
+      function unicodeLength(value) {
+        return Array.from(text(value)).length;
+      }
+
+      function truncateToUnicodeLength(value, maxLength) {
+        return Array.from(text(value)).slice(0, maxLength).join('');
+      }
+
+      function enforceTextMaxLength(input, maxLength) {
+        const limited = truncateToUnicodeLength(input.value, maxLength);
+        if (limited !== input.value) input.value = limited;
       }
 
       function setHostContext(hostContext) {
@@ -308,7 +327,7 @@
             version: FORM_STATE_VERSION,
             interactionId: payload.interactionId,
             savedAt: new Date().toISOString(),
-            ...state,
+            fields: state.fields,
           }));
         } catch {
           // Storage may be unavailable in a host sandbox; the in-memory form still works.
@@ -445,7 +464,10 @@
           const input = document.createElement(question.multiline ? 'textarea' : 'input');
           if (!question.multiline) input.type = 'text';
           input.name = question.id;
-          input.maxLength = Number(question.maxLength ?? 2000);
+          const maxLength = Number(question.maxLength ?? 2000);
+          input.dataset.maxLength = String(maxLength);
+          input.addEventListener('input', () => enforceTextMaxLength(input, maxLength));
+          input.addEventListener('paste', () => requestAnimationFrame(() => enforceTextMaxLength(input, maxLength)));
           if (question.placeholder) input.placeholder = question.placeholder;
           section.append(input);
         }
@@ -524,8 +546,7 @@
               questionId: question.id,
               kind: question.kind,
               value,
-              labels: value == null ? [] : selectedLabels(question, [value]),
-              customValue: value == null ? null : customValues[value] ?? null,
+              customValues,
             });
           } else if (question.kind === 'multi_select') {
             const values = [...fieldset.querySelectorAll(`input[name="${CSS.escape(question.id)}"]:checked`)].map((input) => input.value);
@@ -551,7 +572,6 @@
               questionId: question.id,
               kind: question.kind,
               value: values,
-              labels: selectedLabels(question, values),
               customValues,
             });
           } else if (question.kind === 'boolean') {
@@ -562,17 +582,23 @@
               continue;
             }
             const value = checked ? checked.value === 'true' : null;
-            const label = value === null ? null : value ? question.trueLabel ?? 'Yes' : question.falseLabel ?? 'No';
-            answers.push({ questionId: question.id, kind: question.kind, value, labels: label == null ? [] : [label] });
+            answers.push({ questionId: question.id, kind: question.kind, value });
           } else if (question.kind === 'text') {
             const input = fieldset.querySelector(`[name="${CSS.escape(question.id)}"]`);
+            const maxLength = Number(question.maxLength ?? 2000);
+            enforceTextMaxLength(input, maxLength);
+            if (unicodeLength(input.value) > maxLength) {
+              error.textContent = `Response must be at most ${maxLength} character${maxLength === 1 ? '' : 's'}.`;
+              valid = false;
+              continue;
+            }
             const value = input.value.trim();
             if (!value && required) {
               error.textContent = 'Please enter a response.';
               valid = false;
               continue;
             }
-            answers.push({ questionId: question.id, kind: question.kind, value: value || null, labels: [] });
+            answers.push({ questionId: question.id, kind: question.kind, value: value || null });
           }
         }
 
@@ -607,16 +633,15 @@
         return fields;
       }
 
-      function persistCurrentForm(payload, form, submitted = false) {
+      function persistCurrentForm(payload, form) {
         writePersistedFormState(payload, {
-          submitted,
           fields: snapshotFormFields(payload.request, form),
         });
       }
 
       function restorePersistedForm(payload, form) {
         const persisted = readPersistedFormState(payload);
-        if (!persisted) return { restored: false, submitted: false };
+        if (!persisted) return { restored: false };
 
         for (const question of payload.request.questions) {
           const saved = persisted.fields[question.id];
@@ -647,7 +672,7 @@
             }
           } else if (question.kind === 'text' && typeof saved.value === 'string') {
             const input = fieldset.querySelector(`[name="${CSS.escape(question.id)}"]`);
-            if (input) input.value = saved.value.slice(0, Number(question.maxLength ?? 2000));
+            if (input) input.value = truncateToUnicodeLength(saved.value, Number(question.maxLength ?? 2000));
           }
 
           if (saved.customValues && typeof saved.customValues === 'object') {
@@ -660,7 +685,98 @@
           syncOptionState(fieldset);
         }
 
-        return { restored: true, submitted: persisted.submitted === true };
+        return { restored: true };
+      }
+
+      function knownAuthoritativeState(payload) {
+        const resultState = latestResult?.structuredContent?.state;
+        if (resultState?.interactionId === payload.interactionId) return resultState;
+        if (authoritativeInteractionId === payload.interactionId) return authoritativeState;
+        return null;
+      }
+
+      function serverToolsAvailable() {
+        return hostCapabilities?.serverTools != null;
+      }
+
+      function stateFromToolResult(result, payload) {
+        if (result?.isError) throw new Error('The server rejected the interaction state request.');
+        const state = result?.structuredContent;
+        if (
+          !state ||
+          state.schemaVersion !== 1 ||
+          state.interactionId !== payload.interactionId ||
+          (state.status !== 'pending' && state.status !== 'submitted') ||
+          (state.status === 'pending' && state.answers !== null) ||
+          (state.status === 'submitted' && !Array.isArray(state.answers))
+        ) {
+          throw new Error('The server returned invalid interaction state.');
+        }
+        return state;
+      }
+
+      async function readAuthoritativeState(payload) {
+        const result = await request('tools/call', {
+          name: SERVER_STATE_TOOL,
+          arguments: { interactionId: payload.interactionId },
+        });
+        return stateFromToolResult(result, payload);
+      }
+
+      async function submitAuthoritativeState(payload, answers) {
+        const result = await request('tools/call', {
+          name: SERVER_SUBMIT_TOOL,
+          arguments: {
+            interactionId: payload.interactionId,
+            answers,
+          },
+        });
+        return stateFromToolResult(result, payload);
+      }
+
+      function restoreAuthoritativeAnswers(payload, form, answers) {
+        const answerById = new Map((answers ?? []).map((answer) => [answer.questionId, answer]));
+        for (const question of payload.request.questions) {
+          const fieldset = form.querySelector(`[data-question-id="${CSS.escape(question.id)}"]`);
+          const answer = answerById.get(question.id);
+          if (!fieldset || !answer) continue;
+
+          for (const input of fieldset.querySelectorAll('[data-option-choice="true"]')) input.checked = false;
+          for (const input of fieldset.querySelectorAll('[data-custom-input="true"]')) input.value = '';
+
+          if (question.kind === 'single_select') {
+            if (typeof answer.value === 'string') {
+              const input = fieldset.querySelector(
+                `input[name="${CSS.escape(question.id)}"][value="${CSS.escape(answer.value)}"]`,
+              );
+              if (input) input.checked = true;
+            }
+          } else if (question.kind === 'multi_select') {
+            for (const value of Array.isArray(answer.value) ? answer.value : []) {
+              const input = fieldset.querySelector(
+                `input[name="${CSS.escape(question.id)}"][value="${CSS.escape(value)}"]`,
+              );
+              if (input) input.checked = true;
+            }
+          } else if (question.kind === 'boolean') {
+            if (typeof answer.value === 'boolean') {
+              const value = String(answer.value);
+              const input = fieldset.querySelector(
+                `input[name="${CSS.escape(question.id)}"][value="${CSS.escape(value)}"]`,
+              );
+              if (input) input.checked = true;
+            }
+          } else if (question.kind === 'text') {
+            const input = fieldset.querySelector(`[name="${CSS.escape(question.id)}"]`);
+            if (input) input.value = truncateToUnicodeLength(answer.value ?? '', Number(question.maxLength ?? 2000));
+          }
+
+          for (const input of fieldset.querySelectorAll('[data-custom-input="true"]')) {
+            const value = answer.customValues?.[input.dataset.optionId];
+            if (typeof value === 'string') input.value = value;
+          }
+          syncOptionState(fieldset);
+        }
       }
 
       function responseText(payload, answers) {
@@ -677,31 +793,32 @@
             lines.push('   Answer: (no response)');
             return;
           }
-          if (answer.kind === 'text') {
+          if (question.kind === 'text') {
             lines.push(`   Answer: ${answer.value}`);
-          } else if (Array.isArray(answer.labels) && answer.labels.length > 0) {
-            lines.push(`   Answer: ${answer.labels.join(', ')}`);
+          } else if (question.kind === 'single_select' || question.kind === 'multi_select') {
+            const values = Array.isArray(answer.value) ? answer.value : [answer.value];
+            const labels = selectedLabels(question, values);
+            lines.push(`   Answer: ${labels.join(', ')}`);
             const raw = Array.isArray(answer.value) ? answer.value.join(', ') : String(answer.value);
             lines.push(`   Value: ${raw}`);
-            if (answer.customValue) {
-              lines.push(`   Custom value [${String(answer.value)}]: ${answer.customValue}`);
-            }
-            if (answer.customValues && Array.isArray(answer.value)) {
-              for (const optionId of answer.value) {
-                if (answer.customValues[optionId]) {
-                  lines.push(`   Custom value [${optionId}]: ${answer.customValues[optionId]}`);
-                }
+            const customValues = answer.customValues ?? {};
+            for (const optionId of values) {
+              if (customValues[optionId]) {
+                lines.push(`   Custom value [${optionId}]: ${customValues[optionId]}`);
               }
             }
           } else {
-            lines.push(`   Answer: ${String(answer.value)}`);
+            const label = answer.value ? question.trueLabel ?? 'Yes' : question.falseLabel ?? 'No';
+            lines.push(`   Answer: ${label}`);
+            lines.push(`   Value: ${String(answer.value)}`);
           }
         });
 
         return lines.join('\n');
       }
 
-      async function submitForm(payload, form, submitButton, status) {
+      async function submitForm(payload, form, submitButton, status, controls) {
+        if (controls.submitted || !controls.serverStateReady) return;
         const { valid, answers } = collectAnswers(payload.request, form);
         if (!valid) {
           sendSize();
@@ -709,19 +826,46 @@
         }
 
         submitButton.disabled = true;
-        status.textContent = 'Sending…';
+        status.textContent = 'Saving…';
         try {
-          const message = responseText(payload, answers);
-          await request('ui/message', {
-            role: 'user',
-            content: [{ type: 'text', text: message }],
-          });
-          persistCurrentForm(payload, form, true);
+          const state = await submitAuthoritativeState(payload, answers);
+          authoritativeInteractionId = payload.interactionId;
+          authoritativeState = state;
+          restoreAuthoritativeAnswers(payload, form, state.answers);
+          controls.submitted = true;
           for (const input of form.querySelectorAll('input, textarea, button')) input.disabled = true;
           status.textContent = 'Submitted.';
+
+          // The server state is authoritative; keep only the rendered fields as a local draft cache.
+          persistCurrentForm(payload, form);
+          if (state.submission !== 'duplicate') {
+            try {
+              await request('ui/message', {
+                role: 'user',
+                content: [{ type: 'text', text: responseText(payload, state.answers) }],
+              });
+            } catch (error) {
+              status.textContent = `Saved on server, but could not send response: ${error?.message ?? error}`;
+            }
+          }
         } catch (error) {
+          try {
+            const state = await readAuthoritativeState(payload);
+            if (state.status === 'submitted') {
+              authoritativeInteractionId = payload.interactionId;
+              authoritativeState = state;
+              restoreAuthoritativeAnswers(payload, form, state.answers);
+              controls.submitted = true;
+              for (const input of form.querySelectorAll('input, textarea, button')) input.disabled = true;
+              status.textContent = 'Submitted.';
+              return;
+            }
+            controls.serverStateReady = true;
+          } catch {
+            // Keep the original save failure visible when the follow-up state check also fails.
+          }
           submitButton.disabled = false;
-          status.textContent = `Could not send response: ${error?.message ?? error}`;
+          status.textContent = `Could not save response: ${error?.message ?? error}`;
         } finally {
           sendSize();
         }
@@ -730,6 +874,12 @@
       function render() {
         const payload = currentPayload();
         if (!payload?.request?.questions) return;
+        const generation = ++renderGeneration;
+        const knownState = knownAuthoritativeState(payload);
+        const controls = {
+          submitted: knownState?.status === 'submitted',
+          serverStateReady: false,
+        };
 
         root.replaceChildren();
         root.append(make('h1', '', payload.request.title));
@@ -749,22 +899,58 @@
         }
         actions.append(submitButton, status);
         form.append(actions);
-        const restored = restorePersistedForm(payload, form);
-        if (restored.submitted) {
+        restorePersistedForm(payload, form);
+        if (controls.submitted) {
+          restoreAuthoritativeAnswers(payload, form, knownState.answers);
           for (const input of form.querySelectorAll('input, textarea, button')) input.disabled = true;
           status.textContent = 'Submitted.';
         }
         form.addEventListener('input', () => {
-          if (!restored.submitted) persistCurrentForm(payload, form, false);
+          if (!controls.submitted) persistCurrentForm(payload, form);
         });
         form.addEventListener('change', () => {
-          if (!restored.submitted) persistCurrentForm(payload, form, false);
+          if (!controls.submitted) persistCurrentForm(payload, form);
         });
         form.addEventListener('submit', (event) => {
           event.preventDefault();
-          void submitForm(payload, form, submitButton, status);
+          void submitForm(payload, form, submitButton, status, controls);
         });
         root.append(form);
+
+        if (payload.interactionId && !controls.submitted) {
+          if (hostCapabilities === null) {
+            submitButton.disabled = true;
+            status.textContent = 'Preparing server state…';
+          } else if (!serverToolsAvailable()) {
+            submitButton.disabled = true;
+            status.textContent = 'This host cannot verify server interaction state.';
+          } else {
+            submitButton.disabled = true;
+            status.textContent = 'Checking server state…';
+            void readAuthoritativeState(payload).then((state) => {
+              if (generation !== renderGeneration) return;
+              authoritativeInteractionId = payload.interactionId;
+              authoritativeState = state;
+              if (state.status === 'submitted') {
+                controls.submitted = true;
+                restoreAuthoritativeAnswers(payload, form, state.answers);
+                for (const input of form.querySelectorAll('input, textarea, button')) input.disabled = true;
+                status.textContent = 'Submitted.';
+                return;
+              }
+              controls.serverStateReady = true;
+              submitButton.disabled = false;
+              status.textContent = '';
+            }).catch((error) => {
+              if (generation !== renderGeneration) return;
+              submitButton.disabled = true;
+              status.textContent = `Could not read server state: ${error?.message ?? error}`;
+            });
+          }
+        } else if (payload.interactionId && controls.submitted) {
+          controls.serverStateReady = true;
+        }
+
         requestAnimationFrame(sendSize);
       }
 
@@ -803,6 +989,7 @@
             appCapabilities: { availableDisplayModes: ['inline'] },
             protocolVersion: APP_PROTOCOL_VERSION,
           });
+          hostCapabilities = result?.hostCapabilities ?? {};
           setHostContext(result?.hostContext);
           notify('ui/notifications/initialized');
           initialized = true;
