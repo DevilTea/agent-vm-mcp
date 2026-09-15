@@ -257,10 +257,26 @@ async function refreshRepository(repoPath, deadline, signal) {
 async function resolveCommit(repoPath, revision, deadline, signal) {
   const target = revision?.trim() || 'origin/HEAD';
   if (target.includes('\0') || /[\r\n]/.test(target)) throw new Error('revision contains invalid control characters.');
-  const result = await runGit(
-    ['-C', repoPath, 'rev-parse', '--verify', '--end-of-options', `${target}^{commit}`],
-    { timeoutMs: remainingTimeout(deadline), signal },
-  );
+
+  const candidates = [];
+  if (revision !== undefined && !target.startsWith('refs/') && !target.startsWith('origin/') && !/^[0-9a-f]{40,64}$/i.test(target)) {
+    candidates.push(`refs/remotes/origin/${target}`);
+  }
+  candidates.push(target);
+
+  let result = null;
+  for (const candidate of candidates) {
+    try {
+      result = await runGit(
+        ['-C', repoPath, 'rev-parse', '--verify', '--end-of-options', `${candidate}^{commit}`],
+        { timeoutMs: remainingTimeout(deadline), signal },
+      );
+      break;
+    } catch (error) {
+      if (candidate === target || !error?.git || error.git.timedOut || error.git.cancelled) throw error;
+    }
+  }
+
   const commit = result.stdout.trim();
   if (!/^[0-9a-f]{40,64}$/i.test(commit)) throw new Error(`Git returned an invalid commit id for revision ${target}.`);
   return { target, commit };
