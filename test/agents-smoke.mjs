@@ -283,6 +283,20 @@ if (args[0] === 'server') {
   agent.transcript += '\n> ' + prompt + '\nFAKE_RESPONSE';
   agent.state_change_seq += 2;
   if (state.promptResultStatus) agent.agent_status = state.promptResultStatus;
+  if (state.createCodexSessionOnPromptFor === args[2] && agent.agent === 'codex') {
+    const workspace = state.workspaces[agent.workspace_id];
+    const codexHome = workspace?.env?.CODEX_HOME ?? path.join(process.env.HOME, '.codex');
+    const sessionId = 'late-session-' + agent.name;
+    const sessionDirectory = path.join(codexHome, 'sessions', '2099', '01', '02');
+    fs.mkdirSync(sessionDirectory, { recursive: true });
+    fs.writeFileSync(
+      path.join(sessionDirectory, sessionId + '.jsonl'),
+      JSON.stringify({
+        type: 'session_meta',
+        payload: { session_id: sessionId, id: sessionId, cwd: agent.cwd, timestamp: new Date().toISOString() },
+      }) + '\n',
+    );
+  }
   state.sessions ??= {};
   state.sessions[agent.native_session_id] = { transcript: agent.transcript };
   writeState(state);
@@ -491,6 +505,50 @@ try {
   }
   delete state.promptResultStatus;
   await fs.writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, 'utf8');
+
+  state = JSON.parse(await fs.readFile(statePath, 'utf8'));
+  state.omitNativeSessionId = true;
+  await fs.writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, 'utf8');
+  const lateCodexSession = await agentStart({ harness: 'codex', cwd: root, timeoutMs: 10_000 });
+  state = JSON.parse(await fs.readFile(statePath, 'utf8'));
+  const lateCodexRuntimeId = lateCodexSession.agent.runtimeAgentId;
+  const lateCodexWorkspaceId = state.agents[lateCodexRuntimeId].workspace_id;
+  delete state.omitNativeSessionId;
+  state.promptResultStatus = 'done';
+  state.createCodexSessionOnPromptFor = lateCodexRuntimeId;
+  await fs.writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, 'utf8');
+  const lateCodexPrompt = await agentPrompt({
+    agentId: lateCodexSession.agent.agentId,
+    task: 'CREATE_LATE_NATIVE_SESSION',
+    wait: true,
+    timeoutMs: 10_000,
+  });
+  if (lateCodexPrompt.runtimeDisposition?.action !== 'suspended') {
+    throw new Error(`Late Codex native session was not discovered before completion cleanup: ${JSON.stringify(lateCodexPrompt.runtimeDisposition)}`);
+  }
+  const lateCodexNativeSessionId = `late-session-${lateCodexRuntimeId}`;
+  const lateCodexMetadata = JSON.parse(await fs.readFile(path.join(home, '.local', 'state', 'agent-vm-mcp', 'agents.json'), 'utf8')).agents[lateCodexSession.agent.agentId];
+  state = JSON.parse(await fs.readFile(statePath, 'utf8'));
+  if (
+    state.agents[lateCodexRuntimeId] ||
+    state.workspaces[lateCodexWorkspaceId] ||
+    lateCodexMetadata?.lifecycle !== 'suspended' ||
+    lateCodexMetadata.nativeSessionId !== lateCodexNativeSessionId ||
+    lateCodexMetadata.nativeSessionAttribution !== 'verified' ||
+    lateCodexMetadata.resumable !== true
+  ) {
+    throw new Error(`Late Codex native session attribution was not durably preserved: ${JSON.stringify(lateCodexMetadata)}`);
+  }
+  delete state.promptResultStatus;
+  delete state.createCodexSessionOnPromptFor;
+  await fs.writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, 'utf8');
+  const lateCodexResumed = await agentResume({ agentId: lateCodexSession.agent.agentId });
+  state = JSON.parse(await fs.readFile(statePath, 'utf8'));
+  const lateCodexResumedRuntime = state.agents[lateCodexResumed.agent.runtimeAgentId];
+  if (!lateCodexResumedRuntime || !lateCodexResumedRuntime.launch_args.includes(lateCodexNativeSessionId)) {
+    throw new Error('Late-discovered Codex native session was not used for resume');
+  }
+  await agentStop({ agentId: lateCodexSession.agent.agentId });
 
   const noWaitDone = await agentStart({ harness: 'agy', cwd: root, timeoutMs: 10_000 });
   state = JSON.parse(await fs.readFile(statePath, 'utf8'));
@@ -1260,6 +1318,26 @@ try {
     const record = ambiguousMetadata[ambiguous.agent.agentId];
     if (!record || record.nativeSessionId !== null || record.resumable !== false || record.nativeSessionAttribution !== 'ambiguous') {
       throw new Error('Ambiguous same-cwd native sessions were incorrectly attributed to a logical agent');
+    }
+    if (ambiguous.agent.agentId === ambiguousOne.agent.agentId) {
+      state = JSON.parse(await fs.readFile(statePath, 'utf8'));
+      state.promptResultStatus = 'done';
+      await fs.writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, 'utf8');
+      const ambiguousCompleted = await agentPrompt({
+        agentId: ambiguous.agent.agentId,
+        task: 'AMBIGUOUS_SESSION_MUST_REMAIN',
+        wait: true,
+        timeoutMs: 10_000,
+      });
+      if (
+        ambiguousCompleted.runtimeDisposition?.action !== 'retained' ||
+        ambiguousCompleted.runtimeDisposition.reason !== 'native_session_ambiguous'
+      ) {
+        throw new Error(`Ambiguous completed agent was destructively finalized: ${JSON.stringify(ambiguousCompleted.runtimeDisposition)}`);
+      }
+      state = JSON.parse(await fs.readFile(statePath, 'utf8'));
+      delete state.promptResultStatus;
+      await fs.writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, 'utf8');
     }
     try {
       await agentSuspend({ agentId: ambiguous.agent.agentId });

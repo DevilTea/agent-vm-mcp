@@ -1858,6 +1858,7 @@ async function startAgentRuntime(
         ...(harness === 'codex' ? { codexProvenance, policyStatus: 'verified' } : {}),
         nativeSessionId: recoveredNativeSessionId,
         nativeSessionAttribution: recoveredNativeSessionId ? 'backend_reported' : 'unavailable',
+        nativeSessionStartedAt: new Date(nativeLaunchStartedAt).toISOString(),
         resumable: Boolean(recoveredNativeSessionId && definition.resume.supported),
         runtimeAgentId,
         runtimeWorkspaceId: workspaceId,
@@ -1902,6 +1903,7 @@ async function startAgentRuntime(
       ...(harness === 'codex' ? { codexProvenance, policyStatus: 'verified' } : {}),
       nativeSessionId: nativeDiscovery.sessionId,
       nativeSessionAttribution: nativeDiscovery.attribution,
+      nativeSessionStartedAt: resuming ? null : new Date(nativeLaunchStartedAt).toISOString(),
       resumable: Boolean(nativeDiscovery.sessionId && definition.resume.supported),
       runtimeAgentId,
       runtimeWorkspaceId: workspaceId,
@@ -2024,6 +2026,66 @@ export async function agentRead({ agentId, source = 'recent-unwrapped', lines = 
   const text = await readAgentText(owned.runtimeAgentId, { source, lines, signal });
   await requireOwnedAgent(agentId, { signal });
   return { agentId, source, lines: Math.max(1, Math.min(MAX_AGENT_READ_LINES, lines)), text };
+}
+
+async function refreshNativeSessionAfterPrompt(agentId, completedAgent, signal) {
+  if (completedAgent?.status !== 'done') return { state: 'skipped' };
+
+  try {
+    const metadata = await readAgentMetadata();
+    const record = metadata.agents[agentId] ?? null;
+    if (!record || record.lifecycle !== 'active' || record.nativeSessionId) return { state: 'skipped' };
+
+    const definition = harnessDefinitions()[record.harness];
+    if (!definition?.resume?.supported) return { state: 'unsupported' };
+
+    const owned = await requireOwnedAgent(agentId, { signal, timeoutMs: 5_000 });
+    const backendNativeSessionId = nativeSessionIdFromAgent(owned.agent);
+    let discovery = backendNativeSessionId
+      ? { sessionId: backendNativeSessionId, attribution: 'backend_reported' }
+      : null;
+
+    if (!discovery) {
+      const startedAt = Date.parse(record.nativeSessionStartedAt ?? '');
+      if (!Number.isFinite(startedAt)) return { state: 'unavailable' };
+      discovery = await discoverNativeSessionId(new Map(), record.harness, record.cwd, startedAt, {
+        codexHome: record.codexProvenance?.codexHome,
+      });
+    }
+
+    if (!discovery.sessionId) {
+      if (discovery.attribution === 'ambiguous') {
+        await updateAgentMetadata(agentId, (current) => (
+          current && current.lifecycle === 'active' && !current.nativeSessionId
+            ? { ...current, nativeSessionAttribution: 'ambiguous', resumable: false, updatedAt: new Date().toISOString() }
+            : current
+        ));
+        return { state: 'ambiguous', candidates: discovery.candidates ?? [] };
+      }
+      return { state: 'unavailable' };
+    }
+
+    await updateAgentMetadata(agentId, (current) => (
+      current && current.lifecycle === 'active' && !current.nativeSessionId
+        ? {
+            ...current,
+            nativeSessionId: discovery.sessionId,
+            nativeSessionAttribution: discovery.attribution,
+            resumable: true,
+            updatedAt: new Date().toISOString(),
+          }
+        : current
+    ));
+    return { state: 'resolved', sessionId: discovery.sessionId, attribution: discovery.attribution };
+  } catch (error) {
+    return {
+      state: 'error',
+      error: {
+        code: error?.herdr?.code ?? error?.code ?? 'native_session_refresh_failed',
+        message: error?.message ?? String(error),
+      },
+    };
+  }
 }
 
 async function finalizeCompletedPromptRuntime(agentId, completedAgent, signal) {
@@ -2309,9 +2371,26 @@ export async function agentPrompt(
     }
 
     const diagnostics = await safePromptDiagnostics(agentId);
-    const runtimeDisposition = wait
-      ? await finalizeCompletedPromptRuntime(agentId, diagnostics.agent, signal)
-      : { action: 'retained', reason: 'wait_disabled', status: diagnostics.agent?.status ?? 'unknown' };
+    const nativeSessionRefresh = wait
+      ? await refreshNativeSessionAfterPrompt(agentId, diagnostics.agent, signal)
+      : { state: 'skipped' };
+    const runtimeDisposition = !wait
+      ? { action: 'retained', reason: 'wait_disabled', status: diagnostics.agent?.status ?? 'unknown' }
+      : nativeSessionRefresh.state === 'error'
+        ? {
+            action: 'retained',
+            reason: 'native_session_refresh_failed',
+            status: diagnostics.agent?.status ?? 'unknown',
+            error: nativeSessionRefresh.error,
+          }
+        : nativeSessionRefresh.state === 'ambiguous'
+          ? {
+              action: 'retained',
+              reason: 'native_session_ambiguous',
+              status: diagnostics.agent?.status ?? 'unknown',
+              candidates: nativeSessionRefresh.candidates,
+            }
+          : await finalizeCompletedPromptRuntime(agentId, diagnostics.agent, signal);
     return {
       accepted: true,
       submission: { state: 'submitted', retrySafe: false, waitCompleted: wait },
