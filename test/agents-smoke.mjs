@@ -1676,7 +1676,7 @@ try {
   }
   const metadataLockPath = `${metadataPath}.lock`;
   await fs.mkdir(metadataLockPath);
-  const staleLockTime = new Date(Date.now() - 5_000);
+  const staleLockTime = new Date(Date.now() - 15_000);
   await fs.utimes(metadataLockPath, staleLockTime, staleLockTime);
   await metadataModuleA.__testUpdateAgentMetadata('agent-f4444444444444444444444444', {
     version: 1, agentId: 'agent-f4444444444444444444444', harness: 'agy', cwd: root,
@@ -1684,6 +1684,138 @@ try {
     runtimeAgentId: null, runtimeWorkspaceId: null, lifecycle: 'suspended', updatedAt: new Date().toISOString(),
   });
   if (await fs.stat(metadataLockPath).then(() => true, () => false)) throw new Error('Stale metadata lock was not reclaimed');
+
+  await fs.mkdir(metadataLockPath);
+  await fs.writeFile(
+    path.join(metadataLockPath, 'owner.json'),
+    `${JSON.stringify({ pid: process.pid, token: 'active-metadata-lock-test' })}\n`,
+    'utf8',
+  );
+  await fs.utimes(metadataLockPath, staleLockTime, staleLockTime);
+  try {
+    await metadataModuleA.__testUpdateAgentMetadata('agent-f6666666666666666666666666', {
+      version: 2, agentId: 'agent-f6666666666666666666666666', harness: 'agy', cwd: root,
+      nativeSessionId: null, nativeSessionAttribution: 'unavailable', resumable: false,
+      runtimeAgentId: null, runtimeWorkspaceId: null, lifecycle: 'orphaned', updatedAt: new Date().toISOString(),
+    });
+    throw new Error('Live metadata lock was incorrectly reclaimed');
+  } catch (error) {
+    if (error?.code !== 'agent_metadata_lock_timeout') throw error;
+  } finally {
+    await fs.rm(metadataLockPath, { recursive: true, force: true });
+  }
+
+  const gcNow = Date.now();
+  const gcOld = new Date(gcNow - 31 * 24 * 60 * 60 * 1_000).toISOString();
+  const gcRecentBase = gcNow - 60_000;
+  const gcMetadata = { version: 2, agents: {} };
+  const gcExpiredOrphanId = 'agent-aaaaaaaaaaaaaaaaaaaaaaaaaa';
+  const gcExpiredQuarantineId = 'agent-abbbbbbbbbbbbbbbbbbbbbbbbb';
+  const gcProtectedQuarantineId = 'agent-accccccccccccccccccccccccc';
+  const gcProtectedSuspendedId = 'agent-addddddddddddddddddddddddd';
+  const gcInvalidTimestampId = 'agent-aeeeeeeeeeeeeeeeeeeeeeeeee';
+  const gcNumericTimestampId = 'agent-aeffffffffffffffffffffffff';
+  const gcFutureTimestampId = 'agent-afeeeeeeeeeeeeeeeeeeeeeeee';
+  const gcMismatchedMapKey = 'agent-b0000000000000000000000000';
+  const gcMismatchedRecordId = 'agent-b1111111111111111111111111';
+  gcMetadata.agents[gcExpiredOrphanId] = {
+    version: 2, agentId: gcExpiredOrphanId, harness: 'agy', cwd: root,
+    nativeSessionId: null, nativeSessionAttribution: 'unavailable', resumable: false,
+    runtimeAgentId: null, runtimeWorkspaceId: null, lifecycle: 'orphaned', updatedAt: gcOld,
+  };
+  gcMetadata.agents[gcExpiredQuarantineId] = {
+    version: 2, agentId: gcExpiredQuarantineId, harness: 'codex', cwd: root,
+    nativeSessionId: null, nativeSessionAttribution: 'unavailable', resumable: false,
+    runtimeAgentId: null, runtimeWorkspaceId: null, lifecycle: 'quarantined', updatedAt: gcOld,
+  };
+  gcMetadata.agents[gcProtectedQuarantineId] = {
+    version: 2, agentId: gcProtectedQuarantineId, harness: 'codex', cwd: root,
+    nativeSessionId: null, nativeSessionAttribution: 'unavailable', resumable: false,
+    runtimeAgentId: 'agent-11111111111111111111111111', runtimeWorkspaceId: 'gc-protected-workspace',
+    lifecycle: 'quarantined', updatedAt: gcOld,
+  };
+  gcMetadata.agents[gcProtectedSuspendedId] = {
+    version: 2, agentId: gcProtectedSuspendedId, harness: 'agy', cwd: root,
+    nativeSessionId: 'gc-suspended-native', nativeSessionAttribution: 'verified', resumable: true,
+    runtimeAgentId: null, runtimeWorkspaceId: null, lifecycle: 'suspended', updatedAt: gcOld,
+  };
+  gcMetadata.agents[gcInvalidTimestampId] = {
+    version: 2, agentId: gcInvalidTimestampId, harness: 'agy', cwd: root,
+    nativeSessionId: null, nativeSessionAttribution: 'unavailable', resumable: false,
+    runtimeAgentId: null, runtimeWorkspaceId: null, lifecycle: 'orphaned', updatedAt: 'not-a-date',
+  };
+  gcMetadata.agents[gcNumericTimestampId] = {
+    version: 2, agentId: gcNumericTimestampId, harness: 'agy', cwd: root,
+    nativeSessionId: null, nativeSessionAttribution: 'unavailable', resumable: false,
+    runtimeAgentId: null, runtimeWorkspaceId: null, lifecycle: 'orphaned', updatedAt: 0,
+  };
+  gcMetadata.agents[gcFutureTimestampId] = {
+    version: 2, agentId: gcFutureTimestampId, harness: 'agy', cwd: root,
+    nativeSessionId: null, nativeSessionAttribution: 'unavailable', resumable: false,
+    runtimeAgentId: null, runtimeWorkspaceId: null, lifecycle: 'orphaned',
+    updatedAt: new Date(gcNow + 24 * 60 * 60 * 1_000).toISOString(),
+  };
+  gcMetadata.agents[gcMismatchedMapKey] = {
+    version: 2, agentId: gcMismatchedRecordId, harness: 'agy', cwd: root,
+    nativeSessionId: null, nativeSessionAttribution: 'unavailable', resumable: false,
+    runtimeAgentId: null, runtimeWorkspaceId: null, lifecycle: 'orphaned', updatedAt: gcOld,
+  };
+  const gcRecentIds = [];
+  for (let index = 0; index < 105; index += 1) {
+    const agentId = `agent-${(index + 1_000).toString(16).padStart(26, '0')}`;
+    gcRecentIds.push(agentId);
+    gcMetadata.agents[agentId] = {
+      version: 2, agentId, harness: 'agy', cwd: root,
+      nativeSessionId: null, nativeSessionAttribution: 'unavailable', resumable: false,
+      runtimeAgentId: null, runtimeWorkspaceId: null, lifecycle: 'orphaned',
+      updatedAt: new Date(gcRecentBase + index).toISOString(),
+    };
+  }
+  await fs.writeFile(metadataPath, `${JSON.stringify(gcMetadata, null, 2)}\n`, 'utf8');
+  await metadataModuleA.__testCollectAgentMetadata();
+  let collectedGcMetadata = JSON.parse(await fs.readFile(metadataPath, 'utf8')).agents;
+  if (collectedGcMetadata[gcExpiredOrphanId] || collectedGcMetadata[gcExpiredQuarantineId]) {
+    throw new Error('Expired detached terminal metadata was not garbage-collected');
+  }
+  if (
+    !collectedGcMetadata[gcProtectedQuarantineId] ||
+    !collectedGcMetadata[gcProtectedSuspendedId] ||
+    !collectedGcMetadata[gcInvalidTimestampId] ||
+    !collectedGcMetadata[gcNumericTimestampId] ||
+    !collectedGcMetadata[gcFutureTimestampId] ||
+    collectedGcMetadata[gcMismatchedMapKey]?.agentId !== gcMismatchedRecordId
+  ) {
+    throw new Error('Metadata GC removed a protected or timestamp-uncertain record');
+  }
+  const retainedRecentIds = gcRecentIds.filter((agentId) => collectedGcMetadata[agentId]);
+  if (retainedRecentIds.length !== 100 || gcRecentIds.slice(0, 5).some((agentId) => collectedGcMetadata[agentId])) {
+    throw new Error('Metadata GC did not retain exactly the 100 most recent detached terminal records');
+  }
+  const gcNewestWriteId = 'agent-afffffffffffffffffffffffff';
+  await metadataModuleA.__testUpdateAgentMetadata(gcNewestWriteId, {
+    version: 2, agentId: gcNewestWriteId, harness: 'agy', cwd: root,
+    nativeSessionId: null, nativeSessionAttribution: 'unavailable', resumable: false,
+    runtimeAgentId: null, runtimeWorkspaceId: null, lifecycle: 'orphaned', updatedAt: new Date().toISOString(),
+  });
+  collectedGcMetadata = JSON.parse(await fs.readFile(metadataPath, 'utf8')).agents;
+  const detachedWithValidTimestamp = Object.entries(collectedGcMetadata).filter(([agentId, record]) => {
+    const timestamp = record.terminalAt ?? record.updatedAt;
+    const parsed = typeof timestamp === 'string' ? Date.parse(timestamp) : Number.NaN;
+    return (
+      agentId === record.agentId &&
+      ['orphaned', 'quarantined'].includes(record.lifecycle) &&
+      !record.runtimeAgentId &&
+      !record.runtimeWorkspaceId &&
+      !record.quarantineRuntime &&
+      Number.isFinite(parsed) &&
+      new Date(parsed).toISOString() === timestamp &&
+      parsed <= Date.now()
+    );
+  });
+  if (detachedWithValidTimestamp.length !== 100 || !collectedGcMetadata[gcNewestWriteId]) {
+    throw new Error('Metadata writes did not enforce the detached terminal history cap');
+  }
+  await fs.rm(metadataPath, { force: true });
   const ambiguousTransitionId = 'agent-f3333333333333333333333333';
   const ambiguousTransitionRuntimeId = 'agent-ffffffffffffffffffffffffff';
   const ambiguousTransitionWorkspaceId = 'ambiguous-transition-workspace';
