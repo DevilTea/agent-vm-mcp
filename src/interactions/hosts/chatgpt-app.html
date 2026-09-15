@@ -699,18 +699,56 @@
         return hostCapabilities?.serverTools != null;
       }
 
+      function describeResponseShape(value, depth = 0, seen = new WeakSet()) {
+        if (value === null) return 'null';
+        if (Array.isArray(value)) {
+          if (depth >= 3 || value.length === 0) return `array(${value.length})`;
+          return `array(${value.length})[${describeResponseShape(value[0], depth + 1, seen)}]`;
+        }
+
+        const valueType = typeof value;
+        if (valueType !== 'object') return valueType;
+        if (seen.has(value)) return 'object{circular}';
+        seen.add(value);
+
+        const keys = Object.keys(value).sort();
+        if (depth >= 3) return `object{${keys.join(',')}}`;
+        return `object{${keys.map((key) => `${key}:${describeResponseShape(value[key], depth + 1, seen)}`).join(',')}}`;
+      }
+
+      function isValidInteractionState(state, payload) {
+        return Boolean(
+          state &&
+          state.schemaVersion === 1 &&
+          state.interactionId === payload.interactionId &&
+          (state.status === 'pending' || state.status === 'submitted') &&
+          (state.status !== 'pending' || state.answers === null) &&
+          (state.status !== 'submitted' || Array.isArray(state.answers))
+        );
+      }
+
       function stateFromToolResult(result, payload) {
-        if (result?.isError) throw new Error('The server rejected the interaction state request.');
-        const state = result?.structuredContent;
-        if (
-          !state ||
-          state.schemaVersion !== 1 ||
-          state.interactionId !== payload.interactionId ||
-          (state.status !== 'pending' && state.status !== 'submitted') ||
-          (state.status === 'pending' && state.answers !== null) ||
-          (state.status === 'submitted' && !Array.isArray(state.answers))
-        ) {
-          throw new Error('The server returned invalid interaction state.');
+        const toolResult = result?.toolResult ?? result;
+        if (toolResult?.isError) throw new Error('The server rejected the interaction state request.');
+
+        let state = toolResult?.structuredContent;
+        if (!isValidInteractionState(state, payload) && Array.isArray(toolResult?.content)) {
+          const fallback = toolResult.content.find(
+            (block) => block?.type === 'text' && typeof block.text === 'string',
+          );
+          if (fallback) {
+            try {
+              const fallbackState = JSON.parse(fallback.text);
+              if (isValidInteractionState(fallbackState, payload)) state = fallbackState;
+            } catch {
+              // Validation below reports a single stable error for malformed server state.
+            }
+          }
+        }
+        if (!isValidInteractionState(state, payload)) {
+          throw new Error(
+            `The server returned invalid interaction state. Response shape: ${describeResponseShape(result)}`,
+          );
         }
         return state;
       }
