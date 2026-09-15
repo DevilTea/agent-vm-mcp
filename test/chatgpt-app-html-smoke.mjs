@@ -243,8 +243,30 @@ const serverState = {
   status: 'pending',
   answers: null,
   submissionCount: 0,
+  proxyMode: 'wrapped-null-elided',
 };
 const messages = [];
+function callToolResult(state) {
+  if (serverState.proxyMode === 'wrapped-invalid') {
+    return {
+      toolResult: {
+        bridgeMeta: { transport: 'host' },
+        content: [{ type: 'json', data: state }],
+      },
+    };
+  }
+  const toolResult = {
+    content: [{ type: 'text', text: JSON.stringify(state) }],
+  };
+  if (serverState.proxyMode === 'wrapped-null-elided') {
+    toolResult.structuredContent = Object.fromEntries(
+      Object.entries(state).filter(([, value]) => value !== null),
+    );
+  } else if (serverState.proxyMode.endsWith('structured')) {
+    toolResult.structuredContent = state;
+  }
+  return serverState.proxyMode.startsWith('wrapped') ? { toolResult } : toolResult;
+}
 const server = {
   receive(message, view) {
     if (message.method === 'ui/initialize') {
@@ -261,18 +283,17 @@ const server = {
     }
     if (message.method === 'tools/call') {
       if (message.params.name === 'request_user_input_state') {
+        const state = {
+          schemaVersion: 1,
+          interactionId,
+          status: serverState.status,
+          answers: clone(serverState.answers),
+          submittedAt: serverState.status === 'submitted' ? '2026-09-15T00:00:00.000Z' : null,
+        };
         view.dispatchMessage({
           jsonrpc: '2.0',
           id: message.id,
-          result: {
-            structuredContent: {
-              schemaVersion: 1,
-              interactionId,
-              status: serverState.status,
-              answers: clone(serverState.answers),
-              submittedAt: serverState.status === 'submitted' ? '2026-09-15T00:00:00.000Z' : null,
-            },
-          },
+          result: callToolResult(state),
         });
         return;
       }
@@ -281,34 +302,32 @@ const server = {
         if (serverState.status === 'pending') {
           serverState.status = 'submitted';
           serverState.answers = clone(message.params.arguments.answers);
+          const state = {
+            schemaVersion: 1,
+            interactionId,
+            status: 'submitted',
+            answers: clone(serverState.answers),
+            submittedAt: '2026-09-15T00:00:00.000Z',
+            submission: 'created',
+          };
           view.dispatchMessage({
             jsonrpc: '2.0',
             id: message.id,
-            result: {
-              structuredContent: {
-                schemaVersion: 1,
-                interactionId,
-                status: 'submitted',
-                answers: clone(serverState.answers),
-                submittedAt: '2026-09-15T00:00:00.000Z',
-                submission: 'created',
-              },
-            },
+            result: callToolResult(state),
           });
         } else {
+          const state = {
+            schemaVersion: 1,
+            interactionId,
+            status: 'submitted',
+            answers: clone(serverState.answers),
+            submittedAt: '2026-09-15T00:00:00.000Z',
+            submission: 'duplicate',
+          };
           view.dispatchMessage({
             jsonrpc: '2.0',
             id: message.id,
-            result: {
-              structuredContent: {
-                schemaVersion: 1,
-                interactionId,
-                status: 'submitted',
-                answers: clone(serverState.answers),
-                submittedAt: '2026-09-15T00:00:00.000Z',
-                submission: 'duplicate',
-              },
-            },
+            result: callToolResult(state),
           });
         }
         return;
@@ -369,6 +388,7 @@ assert.equal(firstForm.querySelector('[name="emoji"]').disabled, true);
 assert.equal(firstForm.querySelector('button').disabled, true);
 assert.equal(firstForm.querySelector('.status').textContent, 'Submitted.');
 
+serverState.proxyMode = 'wrapped-structured';
 const second = makeHarness(server);
 second.window.dispatchMessage({
   jsonrpc: '2.0',
@@ -397,5 +417,35 @@ assert.equal(secondForm.querySelector('[name="cjk"]').value, '中文');
 assert.equal(secondForm.querySelector('button').disabled, true);
 assert.equal(secondForm.querySelector('.status').textContent, 'Submitted.');
 assert.equal(serverState.submissionCount, 1, 'hydration must not submit a duplicate response');
+
+serverState.proxyMode = 'wrapped-invalid';
+const third = makeHarness(server);
+third.window.dispatchMessage({
+  jsonrpc: '2.0',
+  method: 'ui/notifications/tool-input',
+  params: { arguments: request },
+});
+third.window.dispatchMessage({
+  jsonrpc: '2.0',
+  method: 'ui/notifications/tool-result',
+  params: {
+    structuredContent: {
+      schemaVersion: 1,
+      interactionId,
+      request,
+      state: { schemaVersion: 1, interactionId, status: 'pending', answers: null, submittedAt: null },
+    },
+  },
+});
+await waitFor(
+  () => third.document.root.querySelector('.status')?.textContent.includes('Response shape:'),
+  'invalid server state did not expose a safe response-shape diagnostic',
+);
+const diagnostic = third.document.root.querySelector('.status').textContent;
+assert.match(diagnostic, /Response shape: object\{toolResult:object\{/);
+assert.match(diagnostic, /bridgeMeta:object\{transport:string\}/);
+assert.match(diagnostic, /content:array\(1\)\[object\{data,type\}\]/);
+assert.equal(diagnostic.includes(interactionId), false, 'diagnostic must not expose interaction IDs');
+assert.equal(diagnostic.includes('😀😀'), false, 'diagnostic must not expose answer values');
 
 console.log('PASS embedded ChatGPT interaction HTML behavior');
