@@ -51,6 +51,7 @@ import {
   serverInfoToolDescription,
 } from './server-info.js';
 import { applyUnifiedPatch, listDirectory, readTextFile, waitForFilesystemMutations } from './filesystem.js';
+import { resolveBashExecutable } from './shell.js';
 import { workspaceCreate, workspaceDelete, workspaceList, waitForWorkspaceMutations } from './workspaces.js';
 
 const MAX_PROCESS_STREAM_BYTES = 4 * 1024 * 1024;
@@ -68,6 +69,7 @@ function positiveIntegerFromEnv(name, fallback) {
 }
 
 const MAX_FILE_IMPORT_BYTES = positiveIntegerFromEnv('AGENT_FILE_IMPORT_MAX_BYTES', DEFAULT_MAX_FILE_IMPORT_BYTES);
+const EXECUTION_SHELL = await resolveBashExecutable();
 
 class BoundedStreamBuffer {
   #buffer = Buffer.alloc(0);
@@ -129,7 +131,7 @@ async function executeCommand({ command, cwd, env, timeoutMs }, requestSignal, a
   assertNoRawCodingHarnessLaunch(command, 'exec');
   const startedAt = Date.now();
   const executionArtifactId = randomUUID();
-  const child = spawn('/bin/bash', ['-lc', command], {
+  const child = spawn(EXECUTION_SHELL, ['-lc', command], {
     cwd: cwd ?? process.env.HOME,
     env: {
       ...process.env,
@@ -277,7 +279,7 @@ function startPersistentProcess({ command, cwd, env }, requestSignal) {
   }
 
   return new Promise((resolve, reject) => {
-    const child = spawn('/bin/bash', ['-lc', command], {
+    const child = spawn(EXECUTION_SHELL, ['-lc', command], {
       cwd: cwd ?? process.env.HOME,
       env: {
         ...process.env,
@@ -971,6 +973,7 @@ async function createServer() {
         await collectCapabilities({
           nativeTools: nativeToolNames,
           bridgeStatus: bridgeManager.status(),
+          executionShell: EXECUTION_SHELL,
         }),
       ),
   );

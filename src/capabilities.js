@@ -164,7 +164,7 @@ async function inspectProbes(probes) {
   );
 }
 
-export async function collectCapabilities({ nativeTools, bridgeStatus }) {
+export async function collectCapabilities({ nativeTools, bridgeStatus, executionShell }) {
   const { config, configPath } = await loadConfig();
   const commands = await inspectCommands(config.commands.map((command) => command.name), { config });
   const probes = await inspectProbes(config.probes ?? []);
@@ -185,7 +185,7 @@ export async function collectCapabilities({ nativeTools, bridgeStatus }) {
       home: process.env.HOME ?? null,
     },
     execution: {
-      shell: '/bin/bash',
+      shell: executionShell,
       persistentProcesses: true,
     },
     runtimes,
