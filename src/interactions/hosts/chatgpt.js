@@ -63,6 +63,7 @@ export function registerChatgptInteractionAdapter(server) {
         'Present a compact structured form when the user must make a real choice or provide information before the discussion can continue. ' +
         'Use this for architecture, design, issue, planning, or other decisions with meaningful tradeoffs. Prefer 1-4 focused questions, concise options, and mark at most one recommendation when you have one. Do not prefix question prompts with ordinal numbers; the UI numbers them for display. ' +
         'Prefer single_select for binary choices too; boolean remains available only for compatibility with existing callers. ' +
+        'Every single_select and multi_select question automatically includes exactly one reserved option with id `other`, label `Other`, and a required inline free-text input; do not add Other yourself. If an option already uses id `other` or is labelled `Other` ignoring case and surrounding whitespace, it is normalized in place without a duplicate. Other options may still use allowCustomInput for their own required inline details. ' +
         'Do not use it when you can safely make a reversible decision yourself. After calling this tool, wait for the form response instead of answering the questions yourself.',
       inputSchema: interactionRequestSchema,
       outputSchema: interactionResultSchema,
