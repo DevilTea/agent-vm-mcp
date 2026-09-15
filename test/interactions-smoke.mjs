@@ -12,12 +12,18 @@ import {
   OTHER_OPTION_ID,
   REQUEST_USER_INPUT_TOOL,
   interactionRequestSchema,
+  normalizeInteractionAnswers,
 } from '../src/interactions/model.js';
-import { CHATGPT_INTERACTION_RESOURCE_URI } from '../src/interactions/hosts/chatgpt.js';
+import {
+  CHATGPT_INTERACTION_RESOURCE_URI,
+  REQUEST_USER_INPUT_STATE_TOOL,
+  REQUEST_USER_INPUT_SUBMIT_TOOL,
+} from '../src/interactions/hosts/chatgpt.js';
 
 const projectRoot = path.resolve(import.meta.dirname, '..');
 const root = await fs.mkdtemp(path.join(os.tmpdir(), 'agent-vm-interactions-'));
 const bridgesPath = path.join(root, 'bridges.json');
+const interactionStatePath = path.join(root, 'interactions.json');
 await fs.writeFile(bridgesPath, '{"version":1,"bridges":[]}\n');
 
 async function connect(hostKind) {
@@ -30,6 +36,7 @@ async function connect(hostKind) {
       ...process.env,
       HOME: root,
       MCP_BRIDGES_CONFIG: bridgesPath,
+      AGENT_INTERACTION_STATE_PATH: interactionStatePath,
       AGENT_HERDR_BIN: path.join(root, 'missing-herdr'),
       AGENT_HERDR_BOOTSTRAP: 'external',
       AGENT_MCP_HOST: hostKind,
@@ -44,6 +51,13 @@ function parseJsonToolResult(result) {
   const text = result.content?.find((item) => item.type === 'text')?.text;
   assert.equal(typeof text, 'string', 'tool result did not contain text JSON');
   return JSON.parse(text);
+}
+
+async function assertToolError(call, expected) {
+  const result = await call();
+  assert.equal(result.isError, true, 'tool call unexpectedly succeeded');
+  const message = result.content?.map((item) => item.text ?? '').join('\n') ?? '';
+  assert.match(message, expected);
 }
 
 function allToolPages(client) {
@@ -120,6 +134,23 @@ try {
   assert.equal(normalized.questions[1].options[1].customInputPlaceholder, 'Explain B');
   assert.equal('allowCustomInput' in normalized.questions[0].options[0], false);
   assert.equal(normalized.questions[2].maxLength, 2_000);
+
+  const unicodeText = interactionRequestSchema.parse({
+    title: 'Unicode text',
+    questions: [{ id: 'text', kind: 'text', prompt: 'Enter text.', maxLength: 2 }],
+  });
+  assert.equal(
+    normalizeInteractionAnswers(unicodeText, [{ questionId: 'text', kind: 'text', value: '😀😀' }])[0].value,
+    '😀😀',
+  );
+  assert.equal(
+    normalizeInteractionAnswers(unicodeText, [{ questionId: 'text', kind: 'text', value: '中文' }])[0].value,
+    '中文',
+  );
+  assert.throws(
+    () => normalizeInteractionAnswers(unicodeText, [{ questionId: 'text', kind: 'text', value: '😀😀😀' }]),
+    /Unicode code points/,
+  );
 
   const automaticOther = interactionRequestSchema.parse({
     title: 'Automatic Other choices',
@@ -248,11 +279,19 @@ try {
     await generic.close().catch(() => {});
   }
 
-  const chatgpt = await connect('chatgpt');
+  let chatgpt = await connect('chatgpt');
   try {
     const tools = await allToolPages(chatgpt);
     const interactionTool = tools.find((tool) => tool.name === REQUEST_USER_INPUT_TOOL);
+    const interactionStateTool = tools.find((tool) => tool.name === REQUEST_USER_INPUT_STATE_TOOL);
+    const interactionSubmitTool = tools.find((tool) => tool.name === REQUEST_USER_INPUT_SUBMIT_TOOL);
     assert.ok(interactionTool, 'ChatGPT interaction tool missing');
+    assert.ok(interactionStateTool, 'ChatGPT interaction state tool missing');
+    assert.ok(interactionSubmitTool, 'ChatGPT interaction submit tool missing');
+    assert.deepEqual(interactionStateTool._meta?.ui?.visibility, ['app']);
+    assert.deepEqual(interactionSubmitTool._meta?.ui?.visibility, ['app']);
+    assert.equal(interactionStateTool._meta?.ui?.resourceUri, CHATGPT_INTERACTION_RESOURCE_URI);
+    assert.equal(interactionSubmitTool._meta?.ui?.resourceUri, CHATGPT_INTERACTION_RESOURCE_URI);
     assert.equal(interactionTool._meta?.ui?.resourceUri, CHATGPT_INTERACTION_RESOURCE_URI);
     assert.equal(interactionTool._meta?.['ui/resourceUri'], CHATGPT_INTERACTION_RESOURCE_URI);
     assert.deepEqual(interactionTool._meta?.ui?.visibility, ['model']);
@@ -298,6 +337,13 @@ try {
     assert.match(content.text, /FORM_STATE_PREFIX/);
     assert.match(content.text, /window\.localStorage\.setItem/);
     assert.match(content.text, /restorePersistedForm/);
+    assert.match(content.text, /request_user_input_state/);
+    assert.match(content.text, /request_user_input_submit/);
+    assert.match(content.text, /tools\/call/);
+    assert.match(content.text, /Array\.from\(text\(value\)\)/);
+    assert.match(content.text, /truncateToUnicodeLength/);
+    assert.doesNotMatch(content.text, /input\.maxLength\s*=/);
+    assert.doesNotMatch(content.text, /persisted\.submitted/);
     assert.match(content.text, /fieldset\s*\{[\s\S]*padding:\s*0 12px/);
     assert.match(content.text, /function displayQuestionPrompt/);
     assert.match(content.text, /prompt\.startsWith\(ordinal\)/);
@@ -356,9 +402,205 @@ try {
     assert.equal(result.structuredContent?.request?.questions?.[1]?.options?.[2]?.allowCustomInput, true);
     assert.equal(result.structuredContent?.request?.questions?.[1]?.maxSelections, 2);
     assert.equal(result.structuredContent?.request?.questions?.[1]?.options?.length, 3);
+    assert.equal(result.structuredContent?.state?.status, 'pending');
+    assert.equal(result.structuredContent?.state?.answers, null);
     assert.match(result.content?.[0]?.text ?? '', /custom input required/);
     assert.match(result.content?.[0]?.text ?? '', /other: Other/);
     assert.match(result.content?.[0]?.text ?? '', /Wait for the user response/);
+
+    const interactionId = result.structuredContent.interactionId;
+    const pendingStateResult = await chatgpt.callTool({
+      name: REQUEST_USER_INPUT_STATE_TOOL,
+      arguments: { interactionId },
+    });
+    assert.equal(pendingStateResult.structuredContent?.interactionId, interactionId);
+    assert.equal(pendingStateResult.structuredContent?.status, 'pending');
+    assert.equal(pendingStateResult.structuredContent?.answers, null);
+
+    const submittedAnswers = [
+      {
+        questionId: 'storage',
+        kind: 'single_select',
+        value: OTHER_OPTION_ID,
+        customValues: { [OTHER_OPTION_ID]: '  Object store  ' },
+      },
+      {
+        questionId: 'formats',
+        kind: 'multi_select',
+        value: ['html'],
+        customValues: {},
+      },
+    ];
+    const submitted = await chatgpt.callTool({
+      name: REQUEST_USER_INPUT_SUBMIT_TOOL,
+      arguments: { interactionId, answers: submittedAnswers },
+    });
+    assert.equal(submitted.structuredContent?.status, 'submitted');
+    assert.equal(submitted.structuredContent?.submission, 'created');
+    assert.deepEqual(submitted.structuredContent?.answers, [
+      {
+        questionId: 'storage',
+        kind: 'single_select',
+        value: OTHER_OPTION_ID,
+        customValues: { [OTHER_OPTION_ID]: 'Object store' },
+      },
+      {
+        questionId: 'formats',
+        kind: 'multi_select',
+        value: ['html'],
+        customValues: {},
+      },
+    ]);
+    const persistedFile = JSON.parse(await fs.readFile(interactionStatePath, 'utf8'));
+    const persistedRecord = persistedFile.interactions.find((entry) => entry.interactionId === interactionId);
+    assert.deepEqual(persistedRecord?.answers, submitted.structuredContent.answers);
+    assert.doesNotMatch(JSON.stringify(persistedRecord), /Structured response/);
+    assert.equal((await fs.stat(interactionStatePath)).mode & 0o777, 0o600);
+
+    const hydratedState = await chatgpt.callTool({
+      name: REQUEST_USER_INPUT_STATE_TOOL,
+      arguments: { interactionId },
+    });
+    assert.equal(hydratedState.structuredContent?.status, 'submitted');
+    assert.deepEqual(hydratedState.structuredContent?.answers, submitted.structuredContent.answers);
+
+    const duplicate = await chatgpt.callTool({
+      name: REQUEST_USER_INPUT_SUBMIT_TOOL,
+      arguments: { interactionId, answers: submittedAnswers },
+    });
+    assert.equal(duplicate.structuredContent?.submission, 'duplicate');
+    assert.deepEqual(duplicate.structuredContent?.answers, submitted.structuredContent.answers);
+    await assertToolError(
+      () => chatgpt.callTool({
+        name: REQUEST_USER_INPUT_SUBMIT_TOOL,
+        arguments: {
+          interactionId,
+          answers: [
+            { questionId: 'storage', kind: 'single_select', value: 'git', customValues: {} },
+            { questionId: 'formats', kind: 'multi_select', value: ['html'], customValues: {} },
+          ],
+        },
+      }),
+      /already been submitted with different answers/,
+    );
+
+    const unknownInteractionId = '00000000-0000-4000-8000-000000000000';
+    await assertToolError(
+      () => chatgpt.callTool({
+        name: REQUEST_USER_INPUT_STATE_TOOL,
+        arguments: { interactionId: unknownInteractionId },
+      }),
+      /Unknown interactionId/,
+    );
+    await assertToolError(
+      () => chatgpt.callTool({
+        name: REQUEST_USER_INPUT_STATE_TOOL,
+        arguments: { interactionId: 'not-an-interaction-id' },
+      }),
+      /Invalid UUID/,
+    );
+    await assertToolError(
+      () => chatgpt.callTool({
+        name: REQUEST_USER_INPUT_SUBMIT_TOOL,
+        arguments: { interactionId: unknownInteractionId, answers: submittedAnswers },
+      }),
+      /Unknown interactionId/,
+    );
+
+    const pendingInteraction = await chatgpt.callTool({
+      name: REQUEST_USER_INPUT_TOOL,
+      arguments: {
+        title: 'Pending validation',
+        questions: [{
+          id: 'choice',
+          kind: 'single_select',
+          prompt: 'Choose.',
+          options: [{ id: 'one', label: 'One' }, { id: 'two', label: 'Two' }],
+        }],
+      },
+    });
+    const pendingInteractionId = pendingInteraction.structuredContent.interactionId;
+    await assertToolError(
+      () => chatgpt.callTool({
+        name: REQUEST_USER_INPUT_SUBMIT_TOOL,
+        arguments: {
+          interactionId: pendingInteractionId,
+          answers: [{ questionId: 'choice', kind: 'single_select', value: 'missing', customValues: {} }],
+        },
+      }),
+      /Unknown option/,
+    );
+    await assertToolError(
+      () => chatgpt.callTool({
+        name: REQUEST_USER_INPUT_SUBMIT_TOOL,
+        arguments: {
+          interactionId: pendingInteractionId,
+          answers: [{ questionId: 'choice', kind: 'single_select', value: OTHER_OPTION_ID, customValues: {} }],
+        },
+      }),
+      /custom value is required/,
+    );
+    await assertToolError(
+      () => chatgpt.callTool({
+        name: REQUEST_USER_INPUT_SUBMIT_TOOL,
+        arguments: {
+          interactionId: pendingInteractionId,
+          answers: submittedAnswers,
+        },
+      }),
+      /exactly one entry|Missing answer/,
+    );
+    const stillPending = await chatgpt.callTool({
+      name: REQUEST_USER_INPUT_STATE_TOOL,
+      arguments: { interactionId: pendingInteractionId },
+    });
+    assert.equal(stillPending.structuredContent?.status, 'pending');
+    assert.equal(stillPending.structuredContent?.answers, null);
+
+    const unicodeInteraction = await chatgpt.callTool({
+      name: REQUEST_USER_INPUT_TOOL,
+      arguments: {
+        title: 'Server Unicode validation',
+        questions: [{ id: 'text', kind: 'text', prompt: 'Enter text.', maxLength: 2 }],
+      },
+    });
+    const unicodeInteractionId = unicodeInteraction.structuredContent.interactionId;
+    const unicodeSubmitted = await chatgpt.callTool({
+      name: REQUEST_USER_INPUT_SUBMIT_TOOL,
+      arguments: {
+        interactionId: unicodeInteractionId,
+        answers: [{ questionId: 'text', kind: 'text', value: '😀😀' }],
+      },
+    });
+    assert.equal(unicodeSubmitted.structuredContent?.status, 'submitted');
+    assert.equal(unicodeSubmitted.structuredContent?.answers?.[0]?.value, '😀😀');
+
+    const tooLongUnicode = await chatgpt.callTool({
+      name: REQUEST_USER_INPUT_TOOL,
+      arguments: {
+        title: 'Server Unicode rejection',
+        questions: [{ id: 'text', kind: 'text', prompt: 'Enter text.', maxLength: 2 }],
+      },
+    });
+    await assertToolError(
+      () => chatgpt.callTool({
+        name: REQUEST_USER_INPUT_SUBMIT_TOOL,
+        arguments: {
+          interactionId: tooLongUnicode.structuredContent.interactionId,
+          answers: [{ questionId: 'text', kind: 'text', value: '😀😀😀' }],
+        },
+      }),
+      /Unicode code points/,
+    );
+
+    await chatgpt.close();
+    chatgpt = await connect('chatgpt');
+    const afterRestart = await chatgpt.callTool({
+      name: REQUEST_USER_INPUT_STATE_TOOL,
+      arguments: { interactionId },
+    });
+    assert.equal(afterRestart.structuredContent?.status, 'submitted');
+    assert.deepEqual(afterRestart.structuredContent?.answers, submitted.structuredContent.answers);
   } finally {
     await chatgpt.close().catch(() => {});
   }

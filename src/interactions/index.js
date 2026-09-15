@@ -1,16 +1,17 @@
-import { REQUEST_USER_INPUT_TOOL } from './model.js';
-import { registerChatgptInteractionAdapter } from './hosts/chatgpt.js';
+import {
+  CHATGPT_INTERACTION_TOOL_NAMES,
+  registerChatgptInteractionAdapter,
+} from './hosts/chatgpt.js';
 
 export function interactionToolNamesForHost(hostProfile) {
-  return hostProfile.interactionAdapter === 'chatgpt' ? [REQUEST_USER_INPUT_TOOL] : [];
+  return hostProfile.interactionAdapter === 'chatgpt' ? CHATGPT_INTERACTION_TOOL_NAMES : [];
 }
 
-export function registerInteractionsForHost(server, hostProfile) {
-  if (hostProfile.interactionAdapter === null) return;
+export async function registerInteractionsForHost(server, hostProfile) {
+  if (hostProfile.interactionAdapter === null) return null;
 
   if (hostProfile.interactionAdapter === 'chatgpt') {
-    registerChatgptInteractionAdapter(server);
-    return;
+    return await registerChatgptInteractionAdapter(server);
   }
 
   throw new Error(`Unsupported interaction adapter: ${hostProfile.interactionAdapter}`);

@@ -3,6 +3,8 @@ import * as z from 'zod/v4';
 export const REQUEST_USER_INPUT_TOOL = 'request_user_input';
 export const INTERACTION_SCHEMA_VERSION = 1;
 export const OTHER_OPTION_ID = 'other';
+export const INTERACTION_STATUS_PENDING = 'pending';
+export const INTERACTION_STATUS_SUBMITTED = 'submitted';
 
 const OTHER_OPTION_LABEL = 'Other';
 const OTHER_OPTION_CUSTOM_INPUT_PLACEHOLDER = 'Please specify another option';
@@ -167,7 +169,13 @@ const textQuestionSchema = z.object({
   kind: z.literal('text'),
   placeholder: z.string().max(300).optional(),
   multiline: z.boolean().default(false),
-  maxLength: z.number().int().min(1).max(10_000).default(2_000),
+  maxLength: z
+    .number()
+    .int()
+    .min(1)
+    .max(10_000)
+    .default(2_000)
+    .describe('Maximum number of Unicode code points in the response; surrogate pairs count as one.'),
 });
 
 const booleanQuestionSchema = z.object({
@@ -266,7 +274,7 @@ const normalizedInteractionQuestionSchema = z.union([
   booleanQuestionSchema,
 ]);
 
-const normalizedInteractionRequestSchema = withUniqueQuestions(
+export const normalizedInteractionRequestSchema = withUniqueQuestions(
   z.object({
     title: z.string().min(1).max(200),
     description: z.string().min(1).max(1_500).optional(),
@@ -275,11 +283,156 @@ const normalizedInteractionRequestSchema = withUniqueQuestions(
   }),
 );
 
+const interactionAnswerValueSchema = z.union([
+  z.string().max(10_000),
+  z.array(z.string().max(64)).max(MAX_NORMALIZED_SELECT_OPTIONS),
+  z.boolean(),
+  z.null(),
+]);
+
+export const interactionAnswerSchema = z
+  .object({
+    questionId: identifierSchema,
+    kind: z.enum(['single_select', 'multi_select', 'text', 'boolean']),
+    value: interactionAnswerValueSchema,
+    customValues: z.record(identifierSchema, z.string().max(10_000)).optional(),
+  })
+  .strict();
+
+export const interactionAnswersSchema = z.array(interactionAnswerSchema).min(1).max(6);
+
+export const interactionStateSchema = z.object({
+  schemaVersion: z.literal(INTERACTION_SCHEMA_VERSION),
+  interactionId: z.string().uuid(),
+  status: z.enum([INTERACTION_STATUS_PENDING, INTERACTION_STATUS_SUBMITTED]),
+  answers: z.array(interactionAnswerSchema).nullable(),
+  submittedAt: z.string().datetime().nullable(),
+});
+
+export const interactionSubmissionResultSchema = interactionStateSchema.extend({
+  submission: z.enum(['created', 'duplicate']),
+});
+
 export const interactionResultSchema = z.object({
   schemaVersion: z.literal(INTERACTION_SCHEMA_VERSION),
   interactionId: z.string().uuid(),
   request: normalizedInteractionRequestSchema,
+  state: interactionStateSchema,
 });
+
+function invalidInteractionAnswers(message) {
+  const error = new Error(message);
+  error.code = 'invalid_interaction_answers';
+  return error;
+}
+
+function assertAnswer(condition, message) {
+  if (!condition) throw invalidInteractionAnswers(message);
+}
+
+function normalizeCustomValues(question, selectedValues, rawCustomValues) {
+  const customValues = rawCustomValues ?? {};
+  const selected = new Set(selectedValues);
+  const optionsById = new Map(question.options.map((option) => [option.id, option]));
+
+  for (const optionId of Object.keys(customValues)) {
+    const option = optionsById.get(optionId);
+    assertAnswer(option, `Unknown custom option ${optionId} for question ${question.id}.`);
+    assertAnswer(selected.has(optionId), `Custom value for unselected option ${optionId} is not allowed.`);
+    assertAnswer(option.allowCustomInput === true, `Option ${optionId} does not accept a custom value.`);
+  }
+
+  const normalized = {};
+  for (const option of question.options) {
+    if (!selected.has(option.id) || option.allowCustomInput !== true) continue;
+    const customValue = customValues[option.id];
+    assertAnswer(typeof customValue === 'string' && customValue.trim().length > 0, `A custom value is required for option ${option.id}.`);
+    normalized[option.id] = customValue.trim();
+  }
+
+  return normalized;
+}
+
+function normalizeAnswerForQuestion(question, answer) {
+  assertAnswer(answer.kind === question.kind, `Answer kind for question ${question.id} does not match the original request.`);
+  const rawCustomValues = answer.customValues ?? {};
+
+  if (question.kind === 'single_select') {
+    assertAnswer(answer.value === null || typeof answer.value === 'string', `Answer value for question ${question.id} must be one option or null.`);
+    const allowed = new Set(question.options.map((option) => option.id));
+    assertAnswer(answer.value === null || allowed.has(answer.value), `Unknown option for question ${question.id}.`);
+    assertAnswer(question.required === false || answer.value !== null, `A response is required for question ${question.id}.`);
+    return {
+      questionId: question.id,
+      kind: question.kind,
+      value: answer.value,
+      customValues: normalizeCustomValues(
+        question,
+        answer.value === null ? [] : [answer.value],
+        rawCustomValues,
+      ),
+    };
+  }
+
+  if (question.kind === 'multi_select') {
+    assertAnswer(Array.isArray(answer.value), `Answer value for question ${question.id} must be an array.`);
+    const selected = new Set(answer.value);
+    assertAnswer(selected.size === answer.value.length, `Duplicate options are not allowed for question ${question.id}.`);
+    const allowed = new Set(question.options.map((option) => option.id));
+    assertAnswer(answer.value.every((optionId) => allowed.has(optionId)), `Unknown option for question ${question.id}.`);
+
+    const minSelections = Math.max(question.required === false ? 0 : 1, question.minSelections ?? 0);
+    const maxSelections = question.maxSelections ?? question.options.length;
+    assertAnswer(answer.value.length >= minSelections, `Question ${question.id} requires at least ${minSelections} selection(s).`);
+    assertAnswer(answer.value.length <= maxSelections, `Question ${question.id} allows at most ${maxSelections} selection(s).`);
+
+    const values = question.options
+      .map((option) => option.id)
+      .filter((optionId) => selected.has(optionId));
+    return {
+      questionId: question.id,
+      kind: question.kind,
+      value: values,
+      customValues: normalizeCustomValues(question, values, rawCustomValues),
+    };
+  }
+
+  assertAnswer(Object.keys(rawCustomValues).length === 0, `Question ${question.id} does not accept custom values.`);
+
+  if (question.kind === 'boolean') {
+    assertAnswer(answer.value === null || typeof answer.value === 'boolean', `Answer value for question ${question.id} must be boolean or null.`);
+    assertAnswer(question.required === false || answer.value !== null, `A response is required for question ${question.id}.`);
+    return { questionId: question.id, kind: question.kind, value: answer.value };
+  }
+
+  assertAnswer(answer.value === null || typeof answer.value === 'string', `Answer value for question ${question.id} must be text or null.`);
+  if (answer.value !== null) {
+    assertAnswer(Array.from(answer.value).length <= question.maxLength, `Answer for question ${question.id} exceeds maxLength in Unicode code points.`);
+  }
+  const value = answer.value === null ? null : answer.value.trim() || null;
+  assertAnswer(question.required === false || value !== null, `A response is required for question ${question.id}.`);
+  return { questionId: question.id, kind: question.kind, value };
+}
+
+export function normalizeInteractionAnswers(request, answers) {
+  const parsed = interactionAnswersSchema.safeParse(answers);
+  if (!parsed.success) {
+    throw invalidInteractionAnswers(parsed.error.issues[0]?.message ?? 'Invalid interaction answers.');
+  }
+
+  assertAnswer(parsed.data.length === request.questions.length, 'Answers must contain exactly one entry for every question.');
+  const byQuestionId = new Map();
+  for (const answer of parsed.data) {
+    assertAnswer(!byQuestionId.has(answer.questionId), `Duplicate answer for question ${answer.questionId}.`);
+    byQuestionId.set(answer.questionId, answer);
+  }
+
+  return request.questions.map((question) => {
+    const answer = byQuestionId.get(question.id);
+    assertAnswer(answer, `Missing answer for question ${question.id}.`);
+    return normalizeAnswerForQuestion(question, answer);
+  });
+}
 
 function questionFallback(question, index) {
   const lines = [`${index + 1}. ${question.prompt}`];
