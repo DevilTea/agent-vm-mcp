@@ -1263,6 +1263,126 @@ try {
   }
   for (const agentId of recoveryIds) await recoveryModule.agentStop({ agentId });
 
+  const staleAbsentId = `agent-${'a'.repeat(26)}`;
+  const staleAbsentRuntimeId = `agent-${'b'.repeat(26)}`;
+  const staleAbsentWorkspaceId = 'stale-active-absent-workspace';
+  const staleRecoverableId = 'agent-12121212121212121212121212';
+  const staleRecoverableRuntimeId = 'agent-34343434343434343434343434';
+  const staleRecoverableWorkspaceId = 'stale-active-recoverable-workspace';
+  const staleOrphanId = `agent-${'c'.repeat(26)}`;
+  const staleOrphanRuntimeId = `agent-${'d'.repeat(26)}`;
+  const staleOrphanWorkspaceId = 'stale-active-orphan-workspace';
+  const staleAmbiguousId = `agent-${'e'.repeat(26)}`;
+  const staleAmbiguousRuntimeId = `agent-${'f'.repeat(26)}`;
+  const staleAmbiguousWorkspaceIds = ['stale-active-ambiguous-1', 'stale-active-ambiguous-2'];
+  for (const [agentId, runtimeAgentId, runtimeWorkspaceId] of [
+    [staleAbsentId, staleAbsentRuntimeId, staleAbsentWorkspaceId],
+    [staleOrphanId, staleOrphanRuntimeId, staleOrphanWorkspaceId],
+    [staleAmbiguousId, staleAmbiguousRuntimeId, staleAmbiguousWorkspaceIds[0]],
+  ]) {
+    await recoveryModule.__testUpdateAgentMetadata(agentId, {
+      version: 2,
+      agentId,
+      harness: 'agy',
+      cwd: root,
+      model: null,
+      effort: null,
+      nativeSessionId: null,
+      nativeSessionAttribution: 'unavailable',
+      resumable: false,
+      runtimeAgentId,
+      runtimeWorkspaceId,
+      lifecycle: 'active',
+      updatedAt: new Date().toISOString(),
+    });
+  }
+  await recoveryModule.__testUpdateAgentMetadata(staleRecoverableId, {
+    version: 2,
+    agentId: staleRecoverableId,
+    harness: 'agy',
+    cwd: root,
+    model: null,
+    effort: null,
+    nativeSessionId: 'stale-recoverable-native-session',
+    nativeSessionAttribution: 'backend_reported',
+    resumable: true,
+    runtimeAgentId: staleRecoverableRuntimeId,
+    runtimeWorkspaceId: staleRecoverableWorkspaceId,
+    lifecycle: 'active',
+    updatedAt: new Date().toISOString(),
+  });
+  state = JSON.parse(await fs.readFile(statePath, 'utf8'));
+  state.workspaces[staleOrphanWorkspaceId] = {
+    workspace: { workspace_id: staleOrphanWorkspaceId, label: staleOrphanRuntimeId, number: 1 },
+    paneId: `${staleOrphanWorkspaceId}:p1`, tabId: `${staleOrphanWorkspaceId}:t1`, cwd: root,
+  };
+  for (const workspaceId of staleAmbiguousWorkspaceIds) {
+    state.workspaces[workspaceId] = {
+      workspace: { workspace_id: workspaceId, label: staleAmbiguousRuntimeId, number: 1 },
+      paneId: `${workspaceId}:p1`, tabId: `${workspaceId}:t1`, cwd: root,
+    };
+  }
+  await fs.writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, 'utf8');
+
+  const staleCapabilities = await recoveryModule.agentCapabilities();
+  const staleMetadata = JSON.parse(await fs.readFile(metadataPath, 'utf8')).agents;
+  for (const [agentId, runtimeAgentId] of [
+    [staleAbsentId, staleAbsentRuntimeId],
+    [staleOrphanId, staleOrphanRuntimeId],
+  ]) {
+    const record = staleMetadata[agentId];
+    if (record?.lifecycle !== 'orphaned' || record.runtimeAgentId !== null || record.lastRuntimeAgentId !== runtimeAgentId) {
+      throw new Error(`Stale active metadata did not reconcile to orphaned: ${JSON.stringify(record)}`);
+    }
+    const discovered = staleCapabilities.runtime.session.agents.find((agent) => agent.agentId === agentId);
+    if (!discovered || discovered.lifecycle !== 'orphaned') {
+      throw new Error(`Orphaned logical agent was not exposed by capabilities: ${agentId}`);
+    }
+  }
+  const recoverableRecord = staleMetadata[staleRecoverableId];
+  if (
+    recoverableRecord?.lifecycle !== 'suspended' ||
+    recoverableRecord.runtimeAgentId !== null ||
+    recoverableRecord.nativeSessionId !== 'stale-recoverable-native-session' ||
+    recoverableRecord.resumable !== true
+  ) {
+    throw new Error(`Recoverable stale active metadata did not reconcile to suspended: ${JSON.stringify(recoverableRecord)}`);
+  }
+  const recoverableDescription = staleCapabilities.runtime.session.agents.find((agent) => agent.agentId === staleRecoverableId);
+  if (!recoverableDescription || recoverableDescription.lifecycle !== 'suspended' || recoverableDescription.resumable !== true) {
+    throw new Error(`Recoverable stale active logical agent was not exposed as suspended: ${JSON.stringify(recoverableDescription)}`);
+  }
+  if (staleMetadata[staleAmbiguousId]?.lifecycle !== 'active') {
+    throw new Error('Ambiguous stale active ownership was mutated during reconciliation');
+  }
+  state = JSON.parse(await fs.readFile(statePath, 'utf8'));
+  if (state.workspaces[staleOrphanWorkspaceId]) {
+    throw new Error('Stale active reconciliation left an exactly-owned orphan workspace behind');
+  }
+  for (const workspaceId of staleAmbiguousWorkspaceIds) {
+    if (!state.workspaces[workspaceId]) throw new Error('Ambiguous workspace was unexpectedly closed');
+  }
+  const orphanedGet = await recoveryModule.agentGet({ agentId: staleAbsentId });
+  if (orphanedGet.lifecycle !== 'orphaned' || orphanedGet.runtimeAgentId !== null) {
+    throw new Error(`agent_get did not expose durable orphaned state: ${JSON.stringify(orphanedGet)}`);
+  }
+  await recoveryModule.agentStop({ agentId: staleAbsentId });
+  await recoveryModule.agentStop({ agentId: staleOrphanId });
+  await recoveryModule.agentStop({ agentId: staleRecoverableId });
+  await recoveryModule.__testUpdateAgentMetadata(staleAmbiguousId, null);
+  state = JSON.parse(await fs.readFile(statePath, 'utf8'));
+  for (const workspaceId of staleAmbiguousWorkspaceIds) delete state.workspaces[workspaceId];
+  await fs.writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, 'utf8');
+  const cleanedStaleMetadata = JSON.parse(await fs.readFile(metadataPath, 'utf8')).agents;
+  if (
+    cleanedStaleMetadata[staleAbsentId] ||
+    cleanedStaleMetadata[staleOrphanId] ||
+    cleanedStaleMetadata[staleRecoverableId] ||
+    cleanedStaleMetadata[staleAmbiguousId]
+  ) {
+    throw new Error('Orphaned/suspended/ambiguous reconciliation fixtures were not cleaned up');
+  }
+
   const missingProvenanceId = 'agent-66666666666666666666666666';
   const missingProvenanceRuntimeId = 'agent-77777777777777777777777777';
   const missingProvenanceWorkspaceId = 'missing-provenance-workspace';
@@ -1515,6 +1635,7 @@ try {
   await fs.writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, 'utf8');
 
   const workspaceCountBeforeSyntheticAbort = Object.keys(state.workspaces).length;
+  const metadataCountBeforeSyntheticAbort = Object.keys(JSON.parse(await fs.readFile(metadataPath, 'utf8')).agents).length;
   let abortChecks = 0;
   const syntheticAbortSignal = {
     aborted: false,
@@ -1539,6 +1660,10 @@ try {
   state = JSON.parse(await fs.readFile(statePath, 'utf8'));
   if (Object.keys(state.workspaces).length !== workspaceCountBeforeSyntheticAbort) {
     throw new Error('Post-create exception leaked an agent workspace');
+  }
+  const metadataCountAfterSyntheticAbort = Object.keys(JSON.parse(await fs.readFile(metadataPath, 'utf8')).agents).length;
+  if (metadataCountAfterSyntheticAbort !== metadataCountBeforeSyntheticAbort) {
+    throw new Error('Post-create exception leaked durable logical-agent metadata');
   }
 
   const workspaceCountBeforeFailedCreate = Object.keys(state.workspaces).length;
@@ -1654,7 +1779,7 @@ try {
   delete process.env.AGENT_HERDR_BOOTSTRAP;
 
   const finalCapabilities = await agentCapabilities();
-  if (finalCapabilities.runtime.session.agents.length !== 0) throw new Error('Fake agents leaked after stop');
+  if (finalCapabilities.runtime.session.agents.length !== 0) throw new Error(`Fake agents leaked after stop: ${JSON.stringify(finalCapabilities.runtime.session.agents)}`);
   console.log('agent runtime smoke PASS');
 } finally {
   for (const [key, value] of Object.entries(previous)) {
