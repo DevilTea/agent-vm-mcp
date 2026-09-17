@@ -15,6 +15,7 @@ import {
   agentCapabilities,
   agentGet,
   agentPrompt,
+  agentPromptResult,
   agentRead,
   agentSendKeys,
   agentStart,
@@ -416,6 +417,7 @@ const BASE_NATIVE_TOOL_NAMES = new Set([
   'agent_get',
   'agent_read',
   'agent_prompt',
+  'agent_prompt_result',
   'agent_send_keys',
   'agent_suspend',
   'agent_resume',
@@ -669,6 +671,11 @@ async function createServer() {
         'Submit a task to an MCP-managed coding agent after a positive readiness check. Definite preflight rejection is not submitted; if another prompt is already in flight or timeout/cancellation occurs after Herdr starts, submission is uncertain/possibly submitted and unsafe to auto-retry.',
       inputSchema: z.object({
         agentId: agentIdSchema,
+        requestId: z
+          .string()
+          .regex(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/)
+          .optional()
+          .describe('Stable caller-chosen prompt identity. Reuse it to join or recover the same request after a lost response.'),
         task: z.string().min(1).max(100_000).refine((task) => !task.includes('\0'), 'task must not contain NUL characters'),
         skills: z
           .array(z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/))
@@ -683,6 +690,26 @@ async function createServer() {
       }),
     },
     async (args, ctx) => jsonResult(await agentPrompt(args, ctx.mcpReq.signal)),
+  );
+
+  server.registerTool(
+    'agent_prompt_result',
+    {
+      description:
+        'Recover a durable agent_prompt completion independently of the live Herdr runtime. Use the same requestId after caller cancellation, process restart, or a lost MCP response. Set ack=true only after the result has been consumed; acknowledgement is separate from runtime suspend/stop. If requestId is unavailable, agentId can select one unacknowledged completion when it is unambiguous.',
+      inputSchema: z
+        .object({
+          requestId: z
+            .string()
+            .regex(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/)
+            .optional()
+            .describe('Stable prompt identity returned by agent_prompt or chosen by the caller.'),
+          agentId: agentIdSchema.optional().describe('Optional logical agent ID for unambiguous latest-result recovery.'),
+          ack: z.boolean().default(false).describe('Mark a completed/uncertain durable result as consumed after reading it.'),
+        })
+        .refine(({ requestId, agentId }) => Boolean(requestId || agentId), 'requestId or agentId is required.'),
+    },
+    async (args, ctx) => jsonResult(await agentPromptResult(args, ctx.mcpReq.signal)),
   );
 
   server.registerTool(

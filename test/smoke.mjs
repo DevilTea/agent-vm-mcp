@@ -299,6 +299,7 @@ exec /usr/bin/git "$@"
     'agent_get',
     'agent_read',
     'agent_prompt',
+    'agent_prompt_result',
     'agent_send_keys',
     'agent_suspend',
     'agent_resume',
@@ -343,8 +344,16 @@ exec /usr/bin/git "$@"
   const agentPromptTool = toolByName.get('agent_prompt');
   if (!agentPromptTool) throw new Error('agent_prompt schema missing');
   const agentPromptProperties = agentPromptTool.inputSchema?.properties ?? {};
-  for (const property of ['agentId', 'task', 'skills', 'wait', 'until', 'timeoutMs']) {
+  for (const property of ['agentId', 'requestId', 'task', 'skills', 'wait', 'until', 'timeoutMs']) {
     if (!(property in agentPromptProperties)) throw new Error(`agent_prompt schema missing property: ${property}`);
+  }
+  const agentPromptResultTool = toolByName.get('agent_prompt_result');
+  if (!agentPromptResultTool?.description?.includes('independently of the live Herdr runtime')) {
+    throw new Error('agent_prompt_result description does not establish runtime-independent recovery');
+  }
+  const agentPromptResultProperties = agentPromptResultTool.inputSchema?.properties ?? {};
+  for (const property of ['requestId', 'agentId', 'ack']) {
+    if (!(property in agentPromptResultProperties)) throw new Error(`agent_prompt_result schema missing property: ${property}`);
   }
   const agentGetTool = toolByName.get('agent_get');
   if (!agentGetTool?.description?.includes('delegation policy')) {

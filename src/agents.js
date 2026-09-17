@@ -20,6 +20,9 @@ const AGENT_ID_PATTERN = /^agent-[0-9a-f]{26}$/;
 const READY_STATUSES = new Set(['idle', 'done']);
 const BOOTSTRAP_MODES = new Set(['auto', 'external']);
 const AGENT_METADATA_VERSION = 2;
+const PROMPT_COMPLETION_VERSION = 1;
+const PROMPT_REQUEST_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+const PROMPT_COMPLETION_STATES = new Set(['in_flight', 'completed', 'uncertain']);
 const TERMINAL_METADATA_RETENTION_MS = 30 * 24 * 60 * 60 * 1_000;
 const MAX_TERMINAL_METADATA_RECORDS = 100;
 const TERMINAL_METADATA_LIFECYCLES = new Set(['orphaned', 'quarantined']);
@@ -33,6 +36,7 @@ const CODEX_MANAGED_DEVELOPER_INSTRUCTIONS =
   'This is an agent-vm-mcp-managed Codex session. Every downstream Codex delegation, including x-review, must use model gpt-5.6-luna with reasoning effort max. This is the managed session policy and overrides model-routing defaults that would select Terra, Sol, or another effort. If a delegation API accepts model or reasoning_effort, pass gpt-5.6-luna and max explicitly.';
 
 let sessionBootstrapPromise = null;
+const promptOperations = new Map();
 const promptAgentsInFlight = new Set();
 const lifecycleLocks = new Map();
 
@@ -189,9 +193,24 @@ async function readAgentMetadata() {
         throw new Error('Agent metadata contains an invalid logical-agent record.');
       }
     }
-    return { ...parsed, version: AGENT_METADATA_VERSION };
+    if (parsed.completions !== undefined && (!parsed.completions || typeof parsed.completions !== 'object' || Array.isArray(parsed.completions))) {
+      throw new Error('Agent metadata contains an invalid prompt completion store.');
+    }
+    for (const [requestId, record] of Object.entries(parsed.completions ?? {})) {
+      if (
+        requestId !== record?.requestId ||
+        !record?.requestId ||
+        !PROMPT_REQUEST_ID_PATTERN.test(record.requestId) ||
+        !PROMPT_COMPLETION_STATES.has(record.state) ||
+        typeof record.agentId !== 'string' ||
+        record.agentId.length === 0
+      ) {
+        throw new Error('Agent metadata contains an invalid prompt completion record.');
+      }
+    }
+    return { ...parsed, version: AGENT_METADATA_VERSION, completions: parsed.completions ?? {} };
   } catch (error) {
-    if (error?.code === 'ENOENT') return { version: AGENT_METADATA_VERSION, agents: {} };
+    if (error?.code === 'ENOENT') return { version: AGENT_METADATA_VERSION, agents: {}, completions: {} };
     const wrapped = new Error(`Unable to read durable agent metadata: ${error.message}`);
     wrapped.code = 'agent_metadata_unreadable';
     throw wrapped;
@@ -350,19 +369,148 @@ async function collectAgentMetadata() {
 }
 
 async function updateAgentMetadata(agentId, update) {
-  const release = await acquireMetadataLock();
-  try {
-    const metadata = await readAgentMetadata();
+  return await mutateAgentMetadata((metadata) => {
     const current = metadata.agents[agentId] ?? null;
     const next = typeof update === 'function' ? update(current) : update;
     if (next === null) delete metadata.agents[agentId];
     else metadata.agents[agentId] = next;
+    return next;
+  });
+}
+
+async function mutateAgentMetadata(mutator) {
+  const release = await acquireMetadataLock();
+  try {
+    const metadata = await readAgentMetadata();
+    metadata.completions ??= {};
+    const result = await mutator(metadata);
     pruneDetachedTerminalMetadata(metadata);
     await writeAgentMetadata(metadata);
-    return next;
+    return result;
   } finally {
     await release();
   }
+}
+
+function normalizePromptRequestId(value) {
+  if (value === undefined) return randomUUID();
+  if (typeof value !== 'string' || !PROMPT_REQUEST_ID_PATTERN.test(value)) {
+    const error = new Error('requestId must be a stable single-line identifier up to 128 characters.');
+    error.code = 'agent_invalid_request_id';
+    throw error;
+  }
+  return value;
+}
+
+function promptRequestFingerprint({ agentId, task, skills, wait, until }) {
+  return createHash('sha256')
+    .update(JSON.stringify({ agentId, task, skills, wait, until }), 'utf8')
+    .digest('hex');
+}
+
+function promptCompletionBlocksDifferentRequest(record) {
+  if (!record) return false;
+  if (record.state === 'in_flight') return true;
+  const disposition = record.result?.runtimeDisposition?.action;
+  return disposition === 'pending' || disposition === 'cleanup_failed';
+}
+
+function promptCompletionNeedsReconciliation(record) {
+  if (!record?.wait) return false;
+  if (record.state === 'in_flight' || record.state === 'uncertain') return true;
+  return record.state === 'completed' && ['pending', 'cleanup_failed'].includes(record.result?.runtimeDisposition?.action);
+}
+
+function promptCompletionResponse(record, { recovered = false } = {}) {
+  if (record.state === 'in_flight') {
+    return {
+      accepted: null,
+      requestId: record.requestId,
+      completionId: record.completionId,
+      recovered,
+      resultState: record.state,
+      submission: { state: 'possibly_submitted', retrySafe: false, waitCompleted: false },
+      error: {
+        code: 'agent_prompt_recovery_pending',
+        message: `Prompt request ${record.requestId} is still in flight or its completion is not yet observable. Do not automatically retry it.`,
+        retryable: false,
+      },
+      agent: null,
+      transcript: '',
+    };
+  }
+  return {
+    ...(record.result ?? {
+      accepted: null,
+      submission: { state: 'possibly_submitted', retrySafe: false, waitCompleted: false },
+      agent: null,
+      transcript: '',
+    }),
+    requestId: record.requestId,
+    completionId: record.completionId,
+    recovered,
+    resultState: record.state,
+    acknowledged: record.acknowledgedAt !== null,
+  };
+}
+
+async function claimPromptCompletion(request) {
+  return await mutateAgentMetadata((metadata) => {
+    const existing = metadata.completions[request.requestId] ?? null;
+    if (existing) {
+      if (existing.agentId !== request.agentId || existing.fingerprint !== request.fingerprint) {
+        return { kind: 'conflict', record: existing };
+      }
+      return { kind: 'existing', record: existing };
+    }
+
+    const busy = Object.values(metadata.completions)
+      .filter((record) => record.agentId === request.agentId)
+      .find((record) => promptCompletionBlocksDifferentRequest(record));
+    if (busy) return { kind: 'busy', record: busy };
+
+    const now = new Date().toISOString();
+    const record = {
+      version: PROMPT_COMPLETION_VERSION,
+      completionId: randomUUID(),
+      requestId: request.requestId,
+      fingerprint: request.fingerprint,
+      agentId: request.agentId,
+      harness: request.harness,
+      cwd: request.cwd,
+      runtimeAgentId: request.runtimeAgentId,
+      runtimeWorkspaceId: request.runtimeWorkspaceId,
+      initialStateChangeSeq: request.initialStateChangeSeq ?? null,
+      skills: request.skills,
+      wait: request.wait,
+      until: request.until,
+      state: 'in_flight',
+      createdAt: now,
+      submittedAt: now,
+      completedAt: null,
+      updatedAt: now,
+      acknowledgedAt: null,
+      result: null,
+    };
+    metadata.completions[request.requestId] = record;
+    return { kind: 'claimed', record };
+  });
+}
+
+async function updatePromptCompletion(requestId, update) {
+  return await mutateAgentMetadata((metadata) => {
+    const current = metadata.completions[requestId] ?? null;
+    if (!current) return null;
+    const next = typeof update === 'function' ? update(current) : update;
+    if (next === null) delete metadata.completions[requestId];
+    else metadata.completions[requestId] = next;
+    return next;
+  });
+}
+
+async function readPromptCompletion(requestId) {
+  const metadata = await readAgentMetadata();
+  return metadata.completions[requestId] ?? null;
 }
 
 function runtimeObservation(snapshot, record) {
@@ -530,17 +678,21 @@ async function reconcileAgentMetadata(snapshot = null, signal) {
   return metadata;
 }
 
-async function reconcileBeforeOperation(signal) {
+async function reconcileBeforeOperation(signal, { timeoutMs = 2_000, reconcileCompletions = true } = {}) {
   const metadata = await collectAgentMetadata();
-  if (!Object.values(metadata.agents).some((record) => (
+  const hasPendingPromptCompletion = Object.values(metadata.completions ?? {}).some(promptCompletionNeedsReconciliation);
+  if (!hasPendingPromptCompletion && !Object.values(metadata.agents).some((record) => (
     record.lifecycle === 'active' ||
     record.lifecycle === 'starting' ||
     record.lifecycle === 'suspending' ||
     record.lifecycle === 'resuming' ||
     (record.harness === 'codex' && record.lifecycle === 'suspended')
   ))) return metadata;
-  const snapshot = await snapshotOutcome({ signal, timeoutMs: 2_000 });
-  return await reconcileAgentMetadata(snapshot.ok ? snapshot.result.snapshot : null, signal);
+  const snapshot = await snapshotOutcome({ signal, timeoutMs: Math.max(1, timeoutMs) });
+  if (!snapshot.ok) return metadata;
+  await reconcileAgentMetadata(snapshot.result.snapshot, signal);
+  if (reconcileCompletions) await reconcilePromptCompletions(snapshot.result.snapshot);
+  return await collectAgentMetadata();
 }
 
 async function withLifecycleLock(agentId, operation) {
@@ -1682,6 +1834,150 @@ async function safePromptDiagnostics(agentId) {
   return { agent: recovered.agent, transcript: read.ok ? read.text : recovered.transcript };
 }
 
+function promptCompletionEvidence(record, runtimeAgent) {
+  return (
+    Number.isSafeInteger(record.initialStateChangeSeq) &&
+    Number.isSafeInteger(runtimeAgent?.state_change_seq) &&
+    runtimeAgent.state_change_seq > record.initialStateChangeSeq
+  );
+}
+
+function completionResultForDonePrompt(record, diagnostics, { recoveredFromUncertain = false } = {}) {
+  const result = {
+    accepted: recoveredFromUncertain ? null : true,
+    requestId: record.requestId,
+    submission: recoveredFromUncertain
+      ? { state: 'possibly_submitted', retrySafe: false, waitCompleted: false }
+      : { state: 'submitted', retrySafe: false, waitCompleted: record.wait },
+    ...(record.skills?.length ? { skills: record.skills } : { skills: [] }),
+    agent: diagnostics.agent,
+    transcript: diagnostics.transcript,
+    runtimeDisposition: { action: 'pending', status: 'done' },
+  };
+  if (recoveredFromUncertain) {
+    result.error = {
+      code: 'agent_prompt_completion_recovered',
+      message: 'Herdr reached done after the original prompt response became uncertain; recover the durable result and do not submit a duplicate task.',
+      retryable: false,
+      ...(record.result?.error?.cause ? { cause: record.result.error.cause } : {}),
+    };
+  }
+  return result;
+}
+
+async function persistPromptCompletion(requestId, result, { finalStatus = 'done' } = {}) {
+  const completedAt = new Date().toISOString();
+  return await updatePromptCompletion(requestId, (current) => {
+    if (!current) return current;
+    if (
+      current.state === 'completed' &&
+      !['pending', 'cleanup_failed'].includes(current.result?.runtimeDisposition?.action)
+    ) return current;
+    return {
+      ...current,
+      state: 'completed',
+      finalStatus,
+      completedAt: current.completedAt ?? completedAt,
+      updatedAt: completedAt,
+      result,
+    };
+  });
+}
+
+async function reconcilePromptCompletionRecord(record, snapshot, { allowLocal = false } = {}) {
+  if (!promptCompletionNeedsReconciliation(record)) return;
+  const localOperation = promptOperations.get(record.agentId);
+  if (!allowLocal && localOperation?.requestId === record.requestId) return;
+
+  const metadata = await readAgentMetadata();
+  const logical = metadata.agents[record.agentId] ?? null;
+  const observation = runtimeObservation(snapshot, record);
+  if (!logical) {
+    if (record.state === 'completed' && observation === 'absent' && record.result) {
+      await persistPromptCompletion(record.requestId, {
+        ...record.result,
+        runtimeDisposition: { action: 'already_finalized', lifecycle: null },
+      });
+    }
+    return;
+  }
+  if (
+    record.state === 'completed' &&
+    ['suspended', 'orphaned', 'quarantined'].includes(logical.lifecycle) &&
+    !logical.runtimeAgentId &&
+    observation === 'absent' &&
+    record.result
+  ) {
+    await persistPromptCompletion(record.requestId, {
+      ...record.result,
+      runtimeDisposition: { action: 'already_finalized', lifecycle: logical.lifecycle },
+    });
+    return;
+  }
+  if (logical.lifecycle !== 'active' || logical.runtimeAgentId !== record.runtimeAgentId) return;
+  if (logical.runtimeWorkspaceId !== record.runtimeWorkspaceId) return;
+
+  if (observation?.status !== 'owned' || observation.agent.agent_status !== 'done') return;
+  if (!promptCompletionEvidence(record, observation.agent)) return;
+
+  const diagnostics = await safePromptDiagnostics(record.agentId);
+  if (diagnostics.agent?.status !== 'done') return;
+
+  const recoveredFromUncertain = record.state === 'uncertain';
+  const durableResult = record.state === 'completed' && record.result
+    ? {
+        ...record.result,
+        agent: record.result.agent ?? diagnostics.agent,
+        transcript: record.result.transcript || diagnostics.transcript,
+        runtimeDisposition: { action: 'pending', status: 'done' },
+      }
+    : completionResultForDonePrompt(record, diagnostics, { recoveredFromUncertain });
+  const persisted = await persistPromptCompletion(record.requestId, durableResult);
+  if (!persisted || persisted.result?.runtimeDisposition?.action !== 'pending') return;
+
+  const nativeSessionRefresh = await refreshNativeSessionAfterPrompt(record.agentId, diagnostics.agent);
+  if (nativeSessionRefresh.state === 'error') {
+    durableResult.runtimeDisposition = {
+      action: 'retained',
+      reason: 'native_session_refresh_failed',
+      status: diagnostics.agent.status,
+      error: nativeSessionRefresh.error,
+    };
+    await persistPromptCompletion(record.requestId, durableResult);
+    return;
+  }
+  if (nativeSessionRefresh.state === 'ambiguous') {
+    durableResult.runtimeDisposition = {
+      action: 'retained',
+      reason: 'native_session_ambiguous',
+      status: diagnostics.agent.status,
+      candidates: nativeSessionRefresh.candidates,
+    };
+    await persistPromptCompletion(record.requestId, durableResult);
+    return;
+  }
+
+  durableResult.runtimeDisposition = await finalizeCompletedPromptRuntime(
+    record.agentId,
+    diagnostics.agent,
+    undefined,
+    { alreadyReconciled: true },
+  );
+  await persistPromptCompletion(record.requestId, durableResult);
+}
+
+async function reconcilePromptCompletions(snapshot) {
+  if (!snapshot) return;
+  const metadata = await readAgentMetadata();
+  for (const record of Object.values(metadata.completions ?? {})) {
+    try {
+      await reconcilePromptCompletionRecord(record, snapshot);
+    } catch {
+      // Leave the durable request and runtime untouched when completion recovery is uncertain.
+    }
+  }
+}
+
 export async function agentCapabilities({ signal } = {}) {
   const definitions = harnessDefinitions();
   let metadata = await collectAgentMetadata();
@@ -1695,9 +1991,13 @@ export async function agentCapabilities({ signal } = {}) {
 
   let session = { name: herdrSessionName(), running: false, agents: [] };
   if (herdrAvailable && herdrVersion) {
-    const snapshot = await snapshotOutcome({ signal, timeoutMs: 2_000 });
+    let snapshot = await snapshotOutcome({ signal, timeoutMs: 2_000 });
     if (snapshot.ok) {
       metadata = await reconcileAgentMetadata(snapshot.result.snapshot, signal);
+      await reconcilePromptCompletions(snapshot.result.snapshot);
+      metadata = await collectAgentMetadata();
+      const refreshedSnapshot = await snapshotOutcome({ signal, timeoutMs: 2_000 });
+      if (refreshedSnapshot.ok) snapshot = refreshedSnapshot;
       session = {
         name: herdrSessionName(),
         running: true,
@@ -2187,14 +2487,14 @@ async function refreshNativeSessionAfterPrompt(agentId, completedAgent, signal) 
   }
 }
 
-async function finalizeCompletedPromptRuntime(agentId, completedAgent, signal) {
+async function finalizeCompletedPromptRuntime(agentId, completedAgent, signal, { alreadyReconciled = false } = {}) {
   if (completedAgent?.status !== 'done') {
     return { action: 'retained', reason: 'status_not_done', status: completedAgent?.status ?? 'unknown' };
   }
 
   try {
     return await withLifecycleLock(agentId, async () => {
-      const metadata = await reconcileBeforeOperation(signal);
+      const metadata = alreadyReconciled ? await collectAgentMetadata() : await reconcileBeforeOperation(signal);
       const record = metadata.agents[agentId] ?? null;
       if (!record || record.lifecycle !== 'active') {
         return {
@@ -2297,8 +2597,56 @@ async function finalizeCompletedPromptRuntime(agentId, completedAgent, signal) {
   }
 }
 
-export async function agentPrompt(
-  { agentId, task, skills = [], wait = true, until = [], timeoutMs = 120_000 },
+function normalizePromptRequest({ agentId, task, skills = [], wait = true, until = [], timeoutMs = 120_000, requestId }) {
+  const normalizedRequestId = normalizePromptRequestId(requestId);
+  const normalized = { agentId, task, skills, wait, until, timeoutMs, requestId: normalizedRequestId };
+  return { ...normalized, fingerprint: promptRequestFingerprint(normalized) };
+}
+
+function promptBusyResponse({ agentId, requestId, record }) {
+  return {
+    accepted: null,
+    requestId,
+    submission: { state: 'possibly_submitted', retrySafe: false, waitCompleted: false },
+    error: {
+      code: 'agent_prompt_in_flight',
+      message: `Agent ${agentId} already has prompt request ${record?.requestId ?? 'another request'} in flight or awaiting completion. The new task was not submitted; do not automatically retry it.`,
+      retryable: false,
+      ...(record?.requestId ? { existingRequestId: record.requestId } : {}),
+    },
+    agent: null,
+    transcript: '',
+  };
+}
+
+function promptRequestConflictResponse({ requestId, record }) {
+  return {
+    accepted: null,
+    requestId,
+    submission: { state: 'possibly_submitted', retrySafe: false, waitCompleted: false },
+    error: {
+      code: 'agent_prompt_request_conflict',
+      message: `Prompt request ${requestId} was already used for a different task payload; refusing to submit an ambiguous duplicate.`,
+      retryable: false,
+      existingRequestId: record?.requestId ?? requestId,
+    },
+    agent: null,
+    transcript: '',
+  };
+}
+
+async function joinPromptOperation(operation, signal, timeoutMs) {
+  try {
+    return await waitForOperation(operation.promise, signal, timeoutMs, 'Timed out waiting for the existing prompt request.');
+  } catch (error) {
+    const recovered = await readPromptCompletion(operation.requestId).catch(() => null);
+    if (recovered && recovered.state !== 'in_flight') return promptCompletionResponse(recovered, { recovered: true });
+    throw error;
+  }
+}
+
+async function runAgentPrompt(
+  { agentId, task, skills = [], wait = true, until = [], timeoutMs = 120_000, requestId, fingerprint },
   signal,
 ) {
   if (!wait && until.length > 0) throw new Error('until requires wait=true.');
@@ -2310,6 +2658,7 @@ export async function agentPrompt(
   };
   const notSubmitted = (error, { agent = null, transcript = '', retryable = preflightRetryable(error) } = {}) => ({
     accepted: false,
+    requestId,
     submission: { state: 'not_submitted', retrySafe: true, waitCompleted: false },
     error: {
       code: 'agent_prompt_not_submitted',
@@ -2327,180 +2676,365 @@ export async function agentPrompt(
     if (signal?.aborted || error?.name === 'AbortError' || error?.code === 'ABORT_ERR') throw error;
   };
 
-  if (promptAgentsInFlight.has(agentId)) {
+  let existing = await readPromptCompletion(requestId);
+  if (existing) {
+    if (existing.agentId !== agentId || existing.fingerprint !== fingerprint) {
+      return promptRequestConflictResponse({ requestId, record: existing });
+    }
+    if (promptCompletionNeedsReconciliation(existing)) {
+      await reconcileBeforeOperation(signal, { timeoutMs: Math.min(2_000, timeoutMs) }).catch(() => {});
+      existing = await readPromptCompletion(requestId) ?? existing;
+    }
+    return promptCompletionResponse(existing, { recovered: true });
+  }
+
+  const metadataBeforePrompt = await readAgentMetadata();
+  const durableBusy = Object.values(metadataBeforePrompt.completions ?? {})
+    .filter((record) => record.agentId === agentId && record.requestId !== requestId)
+    .find((record) => promptCompletionBlocksDifferentRequest(record));
+  if (durableBusy) return promptBusyResponse({ agentId, requestId, record: durableBusy });
+
+  const preflightDeadline = Date.now() + Math.min(10_000, timeoutMs);
+  try {
+    await reconcileBeforeOperation(signal, { timeoutMs: Math.min(2_000, timeoutMs) });
+  } catch (error) {
+    throwIfCancelled(error);
+    return notSubmitted(error);
+  }
+  const remainingPreflightMs = () => {
+    const remaining = preflightDeadline - Date.now();
+    if (remaining <= 0) throw timeoutError('Agent prompt preflight timed out before submission.');
+    return remaining;
+  };
+
+  let before;
+  try {
+    before = await waitForAgentSettled(agentId, {
+      signal,
+      maxWaitMs: remainingPreflightMs(),
+      verifyOwnership: true,
+    });
+  } catch (error) {
+    throwIfCancelled(error);
+    return notSubmitted(error);
+  }
+
+  const gate = readinessFailure(before);
+  if (gate) {
+    let transcript = '';
+    if (Date.now() < preflightDeadline) {
+      const diagnostic = await readAgentTextOutcome(before.runtimeAgentId, {
+        source: 'recent-unwrapped',
+        lines: 120,
+        signal,
+        timeoutMs: Math.min(2_000, remainingPreflightMs()),
+      });
+      transcript = diagnostic.ok ? diagnostic.text : '';
+    }
     return {
+      accepted: false,
+      requestId,
+      submission: { state: 'not_submitted', retrySafe: true, waitCompleted: false },
+      error: gate,
+      agent: before,
+      transcript,
+    };
+  }
+
+  try {
+    await waitForOperation(
+      validateSkills(before.harness, skills),
+      signal,
+      remainingPreflightMs(),
+      'Agent prompt preflight timed out while validating skills.',
+    );
+  } catch (error) {
+    throwIfCancelled(error);
+    return notSubmitted(error, { agent: before });
+  }
+
+  let finalState;
+  try {
+    finalState = await getAgentState(agentId, {
+      signal,
+      includeInteraction: true,
+      verifyOwnership: true,
+      timeoutMs: Math.min(DEFAULT_COMMAND_TIMEOUT_MS, remainingPreflightMs()),
+    });
+    remainingPreflightMs();
+  } catch (error) {
+    throwIfCancelled(error);
+    return notSubmitted(error, { agent: before });
+  }
+
+  const finalGate = readinessFailure(finalState);
+  if (finalGate) {
+    return {
+      accepted: false,
+      requestId,
+      submission: { state: 'not_submitted', retrySafe: true, waitCompleted: false },
+      error: finalGate,
+      agent: finalState,
+      transcript: '',
+    };
+  }
+
+  const prompt = promptWithSkills(task, skills);
+  const args = ['agent', 'prompt', finalState.runtimeAgentId, prompt];
+  if (wait) args.push('--wait');
+  for (const status of until) args.push('--until', status);
+  if (wait) args.push('--timeout', String(timeoutMs));
+
+  try {
+    remainingPreflightMs();
+  } catch (error) {
+    return notSubmitted(error, { agent: finalState });
+  }
+
+  const claim = await claimPromptCompletion({
+    requestId,
+    fingerprint,
+    agentId,
+    harness: finalState.harness,
+    cwd: finalState.cwd,
+    runtimeAgentId: finalState.runtimeAgentId,
+    runtimeWorkspaceId: finalState.workspaceId,
+    initialStateChangeSeq: finalState.stateChangeSeq,
+    skills,
+    wait,
+    until,
+  });
+  if (claim.kind === 'conflict') return promptRequestConflictResponse({ requestId, record: claim.record });
+  if (claim.kind === 'busy') return promptBusyResponse({ agentId, requestId, record: claim.record });
+  if (claim.kind === 'existing') return promptCompletionResponse(claim.record, { recovered: true });
+
+  const outcome = await runHerdr(args, {
+    timeoutMs: wait ? timeoutMs + 2_000 : 10_000,
+    signal,
+    deadlineAt: preflightDeadline,
+  });
+  if (!outcome.ok) {
+    const diagnostics = await safePromptDiagnostics(agentId);
+    if (outcome.process === null || outcome.process?.spawnError || outcome.error?.code === 'herdr_unavailable') {
+      await updatePromptCompletion(requestId, (current) => current?.state === 'in_flight' ? null : current);
+      return notSubmitted(
+        Object.assign(new Error('Prompt was not submitted because the Herdr command could not be started.'), {
+          herdr: outcome.error,
+        }),
+        diagnostics,
+      );
+    }
+    const uncertain = {
       accepted: null,
+      requestId,
+      completionId: claim.record.completionId,
       submission: {
         state: 'possibly_submitted',
         retrySafe: false,
         waitCompleted: false,
       },
       error: {
-        code: 'agent_prompt_in_flight',
-        message: `Agent ${agentId} already has a prompt in flight; the new task was not submitted, but submission state is uncertain. Do not automatically retry it.`,
+        code: 'agent_prompt_outcome_unknown',
+        message: 'Prompt submission may have occurred, but completion could not be confirmed. Do not automatically retry this task.',
         retryable: false,
+        cause: outcome.error,
       },
-      agent: null,
-      transcript: '',
-    };
-  }
-  promptAgentsInFlight.add(agentId);
-
-  try {
-    const preflightDeadline = Date.now() + Math.min(10_000, timeoutMs);
-    const remainingPreflightMs = () => {
-      const remaining = preflightDeadline - Date.now();
-      if (remaining <= 0) throw timeoutError('Agent prompt preflight timed out before submission.');
-      return remaining;
-    };
-
-    let before;
-    try {
-      before = await waitForAgentSettled(agentId, {
-        signal,
-        maxWaitMs: remainingPreflightMs(),
-        verifyOwnership: true,
-      });
-    } catch (error) {
-      throwIfCancelled(error);
-      return notSubmitted(error);
-    }
-
-    const gate = readinessFailure(before);
-    if (gate) {
-      let transcript = '';
-      if (Date.now() < preflightDeadline) {
-        const diagnostic = await readAgentTextOutcome(before.runtimeAgentId, {
-          source: 'recent-unwrapped',
-          lines: 120,
-          signal,
-          timeoutMs: Math.min(2_000, remainingPreflightMs()),
-        });
-        transcript = diagnostic.ok ? diagnostic.text : '';
-      }
-      return {
-        accepted: false,
-        submission: { state: 'not_submitted', retrySafe: true, waitCompleted: false },
-        error: gate,
-        agent: before,
-        transcript,
-      };
-    }
-
-    try {
-      await waitForOperation(
-        validateSkills(before.harness, skills),
-        signal,
-        remainingPreflightMs(),
-        'Agent prompt preflight timed out while validating skills.',
-      );
-    } catch (error) {
-      throwIfCancelled(error);
-      return notSubmitted(error, { agent: before });
-    }
-
-    let finalState;
-    try {
-      finalState = await getAgentState(agentId, {
-        signal,
-        includeInteraction: true,
-        verifyOwnership: true,
-        timeoutMs: Math.min(DEFAULT_COMMAND_TIMEOUT_MS, remainingPreflightMs()),
-      });
-      remainingPreflightMs();
-    } catch (error) {
-      throwIfCancelled(error);
-      return notSubmitted(error, { agent: before });
-    }
-
-    const finalGate = readinessFailure(finalState);
-    if (finalGate) {
-      return {
-        accepted: false,
-        submission: { state: 'not_submitted', retrySafe: true, waitCompleted: false },
-        error: finalGate,
-        agent: finalState,
-        transcript: '',
-      };
-    }
-
-    const prompt = promptWithSkills(task, skills);
-    const args = ['agent', 'prompt', finalState.runtimeAgentId, prompt];
-    if (wait) args.push('--wait');
-    for (const status of until) args.push('--until', status);
-    if (wait) args.push('--timeout', String(timeoutMs));
-
-    try {
-      remainingPreflightMs();
-    } catch (error) {
-      return notSubmitted(error, { agent: finalState });
-    }
-
-    const outcome = await runHerdr(args, {
-      timeoutMs: wait ? timeoutMs + 2_000 : 10_000,
-      signal,
-      deadlineAt: preflightDeadline,
-    });
-    if (!outcome.ok) {
-      const diagnostics = await safePromptDiagnostics(agentId);
-      if (outcome.process === null || outcome.process?.spawnError || outcome.error?.code === 'herdr_unavailable') {
-        return notSubmitted(
-          Object.assign(new Error('Prompt was not submitted because the Herdr command could not be started.'), {
-            herdr: outcome.error,
-          }),
-          diagnostics,
-        );
-      }
-      return {
-        accepted: null,
-        submission: {
-          state: 'possibly_submitted',
-          retrySafe: false,
-          waitCompleted: false,
-        },
-        error: {
-          code: 'agent_prompt_outcome_unknown',
-          message: 'Prompt submission may have occurred, but completion could not be confirmed. Do not automatically retry this task.',
-          retryable: false,
-          cause: outcome.error,
-        },
-        agent: diagnostics.agent,
-        transcript: diagnostics.transcript,
-      };
-    }
-
-    const diagnostics = await safePromptDiagnostics(agentId);
-    const nativeSessionRefresh = wait
-      ? await refreshNativeSessionAfterPrompt(agentId, diagnostics.agent, signal)
-      : { state: 'skipped' };
-    const runtimeDisposition = !wait
-      ? { action: 'retained', reason: 'wait_disabled', status: diagnostics.agent?.status ?? 'unknown' }
-      : nativeSessionRefresh.state === 'error'
-        ? {
-            action: 'retained',
-            reason: 'native_session_refresh_failed',
-            status: diagnostics.agent?.status ?? 'unknown',
-            error: nativeSessionRefresh.error,
-          }
-        : nativeSessionRefresh.state === 'ambiguous'
-          ? {
-              action: 'retained',
-              reason: 'native_session_ambiguous',
-              status: diagnostics.agent?.status ?? 'unknown',
-              candidates: nativeSessionRefresh.candidates,
-            }
-          : await finalizeCompletedPromptRuntime(agentId, diagnostics.agent, signal);
-    return {
-      accepted: true,
-      submission: { state: 'submitted', retrySafe: false, waitCompleted: wait },
-      skills,
       agent: diagnostics.agent,
       transcript: diagnostics.transcript,
-      runtimeDisposition,
     };
-  } finally {
-    promptAgentsInFlight.delete(agentId);
+    await updatePromptCompletion(requestId, (current) => current?.state === 'in_flight' ? {
+      ...current,
+      state: 'uncertain',
+      updatedAt: new Date().toISOString(),
+      result: uncertain,
+    } : current);
+    if (wait && diagnostics.agent?.status === 'done') {
+      const snapshot = await snapshotOutcome({ timeoutMs: 5_000 });
+      if (snapshot.ok) {
+        await reconcilePromptCompletionRecord(
+          await readPromptCompletion(requestId) ?? {
+            ...claim.record,
+            state: 'uncertain',
+            result: uncertain,
+          },
+          snapshot.result.snapshot,
+          { allowLocal: true },
+        );
+        const recovered = await readPromptCompletion(requestId);
+        if (recovered?.state === 'completed') {
+          if (signal?.aborted) throw abortError();
+          return promptCompletionResponse(recovered, { recovered: true });
+        }
+      }
+    }
+    return uncertain;
   }
+
+  const diagnostics = await safePromptDiagnostics(agentId);
+  const nativeSessionRefresh = wait
+    ? await refreshNativeSessionAfterPrompt(agentId, diagnostics.agent)
+    : { state: 'skipped' };
+  const shouldFinalize = wait && diagnostics.agent?.status === 'done' && !['error', 'ambiguous'].includes(nativeSessionRefresh.state);
+  const runtimeDisposition = !wait
+    ? { action: 'retained', reason: 'wait_disabled', status: diagnostics.agent?.status ?? 'unknown' }
+    : nativeSessionRefresh.state === 'error'
+      ? {
+          action: 'retained',
+          reason: 'native_session_refresh_failed',
+          status: diagnostics.agent?.status ?? 'unknown',
+          error: nativeSessionRefresh.error,
+        }
+      : nativeSessionRefresh.state === 'ambiguous'
+        ? {
+            action: 'retained',
+            reason: 'native_session_ambiguous',
+            status: diagnostics.agent?.status ?? 'unknown',
+            candidates: nativeSessionRefresh.candidates,
+          }
+        : shouldFinalize
+          ? { action: 'pending', status: 'done' }
+          : { action: 'retained', reason: 'status_not_done', status: diagnostics.agent?.status ?? 'unknown' };
+  const completed = {
+    accepted: true,
+    requestId,
+    completionId: claim.record.completionId,
+    submission: { state: 'submitted', retrySafe: false, waitCompleted: wait },
+    skills,
+    agent: diagnostics.agent,
+    transcript: diagnostics.transcript,
+    runtimeDisposition,
+  };
+  await persistPromptCompletion(requestId, completed, {
+    finalStatus: diagnostics.agent?.status ?? 'unknown',
+  });
+  if (shouldFinalize) {
+    completed.runtimeDisposition = await finalizeCompletedPromptRuntime(
+      agentId,
+      diagnostics.agent,
+      undefined,
+      { alreadyReconciled: true },
+    );
+    await persistPromptCompletion(requestId, completed, {
+      finalStatus: diagnostics.agent?.status ?? 'done',
+    });
+  }
+  if (signal?.aborted) throw abortError();
+  return completed;
+}
+
+export async function agentPrompt(args, signal) {
+  const request = normalizePromptRequest(args);
+  const existing = promptOperations.get(request.agentId);
+  if (existing) {
+    if (existing.requestId !== request.requestId || existing.fingerprint !== request.fingerprint) {
+      return promptBusyResponse({
+        agentId: request.agentId,
+        requestId: request.requestId,
+        record: { requestId: existing.requestId },
+      });
+    }
+    return await joinPromptOperation(existing, signal, request.timeoutMs);
+  }
+
+  const operation = runAgentPrompt(request, signal);
+  const entry = {
+    requestId: request.requestId,
+    fingerprint: request.fingerprint,
+    promise: operation,
+  };
+  promptOperations.set(request.agentId, entry);
+  promptAgentsInFlight.add(request.agentId);
+  try {
+    return await operation;
+  } finally {
+    if (promptOperations.get(request.agentId) === entry) promptOperations.delete(request.agentId);
+    promptAgentsInFlight.delete(request.agentId);
+  }
+}
+
+export async function agentPromptResult({ requestId, agentId, ack = false }, signal) {
+  if (requestId !== undefined && (typeof requestId !== 'string' || !PROMPT_REQUEST_ID_PATTERN.test(requestId))) {
+    const error = new Error('requestId must be a stable single-line identifier up to 128 characters.');
+    error.code = 'agent_invalid_request_id';
+    throw error;
+  }
+  if (requestId === undefined && !agentId) {
+    const error = new Error('agent_prompt_result requires requestId or agentId.');
+    error.code = 'agent_result_identity_required';
+    throw error;
+  }
+
+  let metadata = await readAgentMetadata();
+  let record = requestId ? metadata.completions[requestId] ?? null : null;
+  if ((record && promptCompletionNeedsReconciliation(record)) || (!record && agentId)) {
+    await reconcileBeforeOperation(signal, { timeoutMs: 2_000 }).catch(() => {});
+    metadata = await readAgentMetadata();
+    record = requestId ? metadata.completions[requestId] ?? null : null;
+  }
+  if (!record && agentId) {
+    const candidates = Object.values(metadata.completions)
+      .filter((candidate) => candidate.agentId === agentId && !candidate.acknowledgedAt)
+      .sort((left, right) => Date.parse(right.updatedAt ?? '') - Date.parse(left.updatedAt ?? ''));
+    if (candidates.length > 1) {
+      return {
+        found: false,
+        agentId,
+        state: 'ambiguous',
+        candidates: candidates.map((candidate) => ({
+          requestId: candidate.requestId,
+          completionId: candidate.completionId,
+          state: candidate.state,
+          updatedAt: candidate.updatedAt,
+        })),
+      };
+    }
+    record = candidates[0] ?? null;
+  }
+  if (!record || (agentId && record.agentId !== agentId)) {
+    return { found: false, requestId: requestId ?? null, agentId: agentId ?? null, state: 'not_found' };
+  }
+
+  if (ack && record.state === 'in_flight') {
+    return {
+      found: true,
+      completion: {
+        completionId: record.completionId,
+        requestId: record.requestId,
+        agentId: record.agentId,
+        state: record.state,
+        acknowledged: false,
+        completedAt: record.completedAt,
+      },
+      result: promptCompletionResponse(record, { recovered: true }),
+      acked: false,
+      ackError: {
+        code: 'agent_result_not_complete',
+        message: 'The durable prompt result is not complete and cannot be acknowledged yet.',
+      },
+    };
+  }
+
+  if (ack && !record.acknowledgedAt) {
+    record = await updatePromptCompletion(record.requestId, (current) => current ? {
+      ...current,
+      acknowledgedAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    } : current) ?? record;
+  }
+  return {
+    found: true,
+    completion: {
+      completionId: record.completionId,
+      requestId: record.requestId,
+      agentId: record.agentId,
+      state: record.state,
+      acknowledged: record.acknowledgedAt !== null,
+      completedAt: record.completedAt,
+      updatedAt: record.updatedAt,
+    },
+    result: promptCompletionResponse(record, { recovered: true }),
+    acked: Boolean(ack),
+  };
 }
 
 export async function agentSendKeys({ agentId, keys }, signal) {
@@ -2565,7 +3099,7 @@ async function verifyRuntimeClosed(runtimeAgentId, workspaceId) {
 
 export async function agentSuspend({ agentId }, signal) {
   return await withLifecycleLock(agentId, async () => {
-    const metadata = await reconcileBeforeOperation(signal);
+    const metadata = await reconcileBeforeOperation(signal, { reconcileCompletions: false });
     let record = metadata.agents[agentId];
     if (!record) {
       await requireOwnedAgent(agentId, { signal, timeoutMs: 5_000 });
@@ -2600,7 +3134,9 @@ export async function agentSuspend({ agentId }, signal) {
       error.code = 'agent_native_session_unavailable';
       throw error;
     }
-    if (promptAgentsInFlight.has(agentId)) {
+    const durablePromptInFlight = Object.values(metadata.completions ?? {})
+      .some((completion) => completion.agentId === agentId && completion.state === 'in_flight' && completion.wait);
+    if (promptAgentsInFlight.has(agentId) || durablePromptInFlight) {
       const error = new Error(`Agent ${agentId} has a prompt in flight and cannot be suspended.`);
       error.code = 'agent_prompt_in_flight';
       throw error;
@@ -2653,7 +3189,7 @@ export async function agentSuspend({ agentId }, signal) {
 
 export async function agentResume({ agentId }, signal) {
   return await withLifecycleLock(agentId, async () => {
-    const metadata = await reconcileBeforeOperation(signal);
+    const metadata = await reconcileBeforeOperation(signal, { reconcileCompletions: false });
     const record = metadata.agents[agentId];
     if (!record) {
       const error = new Error(`Agent ${agentId} is not a durable MCP-managed logical agent.`);
@@ -2726,7 +3262,7 @@ export async function agentResume({ agentId }, signal) {
 
 export async function agentStop({ agentId }, signal) {
   return await withLifecycleLock(agentId, async () => {
-  const metadata = await reconcileBeforeOperation(signal);
+  const metadata = await reconcileBeforeOperation(signal, { reconcileCompletions: false });
   const durable = metadata.agents[agentId];
   if (['orphaned', 'quarantined'].includes(durable?.lifecycle) && !durable.runtimeAgentId) {
     await updateAgentMetadata(agentId, null);

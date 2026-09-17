@@ -1,11 +1,15 @@
+import { execFile } from 'node:child_process';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { promisify } from 'node:util';
 
 import {
   agentCapabilities,
   agentGet,
   agentPrompt,
+  agentPromptResult,
   agentRead,
   agentSendKeys,
   agentStart,
@@ -15,10 +19,13 @@ import {
 } from '../src/agents.js';
 
 const root = await fs.mkdtemp(path.join(os.tmpdir(), 'agent-vm-agents-smoke-'));
+const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const home = path.join(root, 'home');
 const bin = path.join(root, 'bin');
 const statePath = path.join(root, 'herdr-state.json');
 const herdrPath = path.join(bin, 'herdr');
+const metadataPath = path.join(home, '.local', 'state', 'agent-vm-mcp', 'agents.json');
+const execFileAsync = promisify(execFile);
 
 await fs.mkdir(bin, { recursive: true });
 await fs.mkdir(home, { recursive: true });
@@ -280,6 +287,7 @@ if (args[0] === 'server') {
   const agent = state.agents[args[2]];
   if (!agent) fail('agent_not_found', 'agent not found');
   const prompt = args[3];
+  state.promptCount = (state.promptCount ?? 0) + 1;
   agent.transcript += '\n> ' + prompt + '\nFAKE_RESPONSE';
   agent.state_change_seq += 2;
   if (state.promptResultStatus) agent.agent_status = state.promptResultStatus;
@@ -300,8 +308,13 @@ if (args[0] === 'server') {
   state.sessions ??= {};
   state.sessions[agent.native_session_id] = { transcript: agent.transcript };
   writeState(state);
-  if (state.promptFailure === 'after_mutation') fail('agent_prompt_stalled', 'prompt submitted but wait stalled');
-  if (state.promptFailure === 'hang_after_mutation') setInterval(() => {}, 60_000);
+  if (state.delayPromptResponseFor === args[2]) {
+    delete state.delayPromptResponseFor;
+    const delayMs = Number(state.delayPromptResponseMs ?? 1_000);
+    writeState(state);
+    setTimeout(() => emit('cli:agent:prompt', { type: 'agent_prompted', agent }), delayMs);
+  } else if (state.promptFailure === 'after_mutation') fail('agent_prompt_stalled', 'prompt submitted but wait stalled');
+  else if (state.promptFailure === 'hang_after_mutation') setInterval(() => {}, 60_000);
   else if (state.promptFailure === 'hang_with_descendant') {
     const descendant = spawn(process.execPath, ['-e', 'process.on(\'SIGTERM\', () => {}); setInterval(() => {}, 60000)'], { stdio: 'ignore' });
     state.descendantPid = descendant.pid;
@@ -450,6 +463,228 @@ try {
     throw new Error(`Idle prompt was unexpectedly finalized: ${JSON.stringify(prompted.runtimeDisposition)}`);
   }
 
+  const lostResponseAgent = await agentStart({ harness: 'agy', cwd: root, timeoutMs: 10_000 });
+  state = JSON.parse(await fs.readFile(statePath, 'utf8'));
+  const lostResponseRuntimeId = lostResponseAgent.agent.runtimeAgentId;
+  state.promptResultStatus = 'done';
+  state.delayPromptResponseFor = lostResponseRuntimeId;
+  state.delayPromptResponseMs = 5_000;
+  await fs.writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, 'utf8');
+  const lostResponseController = new AbortController();
+  const lostResponsePromise = agentPrompt({
+    agentId: lostResponseAgent.agent.agentId,
+    requestId: 'lost-response-1',
+    task: 'LOST_RESPONSE_TASK',
+    wait: true,
+    timeoutMs: 10_000,
+  }, lostResponseController.signal);
+  let lostResponseDone = false;
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    state = JSON.parse(await fs.readFile(statePath, 'utf8'));
+    if (state.agents[lostResponseRuntimeId]?.agent_status === 'done' && state.agents[lostResponseRuntimeId].transcript.includes('LOST_RESPONSE_TASK')) {
+      lostResponseDone = true;
+      break;
+    }
+  }
+  if (!lostResponseDone) throw new Error('Lost-response test never observed Herdr done before cancellation');
+  lostResponseController.abort();
+  let lostResponseCancelled = false;
+  try {
+    await lostResponsePromise;
+  } catch (error) {
+    if (error?.name !== 'AbortError' && error?.code !== 'ABORT_ERR') throw error;
+    lostResponseCancelled = true;
+  }
+  if (!lostResponseCancelled) throw new Error('Caller cancellation after completion unexpectedly returned the normal MCP response');
+  const lostResponseResult = await agentPromptResult({ requestId: 'lost-response-1' });
+  if (
+    !lostResponseResult.found ||
+    lostResponseResult.completion?.state !== 'completed' ||
+    !lostResponseResult.result?.transcript.includes('LOST_RESPONSE_TASK') ||
+    lostResponseResult.result?.runtimeDisposition?.action !== 'suspended'
+  ) {
+    throw new Error(`Cancelled completed prompt was not durably recoverable: ${JSON.stringify(lostResponseResult)}`);
+  }
+  const lostResponseAck = await agentPromptResult({ requestId: 'lost-response-1', ack: true });
+  if (!lostResponseAck.acked || !lostResponseAck.completion?.acknowledged) throw new Error('Durable completion acknowledgement was not persisted');
+  await agentStop({ agentId: lostResponseAgent.agent.agentId });
+  const stoppedRecovery = await agentPromptResult({ requestId: 'lost-response-1' });
+  if (!stoppedRecovery.found || !stoppedRecovery.result?.transcript.includes('LOST_RESPONSE_TASK')) {
+    throw new Error('Acknowledged completion was lost after logical agent stop');
+  }
+
+  const restartedRecoveryAgent = await agentStart({ harness: 'agy', cwd: root, timeoutMs: 10_000 });
+  state = JSON.parse(await fs.readFile(statePath, 'utf8'));
+  const restartedRecoveryRuntimeId = restartedRecoveryAgent.agent.runtimeAgentId;
+  state.promptResultStatus = 'done';
+  state.delayPromptResponseFor = restartedRecoveryRuntimeId;
+  state.delayPromptResponseMs = 5_000;
+  await fs.writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, 'utf8');
+  const restartedController = new AbortController();
+  const restartedPrompt = agentPrompt({
+    agentId: restartedRecoveryAgent.agent.agentId,
+    requestId: 'restart-recovery-1',
+    task: 'RESTART_RECOVERY_TASK',
+    wait: true,
+    timeoutMs: 10_000,
+  }, restartedController.signal);
+  let restartedDone = false;
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    state = JSON.parse(await fs.readFile(statePath, 'utf8'));
+    if (state.agents[restartedRecoveryRuntimeId]?.agent_status === 'done' && state.agents[restartedRecoveryRuntimeId].transcript.includes('RESTART_RECOVERY_TASK')) {
+      restartedDone = true;
+      break;
+    }
+  }
+  if (!restartedDone) throw new Error('Process-recovery test never observed Herdr done');
+  const recoveryProbeSource = `
+import { agentCapabilities, agentPromptResult } from ${JSON.stringify(pathToFileURL(path.join(projectRoot, 'src', 'agents.js')).href)};
+const capabilities = await agentCapabilities();
+const result = await agentPromptResult({ requestId: 'restart-recovery-1' });
+process.stdout.write(JSON.stringify({ capabilities: capabilities.runtime.session, result }));
+`;
+  const childEnv = { ...process.env };
+  delete childEnv.CODEX_HOME;
+  const recoveryProbe = await execFileAsync(process.execPath, ['--input-type=module', '-e', recoveryProbeSource], {
+    cwd: root,
+    env: childEnv,
+    maxBuffer: 2 * 1024 * 1024,
+  });
+  const { capabilities: restartedCapabilities, result: restartedResult } = JSON.parse(recoveryProbe.stdout);
+  if (
+    restartedCapabilities.agents.some((agent) => agent.agentId === restartedRecoveryAgent.agent.agentId && agent.lifecycle === 'active') ||
+    !restartedResult.found ||
+    restartedResult.completion?.state !== 'completed' ||
+    !restartedResult.result?.transcript.includes('RESTART_RECOVERY_TASK') ||
+    !['suspended', 'stopped'].includes(restartedResult.result?.runtimeDisposition?.action)
+  ) {
+    throw new Error(`Active+done reconciliation did not persist before cleanup: ${JSON.stringify(restartedResult)}`);
+  }
+  restartedController.abort();
+  await restartedPrompt.catch(() => {});
+  await agentPromptResult({ requestId: 'restart-recovery-1', ack: true });
+  await agentStop({ agentId: restartedRecoveryAgent.agent.agentId });
+
+  const joinedAgent = await agentStart({ harness: 'agy', cwd: root, timeoutMs: 10_000 });
+  state = JSON.parse(await fs.readFile(statePath, 'utf8'));
+  state.promptFailure = 'hang_after_mutation';
+  const joinedCountBefore = state.promptCount ?? 0;
+  await fs.writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, 'utf8');
+  const joinedFirst = agentPrompt({
+    agentId: joinedAgent.agent.agentId,
+    requestId: 'same-request-1',
+    task: 'SAME_REQUEST_TASK',
+    wait: true,
+    timeoutMs: 1_000,
+  });
+  let joinedSubmitted = false;
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    state = JSON.parse(await fs.readFile(statePath, 'utf8'));
+    if (state.agents[joinedAgent.agent.agentId]?.transcript.includes('SAME_REQUEST_TASK')) {
+      joinedSubmitted = true;
+      break;
+    }
+  }
+  if (!joinedSubmitted) throw new Error('Same-request join test never observed the first submission');
+  const joinedSecond = await agentPrompt({
+    agentId: joinedAgent.agent.agentId,
+    requestId: 'same-request-1',
+    task: 'SAME_REQUEST_TASK',
+    wait: true,
+    timeoutMs: 5_000,
+  });
+  const joinedFirstResult = await joinedFirst;
+  state = JSON.parse(await fs.readFile(statePath, 'utf8'));
+  if (
+    state.promptCount !== joinedCountBefore + 1 ||
+    joinedSecond.requestId !== 'same-request-1' ||
+    joinedFirstResult.requestId !== 'same-request-1' ||
+    joinedSecond.error?.code !== joinedFirstResult.error?.code
+  ) {
+    throw new Error(`Same request was not joined/idempotently recovered: ${JSON.stringify({ joinedFirstResult, joinedSecond, promptCount: state.promptCount })}`);
+  }
+  const joinedConflict = await agentPrompt({
+    agentId: joinedAgent.agent.agentId,
+    requestId: 'same-request-1',
+    task: 'DIFFERENT_PAYLOAD_FOR_SAME_REQUEST_ID',
+    wait: true,
+    timeoutMs: 5_000,
+  });
+  if (joinedConflict.error?.code !== 'agent_prompt_request_conflict') {
+    throw new Error(`Same request identity accepted a different payload: ${JSON.stringify(joinedConflict)}`);
+  }
+  delete state.promptFailure;
+  await fs.writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, 'utf8');
+  await agentStop({ agentId: joinedAgent.agent.agentId });
+
+  const busyAgent = await agentStart({ harness: 'agy', cwd: root, timeoutMs: 10_000 });
+  state = JSON.parse(await fs.readFile(statePath, 'utf8'));
+  state.promptFailure = 'hang_after_mutation';
+  const busyCountBefore = state.promptCount ?? 0;
+  await fs.writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, 'utf8');
+  const busyController = new AbortController();
+  const busyFirst = agentPrompt({
+    agentId: busyAgent.agent.agentId,
+    requestId: 'busy-request-1',
+    task: 'BUSY_FIRST_TASK',
+    wait: true,
+    timeoutMs: 10_000,
+  }, busyController.signal);
+  let busySubmitted = false;
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    state = JSON.parse(await fs.readFile(statePath, 'utf8'));
+    if (state.agents[busyAgent.agent.agentId]?.transcript.includes('BUSY_FIRST_TASK')) {
+      busySubmitted = true;
+      break;
+    }
+  }
+  if (!busySubmitted) throw new Error('Different-request busy test never observed the first submission');
+  const busySecond = await agentPrompt({
+    agentId: busyAgent.agent.agentId,
+    requestId: 'busy-request-2',
+    task: 'BUSY_SECOND_TASK',
+    wait: true,
+    timeoutMs: 5_000,
+  });
+  state = JSON.parse(await fs.readFile(statePath, 'utf8'));
+  if (
+    busySecond.error?.code !== 'agent_prompt_in_flight' ||
+    busySecond.submission?.state !== 'possibly_submitted' ||
+    state.promptCount !== busyCountBefore + 1 ||
+    state.agents[busyAgent.agent.agentId].transcript.includes('BUSY_SECOND_TASK')
+  ) {
+    throw new Error(`Different prompt was not rejected as busy/uncertain: ${JSON.stringify({ busySecond, promptCount: state.promptCount })}`);
+  }
+  const crossProcessBusySource = `
+import { agentPrompt } from ${JSON.stringify(pathToFileURL(path.join(projectRoot, 'src', 'agents.js')).href)};
+const result = await agentPrompt({ agentId: ${JSON.stringify(busyAgent.agent.agentId)}, requestId: 'busy-cross-process-2', task: 'BUSY_CROSS_PROCESS_TASK', wait: true, timeoutMs: 5_000 });
+process.stdout.write(JSON.stringify(result));
+`;
+  const crossProcessBusy = JSON.parse((await execFileAsync(process.execPath, ['--input-type=module', '-e', crossProcessBusySource], {
+    cwd: root,
+    env: childEnv,
+    maxBuffer: 2 * 1024 * 1024,
+  })).stdout);
+  state = JSON.parse(await fs.readFile(statePath, 'utf8'));
+  if (
+    crossProcessBusy.error?.code !== 'agent_prompt_in_flight' ||
+    crossProcessBusy.submission?.state !== 'possibly_submitted' ||
+    state.promptCount !== busyCountBefore + 1 ||
+    state.agents[busyAgent.agent.agentId].transcript.includes('BUSY_CROSS_PROCESS_TASK')
+  ) {
+    throw new Error(`Different process was not rejected by durable busy state: ${JSON.stringify({ crossProcessBusy, promptCount: state.promptCount })}`);
+  }
+  busyController.abort();
+  await busyFirst.catch(() => {});
+  state = JSON.parse(await fs.readFile(statePath, 'utf8'));
+  delete state.promptFailure;
+  await fs.writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, 'utf8');
+  await agentStop({ agentId: busyAgent.agent.agentId });
+
   const completedResumable = await agentStart({ harness: 'agy', cwd: root, timeoutMs: 10_000 });
   state = JSON.parse(await fs.readFile(statePath, 'utf8'));
   const completedResumableRuntimeId = completedResumable.agent.runtimeAgentId;
@@ -585,6 +820,15 @@ try {
   const cleanupFailureMetadata = JSON.parse(await fs.readFile(path.join(home, '.local', 'state', 'agent-vm-mcp', 'agents.json'), 'utf8')).agents[cleanupFailureAgent.agent.agentId];
   if (cleanupFailureMetadata?.lifecycle !== 'suspending') {
     throw new Error(`Completion cleanup failure did not retain recoverable transitional metadata: ${JSON.stringify(cleanupFailureMetadata)}`);
+  }
+  const cleanupFailureResult = await agentPromptResult({ requestId: cleanupFailurePrompt.requestId });
+  if (
+    !cleanupFailureResult.found ||
+    cleanupFailureResult.completion?.state !== 'completed' ||
+    !cleanupFailureResult.result?.transcript.includes('COMPLETE_WITH_CLEANUP_FAILURE') ||
+    cleanupFailureResult.result?.runtimeDisposition?.action !== 'cleanup_failed'
+  ) {
+    throw new Error(`Completion result was not durable before cleanup recovery: ${JSON.stringify(cleanupFailureResult)}`);
   }
   state = JSON.parse(await fs.readFile(statePath, 'utf8'));
   delete state.promptResultStatus;
@@ -1198,7 +1442,6 @@ try {
   if (!(await agentSuspend({ agentId: resumable.agent.agentId })).alreadySuspended) {
     throw new Error('repeated suspend was not idempotent');
   }
-  const metadataPath = path.join(home, '.local', 'state', 'agent-vm-mcp', 'agents.json');
   const suspendedMetadata = JSON.parse(await fs.readFile(metadataPath, 'utf8')).agents[resumable.agent.agentId];
   if (suspendedMetadata.lifecycle !== 'suspended' || suspendedMetadata.nativeSessionId !== resumableNativeSessionId || suspendedMetadata.runtimeAgentId !== null) {
     throw new Error('agent_suspend did not persist logical/native metadata separately from runtime identity');

@@ -177,6 +177,8 @@ Relevant settings include:
 
 `agent_prompt` distinguishes submission certainty from whether retrying the same task is useful. A definitely unsubmitted request reports `submission.state="not_submitted"` and `retrySafe=true`; when another prompt is already in flight, or submission may have begun, the result is `possibly_submitted` and is not safe to auto-retry.
 
+For durable handoff, callers should provide a stable `requestId` to `agent_prompt`. The completion envelope is persisted in the logical-agent metadata before any automatic suspend/stop cleanup and can be recovered with `agent_prompt_result` after caller cancellation, a lost MCP response, or an MCP process restart. Reusing the same request identity joins or recovers that request without submitting a duplicate; a different request for an agent with an in-flight or unfinished cleanup is rejected with an uncertain/busy result. `agent_prompt_result` reads the durable envelope without requiring the live Herdr runtime; `ack=true` records consumption separately and does not delete the result or imply that runtime cleanup occurred. Recovery and cleanup remain fail-closed when runtime ownership, workspace identity, native-session attribution, or MCP-managed Codex provenance is absent or ambiguous.
+
 Workspace trust, authentication, command approval, and similar harness interactions are surfaced to the caller. The runtime does not silently approve them.
 
 ## Read-only maintenance audit
