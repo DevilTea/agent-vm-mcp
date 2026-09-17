@@ -119,6 +119,14 @@ if (args[0] === 'server') {
 } else if (args[0] === 'workspace' && args[1] === 'create') {
   const cwd = args[args.indexOf('--cwd') + 1];
   const label = args[args.indexOf('--label') + 1];
+  if (state.delayWorkspaceCreateForLabel === label || state.delayNextWorkspaceCreateMs) {
+    delete state.delayWorkspaceCreateForLabel;
+    const delayMs = Number(state.delayNextWorkspaceCreateMs ?? state.delayWorkspaceCreateMs ?? 1_000);
+    delete state.delayNextWorkspaceCreateMs;
+    writeState(state);
+    await new Promise((resolve) => setTimeout(resolve, delayMs));
+    state = readState();
+  }
   const n = state.nextWorkspace++;
   const workspaceId = 'w' + n;
   const paneId = workspaceId + ':p1';
@@ -185,6 +193,13 @@ if (args[0] === 'server') {
   emit('cli:workspace:get', { type: 'workspace_info', workspace: responseWorkspace });
 } else if (args[0] === 'workspace' && args[1] === 'close') {
   const workspaceId = args[2];
+  if (state.delayWorkspaceCloseFor === workspaceId) {
+    delete state.delayWorkspaceCloseFor;
+    const delayMs = Number(state.delayWorkspaceCloseMs ?? 1_000);
+    writeState(state);
+    await new Promise((resolve) => setTimeout(resolve, delayMs));
+    state = readState();
+  }
   if (state.failWorkspaceCloseFor === workspaceId) fail('workspace_close_failed', 'synthetic workspace close failure');
   for (const [name, agent] of Object.entries(state.agents)) {
     if (agent.workspace_id === workspaceId) {
@@ -1028,6 +1043,70 @@ process.stdout.write(JSON.stringify(result));
   await fs.writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, 'utf8');
   await agentStop({ agentId: completedResumable.agent.agentId });
 
+  const cleanupFenceAgent = await agentStart({ harness: 'agy', cwd: root, timeoutMs: 10_000 });
+  state = JSON.parse(await fs.readFile(statePath, 'utf8'));
+  const cleanupFenceRuntimeId = cleanupFenceAgent.agent.runtimeAgentId;
+  const cleanupFenceWorkspaceId = state.agents[cleanupFenceRuntimeId].workspace_id;
+  state.promptResultStatus = 'done';
+  state.delayWorkspaceCloseFor = cleanupFenceWorkspaceId;
+  state.delayWorkspaceCloseMs = 1_500;
+  await fs.writeFile(statePath, `${JSON.stringify(state, null, 2)}
+`, 'utf8');
+  const cleanupFencePromptPromise = agentPrompt({
+    agentId: cleanupFenceAgent.agent.agentId,
+    requestId: 'cleanup-transition-fence-1',
+    task: 'COMPLETE_WITH_CONCURRENT_STOP_ATTEMPT',
+    wait: true,
+    timeoutMs: 10_000,
+  });
+  let cleanupTransitionObserved = false;
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const metadata = JSON.parse(await fs.readFile(metadataPath, 'utf8'));
+    const current = metadata.agents[cleanupFenceAgent.agent.agentId];
+    if (current?.lifecycle === 'suspending' && current.transitionId && current.transitionOwnerPid === process.pid) {
+      cleanupTransitionObserved = true;
+      break;
+    }
+  }
+  if (!cleanupTransitionObserved) throw new Error('Completion cleanup never exposed its owned suspending transition');
+  const cleanupStopSource = `
+import { agentStop } from ${JSON.stringify(pathToFileURL(path.join(projectRoot, 'src', 'agents.js')).href)};
+try {
+  await agentStop({ agentId: ${JSON.stringify(cleanupFenceAgent.agent.agentId)} });
+  process.stdout.write(JSON.stringify({ ok: true }));
+} catch (error) {
+  process.stdout.write(JSON.stringify({ ok: false, code: error?.code ?? error?.herdr?.code ?? null, message: error?.message ?? String(error) }));
+}
+`;
+  const cleanupConcurrentStop = JSON.parse((await execFileAsync(process.execPath, ['--input-type=module', '-e', cleanupStopSource], {
+    cwd: root,
+    env: childEnv,
+    maxBuffer: 2 * 1024 * 1024,
+  })).stdout);
+  if (cleanupConcurrentStop.ok || cleanupConcurrentStop.code !== 'agent_lifecycle_in_flight') {
+    throw new Error(`Concurrent stop was not fenced from completion cleanup: ${JSON.stringify(cleanupConcurrentStop)}`);
+  }
+  const cleanupFencePrompt = await cleanupFencePromptPromise;
+  if (cleanupFencePrompt.runtimeDisposition?.action !== 'suspended') {
+    throw new Error(`Fenced completion cleanup did not finish normally: ${JSON.stringify(cleanupFencePrompt.runtimeDisposition)}`);
+  }
+  const cleanupFenceMetadata = JSON.parse(await fs.readFile(metadataPath, 'utf8')).agents[cleanupFenceAgent.agent.agentId];
+  if (
+    cleanupFenceMetadata?.lifecycle !== 'suspended' ||
+    cleanupFenceMetadata.transitionId !== undefined ||
+    cleanupFenceMetadata.transitionOwnerPid !== undefined
+  ) {
+    throw new Error(`Completion cleanup transition did not settle cleanly: ${JSON.stringify(cleanupFenceMetadata)}`);
+  }
+  state = JSON.parse(await fs.readFile(statePath, 'utf8'));
+  delete state.promptResultStatus;
+  delete state.delayWorkspaceCloseFor;
+  delete state.delayWorkspaceCloseMs;
+  await fs.writeFile(statePath, `${JSON.stringify(state, null, 2)}
+`, 'utf8');
+  await agentStop({ agentId: cleanupFenceAgent.agent.agentId });
+
   state = JSON.parse(await fs.readFile(statePath, 'utf8'));
   state.omitNativeSessionId = true;
   await fs.writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, 'utf8');
@@ -1721,6 +1800,69 @@ process.stdout.write(JSON.stringify(result));
   delete state.renameWorkspaceAfterGetFor;
   await fs.writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, 'utf8');
   await agentStop({ agentId: codex.agent.agentId });
+
+  const resumeFenceAgent = await agentStart({ harness: 'agy', cwd: root, timeoutMs: 10_000 });
+  const resumeFenceInitialRuntimeId = resumeFenceAgent.agent.runtimeAgentId;
+  if (!(await agentSuspend({ agentId: resumeFenceAgent.agent.agentId })).suspended) {
+    throw new Error('Resume fence fixture did not suspend');
+  }
+  state = JSON.parse(await fs.readFile(statePath, 'utf8'));
+  state.delayNextWorkspaceCreateMs = 1_500;
+  await fs.writeFile(statePath, `${JSON.stringify(state, null, 2)}
+`, 'utf8');
+  const resumeFencePromise = agentResume({ agentId: resumeFenceAgent.agent.agentId });
+  let resumeTransitionObserved = false;
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const metadata = JSON.parse(await fs.readFile(metadataPath, 'utf8'));
+    const current = metadata.agents[resumeFenceAgent.agent.agentId];
+    if (
+      current?.lifecycle === 'resuming' &&
+      current.transitionId &&
+      current.transitionOwnerPid === process.pid &&
+      current.runtimeAgentId &&
+      current.runtimeAgentId !== resumeFenceInitialRuntimeId
+    ) {
+      resumeTransitionObserved = true;
+      break;
+    }
+  }
+  if (!resumeTransitionObserved) throw new Error('Resume never exposed its owned resuming transition');
+  const resumeStopSource = `
+import { agentStop } from ${JSON.stringify(pathToFileURL(path.join(projectRoot, 'src', 'agents.js')).href)};
+try {
+  await agentStop({ agentId: ${JSON.stringify(resumeFenceAgent.agent.agentId)} });
+  process.stdout.write(JSON.stringify({ ok: true }));
+} catch (error) {
+  process.stdout.write(JSON.stringify({ ok: false, code: error?.code ?? error?.herdr?.code ?? null, message: error?.message ?? String(error) }));
+}
+`;
+  const resumeConcurrentStop = JSON.parse((await execFileAsync(process.execPath, ['--input-type=module', '-e', resumeStopSource], {
+    cwd: root,
+    env: childEnv,
+    maxBuffer: 2 * 1024 * 1024,
+  })).stdout);
+  if (resumeConcurrentStop.ok || resumeConcurrentStop.code !== 'agent_lifecycle_in_flight') {
+    throw new Error(`Concurrent stop was not fenced from live resume: ${JSON.stringify(resumeConcurrentStop)}`);
+  }
+  const resumeFenceResult = await resumeFencePromise;
+  if (!resumeFenceResult.resumed || resumeFenceResult.agent.runtimeAgentId === resumeFenceInitialRuntimeId) {
+    throw new Error(`Fenced resume did not complete normally: ${JSON.stringify(resumeFenceResult)}`);
+  }
+  const resumeFenceMetadata = JSON.parse(await fs.readFile(metadataPath, 'utf8')).agents[resumeFenceAgent.agent.agentId];
+  if (
+    resumeFenceMetadata?.lifecycle !== 'active' ||
+    resumeFenceMetadata.runtimeAgentId !== resumeFenceResult.agent.runtimeAgentId ||
+    resumeFenceMetadata.transitionId !== undefined ||
+    resumeFenceMetadata.transitionOwnerPid !== undefined
+  ) {
+    throw new Error(`Resume transition did not settle cleanly: ${JSON.stringify(resumeFenceMetadata)}`);
+  }
+  state = JSON.parse(await fs.readFile(statePath, 'utf8'));
+  delete state.delayNextWorkspaceCreateMs;
+  await fs.writeFile(statePath, `${JSON.stringify(state, null, 2)}
+`, 'utf8');
+  await agentStop({ agentId: resumeFenceAgent.agent.agentId });
 
   const agy = await agentStart({
     harness: 'agy',

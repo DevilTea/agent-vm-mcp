@@ -442,9 +442,44 @@ function promptLifecycleBlockedError(agentId, record) {
   return error;
 }
 
+const TRANSITIONAL_LIFECYCLES = new Set(['suspending', 'resuming', 'stopping']);
+
+function lifecycleTransitionOwnerAlive(record) {
+  return Boolean(
+    record &&
+    TRANSITIONAL_LIFECYCLES.has(record.lifecycle) &&
+    typeof record.transitionId === 'string' &&
+    record.transitionId.length > 0 &&
+    Number.isInteger(record.transitionOwnerPid) &&
+    lockOwnerIsAlive({ pid: record.transitionOwnerPid })
+  );
+}
+
+function lifecycleTransitionInFlightError(agentId, record) {
+  const error = new Error(
+    `Agent ${agentId} lifecycle transition ${record?.lifecycle ?? 'unknown'} is still owned by another live operation.`,
+  );
+  error.code = 'agent_lifecycle_in_flight';
+  error.lifecycle = record?.lifecycle ?? null;
+  error.transitionId = record?.transitionId ?? null;
+  return error;
+}
+
+function clearLifecycleTransition(record) {
+  if (!record) return record;
+  const { transitionId, transitionOwnerPid, transitionStartedAt, ...stable } = record;
+  return stable;
+}
+
 async function reserveLifecycleTransition(
   agentId,
-  { from, to, runtimeAgentId = undefined, runtimeWorkspaceId = undefined },
+  {
+    from,
+    to,
+    runtimeAgentId = undefined,
+    runtimeWorkspaceId = undefined,
+    updates = {},
+  },
 ) {
   return await mutateAgentMetadata((metadata) => {
     const current = metadata.agents[agentId] ?? null;
@@ -463,13 +498,56 @@ async function reserveLifecycleTransition(
     }
     const busy = blockingPromptLifecycleCompletion(metadata, agentId);
     if (busy) throw promptLifecycleBlockedError(agentId, busy);
+    const now = new Date().toISOString();
     const next = {
       ...current,
+      ...updates,
       lifecycle: to,
-      updatedAt: new Date().toISOString(),
+      transitionId: randomUUID(),
+      transitionOwnerPid: process.pid,
+      transitionStartedAt: now,
+      updatedAt: now,
     };
     metadata.agents[agentId] = next;
     return next;
+  });
+}
+
+async function mutateOwnedLifecycleTransition(agentId, reservation, update, { clear = false } = {}) {
+  return await mutateAgentMetadata((metadata) => {
+    const current = metadata.agents[agentId] ?? null;
+    if (
+      !current ||
+      current.lifecycle !== reservation.lifecycle ||
+      current.transitionId !== reservation.transitionId ||
+      current.transitionOwnerPid !== process.pid
+    ) {
+      const error = new Error(`Agent ${agentId} lifecycle transition ownership was lost.`);
+      error.code = 'agent_lifecycle_transition_lost';
+      throw error;
+    }
+    const next = typeof update === 'function' ? update(current) : update;
+    if (next === null) delete metadata.agents[agentId];
+    else metadata.agents[agentId] = clear ? clearLifecycleTransition(next) : next;
+    return next === null ? null : metadata.agents[agentId];
+  });
+}
+
+async function abandonLifecycleTransition(agentId, reservation) {
+  return await mutateAgentMetadata((metadata) => {
+    const current = metadata.agents[agentId] ?? null;
+    if (
+      !current ||
+      current.lifecycle !== reservation.lifecycle ||
+      current.transitionId !== reservation.transitionId ||
+      current.transitionOwnerPid !== process.pid
+    ) return current;
+    metadata.agents[agentId] = {
+      ...current,
+      transitionOwnerPid: null,
+      updatedAt: new Date().toISOString(),
+    };
+    return metadata.agents[agentId];
   });
 }
 
@@ -696,6 +774,9 @@ async function reconcileAgentMetadata(snapshot = null, signal) {
         continue;
       }
     }
+    if (TRANSITIONAL_LIFECYCLES.has(record.lifecycle) && lifecycleTransitionOwnerAlive(record)) {
+      continue;
+    }
     if (record.lifecycle === 'active') {
       const observation = runtimeObservation(snapshot, record);
       if (observation === 'absent') {
@@ -759,7 +840,7 @@ async function reconcileAgentMetadata(snapshot = null, signal) {
       if (!closed) continue;
       await updateAgentMetadata(record.agentId, (current) => {
         if (!current || current.lifecycle !== record.lifecycle || current.runtimeAgentId !== record.runtimeAgentId) return current;
-        return {
+        return clearLifecycleTransition({
           ...current,
           lifecycle: 'suspended',
           runtimeAgentId: null,
@@ -767,7 +848,7 @@ async function reconcileAgentMetadata(snapshot = null, signal) {
           lastRuntimeAgentId: record.runtimeAgentId,
           lastWorkspaceId: observation.workspace.workspace_id,
           updatedAt: new Date().toISOString(),
-        };
+        });
       });
       continue;
     }
@@ -776,7 +857,7 @@ async function reconcileAgentMetadata(snapshot = null, signal) {
     if (!lifecycle) continue;
     await updateAgentMetadata(record.agentId, (current) => {
       if (!current || current.lifecycle !== record.lifecycle || current.runtimeAgentId !== record.runtimeAgentId) return current;
-      return {
+      return clearLifecycleTransition({
         ...current,
         lifecycle,
         runtimeAgentId: lifecycle === 'active' ? current.runtimeAgentId : null,
@@ -784,7 +865,7 @@ async function reconcileAgentMetadata(snapshot = null, signal) {
         lastRuntimeAgentId: lifecycle === 'active' ? current.lastRuntimeAgentId ?? null : current.runtimeAgentId ?? current.lastRuntimeAgentId ?? null,
         lastWorkspaceId: lifecycle === 'active' ? current.lastWorkspaceId ?? null : current.runtimeWorkspaceId ?? current.lastWorkspaceId ?? null,
         updatedAt: new Date().toISOString(),
-      };
+      });
     });
   }
   metadata = await readAgentMetadata();
@@ -2339,11 +2420,20 @@ async function startAgentRuntime(
     nativeSessionId = null,
     codexProvenance = null,
     resuming = false,
+    resumeTransitionId = null,
   },
   signal,
 ) {
   const definitions = harnessDefinitions();
   const definition = definitions[harness];
+  if (resuming && !resumeTransitionId) {
+    const error = new Error(`Agent ${agentId} resume is missing its lifecycle transition token.`);
+    error.code = 'agent_lifecycle_transition_lost';
+    throw error;
+  }
+  const resumeReservation = resuming
+    ? { lifecycle: 'resuming', transitionId: resumeTransitionId }
+    : null;
   if (!definition) throw new Error(`Unsupported harness: ${harness}`);
   ({ model, effort } = applyHarnessLaunchPolicy({ harness, model, effort }));
   validateModel(model);
@@ -2450,7 +2540,13 @@ async function startAgentRuntime(
     }
     workspaceId = createdWorkspaceId;
 
-    if (!resuming && harness === 'codex') {
+    if (resuming) {
+      await mutateOwnedLifecycleTransition(agentId, resumeReservation, (current) => ({
+        ...current,
+        runtimeWorkspaceId: workspaceId,
+        updatedAt: new Date().toISOString(),
+      }));
+    } else if (harness === 'codex') {
       await updateAgentMetadata(agentId, (current) => current ? {
         ...current,
         runtimeWorkspaceId: workspaceId,
@@ -2502,7 +2598,16 @@ async function startAgentRuntime(
       if (recovered) {
         await nativeLaunchRelease?.();
         nativeLaunchRelease = null;
-        await updateAgentMetadata(agentId, recoveredMetadata);
+        if (resuming) {
+          await mutateOwnedLifecycleTransition(
+            agentId,
+            resumeReservation,
+            (current) => ({ ...current, ...recoveredMetadata }),
+            { clear: true },
+          );
+        } else {
+          await updateAgentMetadata(agentId, recoveredMetadata);
+        }
         const logicalRecovered = await recoverOwnedAgent(agentId);
         return {
           agent: logicalRecovered?.agent ?? recovered.agent,
@@ -2526,7 +2631,7 @@ async function startAgentRuntime(
         : await discoverNativeSessionId(nativeSnapshotBefore, harness, resolvedCwd, nativeLaunchStartedAt, {
           codexHome: codexProvenance?.codexHome,
         });
-    await updateAgentMetadata(agentId, {
+    const activeMetadata = {
       version: AGENT_METADATA_VERSION,
       agentId,
       harness,
@@ -2542,7 +2647,17 @@ async function startAgentRuntime(
       runtimeWorkspaceId: workspaceId,
       lifecycle: 'active',
       updatedAt: new Date().toISOString(),
-    });
+    };
+    if (resuming) {
+      await mutateOwnedLifecycleTransition(
+        agentId,
+        resumeReservation,
+        (current) => ({ ...current, ...activeMetadata }),
+        { clear: true },
+      );
+    } else {
+      await updateAgentMetadata(agentId, activeMetadata);
+    }
     if (!resuming) launchMetadataWritten = true;
     await nativeLaunchRelease?.();
     nativeLaunchRelease = null;
@@ -2808,24 +2923,34 @@ async function finalizeCompletedPromptRuntime(
       const definition = harnessDefinitions()[record.harness];
       const resumable = Boolean(record.resumable && record.nativeSessionId && definition?.resume?.supported);
       if (resumable) {
-        await updateAgentMetadata(agentId, {
-          ...record,
-          lifecycle: 'suspending',
+        const reservation = await reserveLifecycleTransition(agentId, {
+          from: 'active',
+          to: 'suspending',
+          runtimeAgentId: owned.runtimeAgentId,
           runtimeWorkspaceId: workspaceId,
-          updatedAt: new Date().toISOString(),
         });
-        const outcome = await runHerdr(['workspace', 'close', workspaceId], { timeoutMs: 30_000, signal });
-        if (!outcome.ok) throwHerdrFailure(outcome);
-        await verifyRuntimeClosed(owned.runtimeAgentId, workspaceId);
-        await updateAgentMetadata(agentId, {
-          ...record,
-          lifecycle: 'suspended',
-          runtimeAgentId: null,
-          runtimeWorkspaceId: null,
-          lastRuntimeAgentId: owned.runtimeAgentId,
-          lastWorkspaceId: workspaceId,
-          updatedAt: new Date().toISOString(),
-        });
+        try {
+          const outcome = await runHerdr(['workspace', 'close', workspaceId], { timeoutMs: 30_000, signal });
+          if (!outcome.ok) throwHerdrFailure(outcome);
+          await verifyRuntimeClosed(owned.runtimeAgentId, workspaceId);
+          await mutateOwnedLifecycleTransition(
+            agentId,
+            reservation,
+            (current) => ({
+              ...current,
+              lifecycle: 'suspended',
+              runtimeAgentId: null,
+              runtimeWorkspaceId: null,
+              lastRuntimeAgentId: owned.runtimeAgentId,
+              lastWorkspaceId: workspaceId,
+              updatedAt: new Date().toISOString(),
+            }),
+            { clear: true },
+          );
+        } catch (error) {
+          await abandonLifecycleTransition(agentId, reservation).catch(() => {});
+          throw error;
+        }
         return {
           action: 'suspended',
           agentId,
@@ -2836,10 +2961,21 @@ async function finalizeCompletedPromptRuntime(
         };
       }
 
-      const outcome = await runHerdr(['workspace', 'close', workspaceId], { timeoutMs: 30_000, signal });
-      if (!outcome.ok) throwHerdrFailure(outcome);
-      await verifyRuntimeClosed(owned.runtimeAgentId, workspaceId);
-      await updateAgentMetadata(agentId, null);
+      const reservation = await reserveLifecycleTransition(agentId, {
+        from: 'active',
+        to: 'stopping',
+        runtimeAgentId: owned.runtimeAgentId,
+        runtimeWorkspaceId: workspaceId,
+      });
+      try {
+        const outcome = await runHerdr(['workspace', 'close', workspaceId], { timeoutMs: 30_000, signal });
+        if (!outcome.ok) throwHerdrFailure(outcome);
+        await verifyRuntimeClosed(owned.runtimeAgentId, workspaceId);
+        await mutateOwnedLifecycleTransition(agentId, reservation, null);
+      } catch (error) {
+        await abandonLifecycleTransition(agentId, reservation).catch(() => {});
+        throw error;
+      }
       return {
         action: 'stopped',
         agentId,
@@ -3451,26 +3587,34 @@ export async function agentSuspend({ agentId }, signal) {
       throw error;
     }
 
-    await reserveLifecycleTransition(agentId, {
+    const reservation = await reserveLifecycleTransition(agentId, {
       from: 'active',
       to: 'suspending',
       runtimeAgentId: owned.runtimeAgentId,
       runtimeWorkspaceId: workspaceId,
     });
-    const outcome = await runHerdr(['workspace', 'close', workspaceId], { timeoutMs: 30_000, signal });
-    if (!outcome.ok) {
-      throwHerdrFailure(outcome);
+    try {
+      const outcome = await runHerdr(['workspace', 'close', workspaceId], { timeoutMs: 30_000, signal });
+      if (!outcome.ok) throwHerdrFailure(outcome);
+      await verifyRuntimeClosed(owned.runtimeAgentId, workspaceId);
+      await mutateOwnedLifecycleTransition(
+        agentId,
+        reservation,
+        (current) => ({
+          ...current,
+          lifecycle: 'suspended',
+          runtimeAgentId: null,
+          runtimeWorkspaceId: null,
+          lastRuntimeAgentId: owned.runtimeAgentId,
+          lastWorkspaceId: workspaceId,
+          updatedAt: new Date().toISOString(),
+        }),
+        { clear: true },
+      );
+    } catch (error) {
+      await abandonLifecycleTransition(agentId, reservation).catch(() => {});
+      throw error;
     }
-    await verifyRuntimeClosed(owned.runtimeAgentId, workspaceId);
-    await updateAgentMetadata(agentId, {
-      ...record,
-      lifecycle: 'suspended',
-      runtimeAgentId: null,
-      runtimeWorkspaceId: null,
-      lastRuntimeAgentId: owned.runtimeAgentId,
-      lastWorkspaceId: workspaceId,
-      updatedAt: new Date().toISOString(),
-    });
     return {
       agentId,
       harness: record.harness,
@@ -3525,12 +3669,10 @@ export async function agentResume({ agentId }, signal) {
       to: 'resuming',
       runtimeAgentId: null,
       runtimeWorkspaceId: null,
-    });
-    await updateAgentMetadata(agentId, {
-      ...reserved,
-      runtimeAgentId,
-      runtimeWorkspaceId: null,
-      updatedAt: new Date().toISOString(),
+      updates: {
+        runtimeAgentId,
+        runtimeWorkspaceId: null,
+      },
     });
     try {
       const result = await startAgentRuntime({
@@ -3543,18 +3685,26 @@ export async function agentResume({ agentId }, signal) {
         codexProvenance: record.codexProvenance ?? null,
         nativeSessionId: record.nativeSessionId,
         resuming: true,
+        resumeTransitionId: reserved.transitionId,
       }, signal);
       return { ...result, resumed: true, logicalAgentId: agentId, nativeSessionId: record.nativeSessionId };
     } catch (error) {
       if (!error?.cleanup) {
-        await updateAgentMetadata(agentId, {
-          ...record,
-          lifecycle: 'suspended',
-          runtimeAgentId: null,
-          runtimeWorkspaceId: null,
-          lastRuntimeAgentId: runtimeAgentId,
-          updatedAt: new Date().toISOString(),
-        }).catch(() => {});
+        await mutateOwnedLifecycleTransition(
+          agentId,
+          reserved,
+          (current) => ({
+            ...current,
+            lifecycle: 'suspended',
+            runtimeAgentId: null,
+            runtimeWorkspaceId: null,
+            lastRuntimeAgentId: runtimeAgentId,
+            updatedAt: new Date().toISOString(),
+          }),
+          { clear: true },
+        ).catch(() => {});
+      } else {
+        await abandonLifecycleTransition(agentId, reserved).catch(() => {});
       }
       throw error;
     }
@@ -3567,6 +3717,9 @@ export async function agentStop({ agentId }, signal) {
   const blockingPrompt = blockingPromptLifecycleCompletion(metadata, agentId);
   if (blockingPrompt) throw promptLifecycleBlockedError(agentId, blockingPrompt);
   const durable = metadata.agents[agentId];
+  if (lifecycleTransitionOwnerAlive(durable)) {
+    throw lifecycleTransitionInFlightError(agentId, durable);
+  }
   if (['orphaned', 'quarantined'].includes(durable?.lifecycle) && !durable.runtimeAgentId) {
     await updateAgentMetadata(agentId, null);
     return {
@@ -3658,17 +3811,21 @@ export async function agentStop({ agentId }, signal) {
     throw error;
   }
 
-  if (durable) {
-    await reserveLifecycleTransition(agentId, {
-      from: 'active',
-      to: 'stopping',
-      runtimeAgentId: owned.runtimeAgentId,
-      runtimeWorkspaceId: workspaceId,
-    });
+  const reservation = durable ? await reserveLifecycleTransition(agentId, {
+    from: 'active',
+    to: 'stopping',
+    runtimeAgentId: owned.runtimeAgentId,
+    runtimeWorkspaceId: workspaceId,
+  }) : null;
+  try {
+    const outcome = await runHerdr(['workspace', 'close', workspaceId], { timeoutMs: 30_000, signal });
+    if (!outcome.ok) throwHerdrFailure(outcome);
+    if (reservation) await mutateOwnedLifecycleTransition(agentId, reservation, null);
+  } catch (error) {
+    if (reservation) await abandonLifecycleTransition(agentId, reservation).catch(() => {});
+    throw error;
   }
-  const outcome = await runHerdr(['workspace', 'close', workspaceId], { timeoutMs: 30_000, signal });
-  if (!outcome.ok) throwHerdrFailure(outcome);
-  await updateAgentMetadata(agentId, null);
+  if (!reservation) await updateAgentMetadata(agentId, null);
   return {
     agentId,
     harness: agent.harness,
