@@ -26,7 +26,7 @@ const PROMPT_COMPLETION_STATES = new Set(['in_flight', 'completed', 'uncertain']
 const TERMINAL_METADATA_RETENTION_MS = 30 * 24 * 60 * 60 * 1_000;
 const MAX_TERMINAL_METADATA_RECORDS = 100;
 const TERMINAL_METADATA_LIFECYCLES = new Set(['orphaned', 'quarantined']);
-const LIFECYCLE_STATES = new Set(['active', 'starting', 'suspending', 'suspended', 'resuming', 'orphaned', 'quarantined']);
+const LIFECYCLE_STATES = new Set(['active', 'starting', 'suspending', 'suspended', 'resuming', 'stopping', 'orphaned', 'quarantined']);
 const CODEX_SUPPORTED_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
 const CODEX_POLICY = Object.freeze({ model: 'gpt-5.6-luna', effort: 'max' });
 const CODEX_PROVENANCE_VERSION = 1;
@@ -408,17 +408,101 @@ function promptRequestFingerprint({ agentId, task, skills, wait, until }) {
     .digest('hex');
 }
 
+function promptSubmissionMarker(completionId) {
+  return `agent-vm-mcp-request:${completionId}`;
+}
+
 function promptCompletionBlocksDifferentRequest(record) {
   if (!record) return false;
-  if (record.state === 'in_flight') return true;
+  if (record.state === 'in_flight' || record.state === 'uncertain') return true;
   const disposition = record.result?.runtimeDisposition?.action;
   return disposition === 'pending' || disposition === 'cleanup_failed';
 }
 
+function blockingPromptCompletion(metadata, agentId, excludeRequestId = null) {
+  return Object.values(metadata.completions ?? {})
+    .filter((record) => record.agentId === agentId && record.requestId !== excludeRequestId)
+    .find((record) => promptCompletionBlocksDifferentRequest(record)) ?? null;
+}
+
+function promptCompletionBlocksLifecycleMutation(record) {
+  return record?.state === 'in_flight' || record?.state === 'uncertain';
+}
+
+function blockingPromptLifecycleCompletion(metadata, agentId) {
+  return Object.values(metadata.completions ?? {})
+    .filter((record) => record.agentId === agentId)
+    .find((record) => promptCompletionBlocksLifecycleMutation(record)) ?? null;
+}
+
+function promptLifecycleBlockedError(agentId, record) {
+  const error = new Error(`Agent ${agentId} has unresolved prompt request ${record?.requestId ?? 'unknown'} and cannot change runtime lifecycle.`);
+  error.code = 'agent_prompt_in_flight';
+  error.existingRequestId = record?.requestId ?? null;
+  return error;
+}
+
+async function reserveLifecycleTransition(
+  agentId,
+  { from, to, runtimeAgentId = undefined, runtimeWorkspaceId = undefined },
+) {
+  return await mutateAgentMetadata((metadata) => {
+    const current = metadata.agents[agentId] ?? null;
+    if (!current || current.lifecycle !== from) {
+      const error = new Error(`Agent ${agentId} changed lifecycle before ${to} could be reserved.`);
+      error.code = 'agent_invalid_transition';
+      throw error;
+    }
+    if (
+      (runtimeAgentId !== undefined && current.runtimeAgentId !== runtimeAgentId) ||
+      (runtimeWorkspaceId !== undefined && current.runtimeWorkspaceId !== runtimeWorkspaceId)
+    ) {
+      const error = new Error(`Agent ${agentId} changed runtime generation before ${to} could be reserved.`);
+      error.code = 'agent_runtime_generation_changed';
+      throw error;
+    }
+    const busy = blockingPromptLifecycleCompletion(metadata, agentId);
+    if (busy) throw promptLifecycleBlockedError(agentId, busy);
+    const next = {
+      ...current,
+      lifecycle: to,
+      updatedAt: new Date().toISOString(),
+    };
+    metadata.agents[agentId] = next;
+    return next;
+  });
+}
+
+async function verifyPromptClaimGeneration(record, signal, timeoutMs) {
+  const metadata = await readAgentMetadata();
+  const logical = metadata.agents[record.agentId] ?? null;
+  if (
+    logical && (
+      logical.lifecycle !== 'active' ||
+      logical.runtimeAgentId !== record.runtimeAgentId ||
+      logical.runtimeWorkspaceId !== record.runtimeWorkspaceId
+    )
+  ) {
+    const error = new Error(`Agent ${record.agentId} changed runtime generation before prompt dispatch.`);
+    error.code = 'agent_runtime_generation_changed';
+    throw error;
+  }
+  const owned = await requireOwnedAgent(record.agentId, { signal, timeoutMs });
+  if (
+    owned.runtimeAgentId !== record.runtimeAgentId ||
+    owned.workspace.workspace_id !== record.runtimeWorkspaceId ||
+    owned.agent.workspace_id !== record.runtimeWorkspaceId
+  ) {
+    const error = new Error(`Agent ${record.agentId} changed runtime generation before prompt dispatch.`);
+    error.code = 'agent_runtime_generation_changed';
+    throw error;
+  }
+  return owned;
+}
+
 function promptCompletionNeedsReconciliation(record) {
-  if (!record?.wait) return false;
-  if (record.state === 'in_flight' || record.state === 'uncertain') return true;
-  return record.state === 'completed' && ['pending', 'cleanup_failed'].includes(record.result?.runtimeDisposition?.action);
+  if (record?.state === 'in_flight' || record?.state === 'uncertain') return true;
+  return Boolean(record?.wait && record.state === 'completed' && ['pending', 'cleanup_failed'].includes(record.result?.runtimeDisposition?.action));
 }
 
 function promptCompletionResponse(record, { recovered = false } = {}) {
@@ -464,15 +548,23 @@ async function claimPromptCompletion(request) {
       return { kind: 'existing', record: existing };
     }
 
-    const busy = Object.values(metadata.completions)
-      .filter((record) => record.agentId === request.agentId)
-      .find((record) => promptCompletionBlocksDifferentRequest(record));
+    const busy = blockingPromptCompletion(metadata, request.agentId);
     if (busy) return { kind: 'busy', record: busy };
 
+    const logical = metadata.agents[request.agentId] ?? null;
+    if (
+      logical && (
+        logical.lifecycle !== 'active' ||
+        logical.runtimeAgentId !== request.runtimeAgentId ||
+        logical.runtimeWorkspaceId !== request.runtimeWorkspaceId
+      )
+    ) return { kind: 'generation_mismatch', record: logical };
+
     const now = new Date().toISOString();
+    const completionId = randomUUID();
     const record = {
       version: PROMPT_COMPLETION_VERSION,
-      completionId: randomUUID(),
+      completionId,
       requestId: request.requestId,
       fingerprint: request.fingerprint,
       agentId: request.agentId,
@@ -485,8 +577,11 @@ async function claimPromptCompletion(request) {
       wait: request.wait,
       until: request.until,
       state: 'in_flight',
+      dispatchState: 'dispatching',
+      submissionMarker: promptSubmissionMarker(completionId),
+      ownerPid: process.pid,
       createdAt: now,
-      submittedAt: now,
+      submittedAt: null,
       completedAt: null,
       updatedAt: now,
       acknowledgedAt: null,
@@ -594,7 +689,7 @@ async function reconcileAgentMetadata(snapshot = null, signal) {
   let metadata = await readAgentMetadata();
   if (!snapshot) return metadata;
   for (const record of Object.values(metadata.agents)) {
-    if (record.harness === 'codex' && ['active', 'starting', 'suspending', 'suspended', 'resuming'].includes(record.lifecycle)) {
+    if (record.harness === 'codex' && ['active', 'starting', 'suspending', 'suspended', 'resuming', 'stopping'].includes(record.lifecycle)) {
       const compliance = await verifyCodexProvenance(record);
       if (!compliance.ok) {
         await quarantineCodexRecord(record, compliance.reason, snapshot, signal);
@@ -636,6 +731,24 @@ async function reconcileAgentMetadata(snapshot = null, signal) {
             };
           });
         }
+      }
+      continue;
+    }
+    if (record.lifecycle === 'stopping') {
+      const observation = runtimeObservation(snapshot, record);
+      if (observation === 'ambiguous') continue;
+      if (observation === 'absent') {
+        await updateAgentMetadata(record.agentId, (current) => (
+          current?.lifecycle === 'stopping' && current.runtimeAgentId === record.runtimeAgentId ? null : current
+        ));
+        continue;
+      }
+      if (observation?.status === 'orphan' || observation?.status === 'owned') {
+        const closed = await closeExactlyOwnedWorkspace(record.runtimeAgentId, observation.workspace, signal);
+        if (!closed) continue;
+        await updateAgentMetadata(record.agentId, (current) => (
+          current?.lifecycle === 'stopping' && current.runtimeAgentId === record.runtimeAgentId ? null : current
+        ));
       }
       continue;
     }
@@ -686,6 +799,7 @@ async function reconcileBeforeOperation(signal, { timeoutMs = 2_000, reconcileCo
     record.lifecycle === 'starting' ||
     record.lifecycle === 'suspending' ||
     record.lifecycle === 'resuming' ||
+    record.lifecycle === 'stopping' ||
     (record.harness === 'codex' && record.lifecycle === 'suspended')
   ))) return metadata;
   const snapshot = await snapshotOutcome({ signal, timeoutMs: Math.max(1, timeoutMs) });
@@ -1429,7 +1543,7 @@ function ownedAgentRecords(snapshot, metadata = { agents: {} }, { includeTransit
       if (
         durable &&
         durable.lifecycle !== 'active' &&
-        !(includeTransitional && ['starting', 'suspending', 'resuming'].includes(durable.lifecycle))
+        !(includeTransitional && ['starting', 'suspending', 'resuming', 'stopping'].includes(durable.lifecycle))
       ) return false;
       const workspace = workspaceById.get(agent.workspace_id);
       return Boolean(workspace && workspace.label === agent.name && workspace.workspace_id === agent.workspace_id);
@@ -1834,12 +1948,66 @@ async function safePromptDiagnostics(agentId) {
   return { agent: recovered.agent, transcript: read.ok ? read.text : recovered.transcript };
 }
 
-function promptCompletionEvidence(record, runtimeAgent) {
+function promptCompletionEvidence(record, runtimeAgent, transcript = '') {
   return (
     Number.isSafeInteger(record.initialStateChangeSeq) &&
     Number.isSafeInteger(runtimeAgent?.state_change_seq) &&
-    runtimeAgent.state_change_seq > record.initialStateChangeSeq
+    runtimeAgent.state_change_seq > record.initialStateChangeSeq &&
+    typeof record.submissionMarker === 'string' &&
+    record.submissionMarker.length > 0 &&
+    transcript.includes(record.submissionMarker)
   );
+}
+
+function uncertainPromptResult(record, diagnostics = { agent: null, transcript: '' }, cause = null) {
+  return {
+    accepted: null,
+    requestId: record.requestId,
+    completionId: record.completionId,
+    submission: { state: 'possibly_submitted', retrySafe: false, waitCompleted: false },
+    error: {
+      code: 'agent_prompt_outcome_unknown',
+      message: 'Prompt submission may have occurred, but completion could not be confirmed. Do not automatically retry this task.',
+      retryable: false,
+      ...(cause ? { cause } : {}),
+    },
+    agent: diagnostics.agent ?? null,
+    transcript: diagnostics.transcript ?? '',
+  };
+}
+
+function recoveredPromptResult(record, diagnostics) {
+  const status = diagnostics.agent?.status ?? 'unknown';
+  if (!record.wait) {
+    return {
+      accepted: true,
+      requestId: record.requestId,
+      completionId: record.completionId,
+      submission: { state: 'submitted', retrySafe: false, waitCompleted: false },
+      ...(record.skills?.length ? { skills: record.skills } : { skills: [] }),
+      agent: diagnostics.agent,
+      transcript: diagnostics.transcript,
+      runtimeDisposition: { action: 'retained', reason: 'wait_disabled', status },
+    };
+  }
+  return {
+    accepted: null,
+    requestId: record.requestId,
+    completionId: record.completionId,
+    submission: { state: 'possibly_submitted', retrySafe: false, waitCompleted: status === 'done' },
+    ...(record.skills?.length ? { skills: record.skills } : { skills: [] }),
+    agent: diagnostics.agent,
+    transcript: diagnostics.transcript,
+    runtimeDisposition: status === 'done'
+      ? { action: 'pending', status: 'done' }
+      : { action: 'retained', reason: 'recovered_terminal_state', status },
+    error: {
+      code: 'agent_prompt_completion_recovered',
+      message: 'The prompt submission marker was observed after the original response became uncertain; use this durable result and do not submit a duplicate task.',
+      retryable: false,
+      ...(record.result?.error?.cause ? { cause: record.result.error.cause } : {}),
+    },
+  };
 }
 
 function completionResultForDonePrompt(record, diagnostics, { recoveredFromUncertain = false } = {}) {
@@ -1888,6 +2056,8 @@ async function reconcilePromptCompletionRecord(record, snapshot, { allowLocal = 
   if (!promptCompletionNeedsReconciliation(record)) return;
   const localOperation = promptOperations.get(record.agentId);
   if (!allowLocal && localOperation?.requestId === record.requestId) return;
+  const ownerAlive = Boolean(Number.isInteger(record.ownerPid) && lockOwnerIsAlive({ pid: record.ownerPid }));
+  if (record.state === 'in_flight' && ownerAlive && !allowLocal) return;
 
   const metadata = await readAgentMetadata();
   const logical = metadata.agents[record.agentId] ?? null;
@@ -1898,6 +2068,13 @@ async function reconcilePromptCompletionRecord(record, snapshot, { allowLocal = 
         ...record.result,
         runtimeDisposition: { action: 'already_finalized', lifecycle: null },
       });
+    } else if (record.state === 'in_flight' && !ownerAlive) {
+      await updatePromptCompletion(record.requestId, (current) => current?.state === 'in_flight' ? {
+        ...current,
+        state: 'uncertain',
+        updatedAt: new Date().toISOString(),
+        result: uncertainPromptResult(current),
+      } : current);
     }
     return;
   }
@@ -1914,16 +2091,74 @@ async function reconcilePromptCompletionRecord(record, snapshot, { allowLocal = 
     });
     return;
   }
-  if (logical.lifecycle !== 'active' || logical.runtimeAgentId !== record.runtimeAgentId) return;
-  if (logical.runtimeWorkspaceId !== record.runtimeWorkspaceId) return;
-
-  if (observation?.status !== 'owned' || observation.agent.agent_status !== 'done') return;
-  if (!promptCompletionEvidence(record, observation.agent)) return;
+  if (
+    logical.lifecycle !== 'active' ||
+    logical.runtimeAgentId !== record.runtimeAgentId ||
+    logical.runtimeWorkspaceId !== record.runtimeWorkspaceId
+  ) {
+    if (record.state === 'in_flight' && !ownerAlive) {
+      await updatePromptCompletion(record.requestId, (current) => current?.state === 'in_flight' ? {
+        ...current,
+        state: 'uncertain',
+        updatedAt: new Date().toISOString(),
+        result: uncertainPromptResult(current),
+      } : current);
+    }
+    return;
+  }
+  if (observation?.status !== 'owned') {
+    if (record.state === 'in_flight' && !ownerAlive) {
+      await updatePromptCompletion(record.requestId, (current) => current?.state === 'in_flight' ? {
+        ...current,
+        state: 'uncertain',
+        updatedAt: new Date().toISOString(),
+        result: uncertainPromptResult(current),
+      } : current);
+    }
+    return;
+  }
 
   const diagnostics = await safePromptDiagnostics(record.agentId);
-  if (diagnostics.agent?.status !== 'done') return;
+  const evidence = promptCompletionEvidence(record, observation.agent, diagnostics.transcript);
+  if (!evidence) {
+    if (record.state === 'in_flight' && !ownerAlive) {
+      await updatePromptCompletion(record.requestId, (current) => current?.state === 'in_flight' ? {
+        ...current,
+        state: 'uncertain',
+        updatedAt: new Date().toISOString(),
+        result: uncertainPromptResult(current, diagnostics),
+      } : current);
+    }
+    return;
+  }
 
-  const recoveredFromUncertain = record.state === 'uncertain';
+  if (!record.wait) {
+    await persistPromptCompletion(record.requestId, recoveredPromptResult(record, diagnostics), {
+      finalStatus: diagnostics.agent?.status ?? 'unknown',
+    });
+    return;
+  }
+
+  if (!READY_STATUSES.has(diagnostics.agent?.status)) {
+    if (record.state === 'in_flight' && !ownerAlive) {
+      await updatePromptCompletion(record.requestId, (current) => current?.state === 'in_flight' ? {
+        ...current,
+        state: 'uncertain',
+        updatedAt: new Date().toISOString(),
+        result: uncertainPromptResult(current, diagnostics),
+      } : current);
+    }
+    return;
+  }
+
+  if (diagnostics.agent.status !== 'done') {
+    await persistPromptCompletion(record.requestId, recoveredPromptResult(record, diagnostics), {
+      finalStatus: diagnostics.agent.status,
+    });
+    return;
+  }
+
+  const recoveredFromUncertain = record.state === 'uncertain' || record.state === 'in_flight';
   const durableResult = record.state === 'completed' && record.result
     ? {
         ...record.result,
@@ -1961,7 +2196,11 @@ async function reconcilePromptCompletionRecord(record, snapshot, { allowLocal = 
     record.agentId,
     diagnostics.agent,
     undefined,
-    { alreadyReconciled: true },
+    {
+      alreadyReconciled: true,
+      expectedRuntimeAgentId: record.runtimeAgentId,
+      expectedRuntimeWorkspaceId: record.runtimeWorkspaceId,
+    },
   );
   await persistPromptCompletion(record.requestId, durableResult);
 }
@@ -2487,7 +2726,12 @@ async function refreshNativeSessionAfterPrompt(agentId, completedAgent, signal) 
   }
 }
 
-async function finalizeCompletedPromptRuntime(agentId, completedAgent, signal, { alreadyReconciled = false } = {}) {
+async function finalizeCompletedPromptRuntime(
+  agentId,
+  completedAgent,
+  signal,
+  { alreadyReconciled = false, expectedRuntimeAgentId = null, expectedRuntimeWorkspaceId = null } = {},
+) {
   if (completedAgent?.status !== 'done') {
     return { action: 'retained', reason: 'status_not_done', status: completedAgent?.status ?? 'unknown' };
   }
@@ -2502,8 +2746,28 @@ async function finalizeCompletedPromptRuntime(agentId, completedAgent, signal, {
           lifecycle: record?.lifecycle ?? null,
         };
       }
+      if (
+        (expectedRuntimeAgentId && record.runtimeAgentId !== expectedRuntimeAgentId) ||
+        (expectedRuntimeWorkspaceId && record.runtimeWorkspaceId !== expectedRuntimeWorkspaceId)
+      ) {
+        return {
+          action: 'retained',
+          reason: 'runtime_generation_changed',
+          status: completedAgent?.status ?? 'unknown',
+        };
+      }
 
       const owned = await requireOwnedAgent(agentId, { signal, timeoutMs: 5_000 });
+      if (
+        (expectedRuntimeAgentId && owned.runtimeAgentId !== expectedRuntimeAgentId) ||
+        (expectedRuntimeWorkspaceId && owned.workspace.workspace_id !== expectedRuntimeWorkspaceId)
+      ) {
+        return {
+          action: 'retained',
+          reason: 'runtime_generation_changed',
+          status: owned.agent.agent_status ?? 'unknown',
+        };
+      }
       if (owned.agent.agent_status !== 'done') {
         return {
           action: 'retained',
@@ -2525,7 +2789,9 @@ async function finalizeCompletedPromptRuntime(agentId, completedAgent, signal, {
       if (
         latest.runtimeAgentId !== owned.runtimeAgentId ||
         latest.workspace.workspace_id !== workspaceId ||
-        latest.agent.workspace_id !== workspaceId
+        latest.agent.workspace_id !== workspaceId ||
+        (expectedRuntimeAgentId && latest.runtimeAgentId !== expectedRuntimeAgentId) ||
+        (expectedRuntimeWorkspaceId && latest.workspace.workspace_id !== expectedRuntimeWorkspaceId)
       ) {
         const error = new Error(`Agent ${agentId} changed workspace before completion cleanup.`);
         error.code = 'agent_not_managed';
@@ -2688,12 +2954,6 @@ async function runAgentPrompt(
     return promptCompletionResponse(existing, { recovered: true });
   }
 
-  const metadataBeforePrompt = await readAgentMetadata();
-  const durableBusy = Object.values(metadataBeforePrompt.completions ?? {})
-    .filter((record) => record.agentId === agentId && record.requestId !== requestId)
-    .find((record) => promptCompletionBlocksDifferentRequest(record));
-  if (durableBusy) return promptBusyResponse({ agentId, requestId, record: durableBusy });
-
   const preflightDeadline = Date.now() + Math.min(10_000, timeoutMs);
   try {
     await reconcileBeforeOperation(signal, { timeoutMs: Math.min(2_000, timeoutMs) });
@@ -2701,6 +2961,9 @@ async function runAgentPrompt(
     throwIfCancelled(error);
     return notSubmitted(error);
   }
+  const metadataAfterReconcile = await readAgentMetadata();
+  const durableBusy = blockingPromptCompletion(metadataAfterReconcile, agentId, requestId);
+  if (durableBusy) return promptBusyResponse({ agentId, requestId, record: durableBusy });
   const remainingPreflightMs = () => {
     const remaining = preflightDeadline - Date.now();
     if (remaining <= 0) throw timeoutError('Agent prompt preflight timed out before submission.');
@@ -2807,12 +3070,36 @@ async function runAgentPrompt(
   if (claim.kind === 'conflict') return promptRequestConflictResponse({ requestId, record: claim.record });
   if (claim.kind === 'busy') return promptBusyResponse({ agentId, requestId, record: claim.record });
   if (claim.kind === 'existing') return promptCompletionResponse(claim.record, { recovered: true });
+  if (claim.kind === 'generation_mismatch') {
+    const error = new Error(`Agent ${agentId} changed runtime generation before prompt claim.`);
+    error.code = 'agent_runtime_generation_changed';
+    return notSubmitted(error, { agent: finalState, retryable: true });
+  }
 
+  try {
+    await verifyPromptClaimGeneration(claim.record, signal, Math.min(DEFAULT_COMMAND_TIMEOUT_MS, remainingPreflightMs()));
+  } catch (error) {
+    throwIfCancelled(error);
+    await updatePromptCompletion(requestId, (current) => (
+      current?.completionId === claim.record.completionId && current.state === 'in_flight' ? null : current
+    ));
+    return notSubmitted(error, { agent: finalState, retryable: true });
+  }
+
+  args[3] = `${prompt}\n\n[${claim.record.submissionMarker}]`;
   const outcome = await runHerdr(args, {
     timeoutMs: wait ? timeoutMs + 2_000 : 10_000,
     signal,
     deadlineAt: preflightDeadline,
   });
+  if (outcome.process !== null && !outcome.process?.spawnError) {
+    await updatePromptCompletion(requestId, (current) => current?.completionId === claim.record.completionId ? {
+      ...current,
+      dispatchState: 'started',
+      submittedAt: current.submittedAt ?? new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    } : current);
+  }
   if (!outcome.ok) {
     const diagnostics = await safePromptDiagnostics(agentId);
     if (outcome.process === null || outcome.process?.spawnError || outcome.error?.code === 'herdr_unavailable') {
@@ -2848,7 +3135,7 @@ async function runAgentPrompt(
       updatedAt: new Date().toISOString(),
       result: uncertain,
     } : current);
-    if (wait && diagnostics.agent?.status === 'done') {
+    if (wait && READY_STATUSES.has(diagnostics.agent?.status)) {
       const snapshot = await snapshotOutcome({ timeoutMs: 5_000 });
       if (snapshot.ok) {
         await reconcilePromptCompletionRecord(
@@ -2862,7 +3149,7 @@ async function runAgentPrompt(
         );
         const recovered = await readPromptCompletion(requestId);
         if (recovered?.state === 'completed') {
-          if (signal?.aborted) throw abortError();
+          if (signal?.aborted && recovered.finalStatus === 'done') throw abortError();
           return promptCompletionResponse(recovered, { recovered: true });
         }
       }
@@ -2870,6 +3157,12 @@ async function runAgentPrompt(
     return uncertain;
   }
 
+  await updatePromptCompletion(requestId, (current) => current?.completionId === claim.record.completionId ? {
+    ...current,
+    dispatchState: 'confirmed',
+    submittedAt: current.submittedAt ?? new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  } : current);
   const diagnostics = await safePromptDiagnostics(agentId);
   const nativeSessionRefresh = wait
     ? await refreshNativeSessionAfterPrompt(agentId, diagnostics.agent)
@@ -2912,7 +3205,11 @@ async function runAgentPrompt(
       agentId,
       diagnostics.agent,
       undefined,
-      { alreadyReconciled: true },
+      {
+        alreadyReconciled: true,
+        expectedRuntimeAgentId: claim.record.runtimeAgentId,
+        expectedRuntimeWorkspaceId: claim.record.runtimeWorkspaceId,
+      },
     );
     await persistPromptCompletion(requestId, completed, {
       finalStatus: diagnostics.agent?.status ?? 'done',
@@ -3134,12 +3431,9 @@ export async function agentSuspend({ agentId }, signal) {
       error.code = 'agent_native_session_unavailable';
       throw error;
     }
-    const durablePromptInFlight = Object.values(metadata.completions ?? {})
-      .some((completion) => completion.agentId === agentId && completion.state === 'in_flight' && completion.wait);
+    const durablePromptInFlight = blockingPromptLifecycleCompletion(metadata, agentId);
     if (promptAgentsInFlight.has(agentId) || durablePromptInFlight) {
-      const error = new Error(`Agent ${agentId} has a prompt in flight and cannot be suspended.`);
-      error.code = 'agent_prompt_in_flight';
-      throw error;
+      throw promptLifecycleBlockedError(agentId, durablePromptInFlight ?? { requestId: 'process-local' });
     }
 
     const owned = await requireOwnedAgent(agentId, { signal, timeoutMs: 5_000 });
@@ -3157,11 +3451,11 @@ export async function agentSuspend({ agentId }, signal) {
       throw error;
     }
 
-    await updateAgentMetadata(agentId, {
-      ...record,
-      lifecycle: 'suspending',
+    await reserveLifecycleTransition(agentId, {
+      from: 'active',
+      to: 'suspending',
+      runtimeAgentId: owned.runtimeAgentId,
       runtimeWorkspaceId: workspaceId,
-      updatedAt: new Date().toISOString(),
     });
     const outcome = await runHerdr(['workspace', 'close', workspaceId], { timeoutMs: 30_000, signal });
     if (!outcome.ok) {
@@ -3196,6 +3490,8 @@ export async function agentResume({ agentId }, signal) {
       error.code = 'agent_not_managed';
       throw error;
     }
+    const blockingPrompt = blockingPromptLifecycleCompletion(metadata, agentId);
+    if (blockingPrompt) throw promptLifecycleBlockedError(agentId, blockingPrompt);
     const definition = harnessDefinitions()[record.harness];
     if (record.harness === 'codex') {
       const compliance = await verifyCodexProvenance(record);
@@ -3224,9 +3520,14 @@ export async function agentResume({ agentId }, signal) {
       throw error;
     }
     const runtimeAgentId = `agent-${randomUUID().replaceAll('-', '').slice(0, 26)}`;
+    const reserved = await reserveLifecycleTransition(agentId, {
+      from: 'suspended',
+      to: 'resuming',
+      runtimeAgentId: null,
+      runtimeWorkspaceId: null,
+    });
     await updateAgentMetadata(agentId, {
-      ...record,
-      lifecycle: 'resuming',
+      ...reserved,
       runtimeAgentId,
       runtimeWorkspaceId: null,
       updatedAt: new Date().toISOString(),
@@ -3263,6 +3564,8 @@ export async function agentResume({ agentId }, signal) {
 export async function agentStop({ agentId }, signal) {
   return await withLifecycleLock(agentId, async () => {
   const metadata = await reconcileBeforeOperation(signal, { reconcileCompletions: false });
+  const blockingPrompt = blockingPromptLifecycleCompletion(metadata, agentId);
+  if (blockingPrompt) throw promptLifecycleBlockedError(agentId, blockingPrompt);
   const durable = metadata.agents[agentId];
   if (['orphaned', 'quarantined'].includes(durable?.lifecycle) && !durable.runtimeAgentId) {
     await updateAgentMetadata(agentId, null);
@@ -3275,7 +3578,7 @@ export async function agentStop({ agentId }, signal) {
       discarded: true,
     };
   }
-  if (durable?.lifecycle === 'starting' || durable?.lifecycle === 'suspending' || durable?.lifecycle === 'resuming' || durable?.lifecycle === 'quarantined') {
+  if (durable?.lifecycle === 'starting' || durable?.lifecycle === 'suspending' || durable?.lifecycle === 'resuming' || durable?.lifecycle === 'stopping' || durable?.lifecycle === 'quarantined') {
     const snapshot = await snapshotOutcome({ signal, timeoutMs: 5_000 });
     if (!snapshot.ok) throwHerdrFailure(snapshot);
     const observation = runtimeObservation(snapshot.result.snapshot, durable);
@@ -3355,6 +3658,14 @@ export async function agentStop({ agentId }, signal) {
     throw error;
   }
 
+  if (durable) {
+    await reserveLifecycleTransition(agentId, {
+      from: 'active',
+      to: 'stopping',
+      runtimeAgentId: owned.runtimeAgentId,
+      runtimeWorkspaceId: workspaceId,
+    });
+  }
   const outcome = await runHerdr(['workspace', 'close', workspaceId], { timeoutMs: 30_000, signal });
   if (!outcome.ok) throwHerdrFailure(outcome);
   await updateAgentMetadata(agentId, null);

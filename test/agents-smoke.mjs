@@ -1,4 +1,4 @@
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -286,6 +286,12 @@ if (args[0] === 'server') {
 } else if (args[0] === 'agent' && args[1] === 'prompt') {
   const agent = state.agents[args[2]];
   if (!agent) fail('agent_not_found', 'agent not found');
+  if (state.delayBeforePromptMutationFor === args[2]) {
+    delete state.delayBeforePromptMutationFor;
+    writeState(state);
+    await new Promise((resolve) => setTimeout(resolve, 1_500));
+    fail('prompt_not_mutated', 'synthetic crash window before prompt mutation');
+  }
   const prompt = args[3];
   state.promptCount = (state.promptCount ?? 0) + 1;
   agent.transcript += '\n> ' + prompt + '\nFAKE_RESPONSE';
@@ -521,32 +527,47 @@ try {
   state.delayPromptResponseFor = restartedRecoveryRuntimeId;
   state.delayPromptResponseMs = 5_000;
   await fs.writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, 'utf8');
-  const restartedController = new AbortController();
-  const restartedPrompt = agentPrompt({
-    agentId: restartedRecoveryAgent.agent.agentId,
-    requestId: 'restart-recovery-1',
-    task: 'RESTART_RECOVERY_TASK',
-    wait: true,
-    timeoutMs: 10_000,
-  }, restartedController.signal);
+  const childEnv = { ...process.env };
+  delete childEnv.CODEX_HOME;
+  const crashedOwnerSource = `
+import { agentPrompt } from ${JSON.stringify(pathToFileURL(path.join(projectRoot, 'src', 'agents.js')).href)};
+await agentPrompt({
+  agentId: ${JSON.stringify(restartedRecoveryAgent.agent.agentId)},
+  requestId: 'restart-recovery-1',
+  task: 'RESTART_RECOVERY_TASK',
+  wait: true,
+  timeoutMs: 10_000,
+});
+`;
+  const crashedOwner = spawn(process.execPath, ['--input-type=module', '-e', crashedOwnerSource], {
+    cwd: root,
+    env: childEnv,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let crashedOwnerStderr = '';
+  crashedOwner.stderr.on('data', (chunk) => { crashedOwnerStderr += chunk.toString('utf8'); });
   let restartedDone = false;
-  for (let attempt = 0; attempt < 100; attempt += 1) {
+  for (let attempt = 0; attempt < 150; attempt += 1) {
     await new Promise((resolve) => setTimeout(resolve, 20));
     state = JSON.parse(await fs.readFile(statePath, 'utf8'));
-    if (state.agents[restartedRecoveryRuntimeId]?.agent_status === 'done' && state.agents[restartedRecoveryRuntimeId].transcript.includes('RESTART_RECOVERY_TASK')) {
+    const transcript = state.agents[restartedRecoveryRuntimeId]?.transcript ?? '';
+    if (state.agents[restartedRecoveryRuntimeId]?.agent_status === 'done' && transcript.includes('RESTART_RECOVERY_TASK') && transcript.includes('agent-vm-mcp-request:')) {
       restartedDone = true;
       break;
     }
   }
-  if (!restartedDone) throw new Error('Process-recovery test never observed Herdr done');
+  if (!restartedDone) {
+    crashedOwner.kill('SIGKILL');
+    throw new Error(`Process-recovery test never observed Herdr done/marker: ${crashedOwnerStderr}`);
+  }
+  crashedOwner.kill('SIGKILL');
+  await new Promise((resolve) => crashedOwner.once('exit', resolve));
   const recoveryProbeSource = `
 import { agentCapabilities, agentPromptResult } from ${JSON.stringify(pathToFileURL(path.join(projectRoot, 'src', 'agents.js')).href)};
 const capabilities = await agentCapabilities();
 const result = await agentPromptResult({ requestId: 'restart-recovery-1' });
 process.stdout.write(JSON.stringify({ capabilities: capabilities.runtime.session, result }));
 `;
-  const childEnv = { ...process.env };
-  delete childEnv.CODEX_HOME;
   const recoveryProbe = await execFileAsync(process.execPath, ['--input-type=module', '-e', recoveryProbeSource], {
     cwd: root,
     env: childEnv,
@@ -562,10 +583,165 @@ process.stdout.write(JSON.stringify({ capabilities: capabilities.runtime.session
   ) {
     throw new Error(`Active+done reconciliation did not persist before cleanup: ${JSON.stringify(restartedResult)}`);
   }
-  restartedController.abort();
-  await restartedPrompt.catch(() => {});
   await agentPromptResult({ requestId: 'restart-recovery-1', ack: true });
   await agentStop({ agentId: restartedRecoveryAgent.agent.agentId });
+
+  const crashBeforeDispatchAgent = await agentStart({ harness: 'agy', cwd: root, timeoutMs: 10_000 });
+  state = JSON.parse(await fs.readFile(statePath, 'utf8'));
+  const crashBeforeDispatchRuntimeId = crashBeforeDispatchAgent.agent.runtimeAgentId;
+  delete state.promptResultStatus;
+  delete state.promptFailure;
+  state.delayBeforePromptMutationFor = crashBeforeDispatchRuntimeId;
+  const crashBeforeDispatchCount = state.promptCount ?? 0;
+  await fs.writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, 'utf8');
+  const crashBeforeDispatchSource = `
+import { agentPrompt } from ${JSON.stringify(pathToFileURL(path.join(projectRoot, 'src', 'agents.js')).href)};
+await agentPrompt({
+  agentId: ${JSON.stringify(crashBeforeDispatchAgent.agent.agentId)},
+  requestId: 'crash-before-dispatch-1',
+  task: 'MUST_NOT_BE_FALSELY_ATTRIBUTED',
+  wait: true,
+  timeoutMs: 10_000,
+});
+`;
+  const crashBeforeDispatchOwner = spawn(process.execPath, ['--input-type=module', '-e', crashBeforeDispatchSource], {
+    cwd: root,
+    env: childEnv,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let crashBeforeDispatchArmed = false;
+  for (let attempt = 0; attempt < 150; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const metadata = JSON.parse(await fs.readFile(metadataPath, 'utf8'));
+    state = JSON.parse(await fs.readFile(statePath, 'utf8'));
+    if (metadata.completions?.['crash-before-dispatch-1']?.state === 'in_flight' && state.delayBeforePromptMutationFor === undefined) {
+      crashBeforeDispatchArmed = true;
+      break;
+    }
+  }
+  if (!crashBeforeDispatchArmed) {
+    crashBeforeDispatchOwner.kill('SIGKILL');
+    throw new Error('Crash-before-dispatch test never reached durable claim/pre-mutation window');
+  }
+  crashBeforeDispatchOwner.kill('SIGKILL');
+  await new Promise((resolve) => crashBeforeDispatchOwner.once('exit', resolve));
+  state = JSON.parse(await fs.readFile(statePath, 'utf8'));
+  const crashRuntime = state.agents[crashBeforeDispatchRuntimeId];
+  crashRuntime.agent_status = 'done';
+  crashRuntime.state_change_seq += 2;
+  crashRuntime.transcript += '\nUNRELATED_STATE_CHANGE';
+  await fs.writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, 'utf8');
+  const crashBeforeDispatchResultSource = `
+import { agentPromptResult } from ${JSON.stringify(pathToFileURL(path.join(projectRoot, 'src', 'agents.js')).href)};
+process.stdout.write(JSON.stringify(await agentPromptResult({ requestId: 'crash-before-dispatch-1' })));
+`;
+  const crashBeforeDispatchResult = JSON.parse((await execFileAsync(process.execPath, ['--input-type=module', '-e', crashBeforeDispatchResultSource], {
+    cwd: root,
+    env: childEnv,
+    maxBuffer: 2 * 1024 * 1024,
+  })).stdout);
+  if (
+    !crashBeforeDispatchResult.found ||
+    crashBeforeDispatchResult.completion?.state !== 'uncertain' ||
+    crashBeforeDispatchResult.result?.accepted !== null ||
+    crashBeforeDispatchResult.result?.transcript?.includes('agent-vm-mcp-request:')
+  ) {
+    throw new Error(`Crash before prompt mutation was falsely attributed as submitted: ${JSON.stringify(crashBeforeDispatchResult)}`);
+  }
+  const crashBeforeDispatchAck = await agentPromptResult({ requestId: 'crash-before-dispatch-1', ack: true });
+  if (!crashBeforeDispatchAck.acked || crashBeforeDispatchAck.completion?.state !== 'uncertain') {
+    throw new Error(`Uncertain result acknowledgement changed safety state: ${JSON.stringify(crashBeforeDispatchAck)}`);
+  }
+  const crashBeforeDispatchDifferent = await agentPrompt({
+    agentId: crashBeforeDispatchAgent.agent.agentId,
+    requestId: 'crash-before-dispatch-2',
+    task: 'MUST_STAY_BLOCKED_AFTER_UNCERTAIN_ACK',
+    wait: true,
+    timeoutMs: 5_000,
+  });
+  const crashBeforeDispatchSame = await agentPrompt({
+    agentId: crashBeforeDispatchAgent.agent.agentId,
+    requestId: 'crash-before-dispatch-1',
+    task: 'MUST_NOT_BE_FALSELY_ATTRIBUTED',
+    wait: true,
+    timeoutMs: 5_000,
+  });
+  state = JSON.parse(await fs.readFile(statePath, 'utf8'));
+  if (
+    crashBeforeDispatchDifferent.error?.code !== 'agent_prompt_in_flight' ||
+    crashBeforeDispatchSame.resultState !== 'uncertain' ||
+    state.promptCount !== crashBeforeDispatchCount ||
+    state.agents[crashBeforeDispatchRuntimeId].transcript.includes('MUST_STAY_BLOCKED_AFTER_UNCERTAIN_ACK')
+  ) {
+    throw new Error(`Uncertain request did not remain fail-closed/idempotent after acknowledgement: ${JSON.stringify({ crashBeforeDispatchDifferent, crashBeforeDispatchSame, promptCount: state.promptCount })}`);
+  }
+  const crashBeforeDispatchMetadata = JSON.parse(await fs.readFile(metadataPath, 'utf8'));
+  const crashBeforeDispatchMarker = crashBeforeDispatchMetadata.completions['crash-before-dispatch-1'].submissionMarker;
+  state.agents[crashBeforeDispatchRuntimeId].transcript += `\n[${crashBeforeDispatchMarker}]`;
+  await fs.writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, 'utf8');
+  const crashBeforeDispatchResolved = await agentPromptResult({ requestId: 'crash-before-dispatch-1' });
+  if (crashBeforeDispatchResolved.completion?.state !== 'completed' || !crashBeforeDispatchResolved.result?.transcript.includes(crashBeforeDispatchMarker)) {
+    throw new Error(`Submission marker did not resolve previously uncertain crash result: ${JSON.stringify(crashBeforeDispatchResolved)}`);
+  }
+  await agentStop({ agentId: crashBeforeDispatchAgent.agent.agentId });
+
+  const noWaitCrashAgent = await agentStart({ harness: 'agy', cwd: root, timeoutMs: 10_000 });
+  state = JSON.parse(await fs.readFile(statePath, 'utf8'));
+  const noWaitCrashRuntimeId = noWaitCrashAgent.agent.runtimeAgentId;
+  delete state.promptResultStatus;
+  delete state.promptFailure;
+  state.delayPromptResponseFor = noWaitCrashRuntimeId;
+  state.delayPromptResponseMs = 5_000;
+  await fs.writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, 'utf8');
+  const noWaitCrashSource = `
+import { agentPrompt } from ${JSON.stringify(pathToFileURL(path.join(projectRoot, 'src', 'agents.js')).href)};
+await agentPrompt({
+  agentId: ${JSON.stringify(noWaitCrashAgent.agent.agentId)},
+  requestId: 'wait-false-crash-1',
+  task: 'WAIT_FALSE_CRASH_TASK',
+  wait: false,
+  timeoutMs: 10_000,
+});
+`;
+  const noWaitCrashOwner = spawn(process.execPath, ['--input-type=module', '-e', noWaitCrashSource], {
+    cwd: root,
+    env: childEnv,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let noWaitCrashSubmitted = false;
+  for (let attempt = 0; attempt < 150; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    state = JSON.parse(await fs.readFile(statePath, 'utf8'));
+    if ((state.agents[noWaitCrashRuntimeId]?.transcript ?? '').includes('WAIT_FALSE_CRASH_TASK') && (state.agents[noWaitCrashRuntimeId]?.transcript ?? '').includes('agent-vm-mcp-request:')) {
+      noWaitCrashSubmitted = true;
+      break;
+    }
+  }
+  if (!noWaitCrashSubmitted) {
+    noWaitCrashOwner.kill('SIGKILL');
+    throw new Error('wait=false crash test never observed prompt submission marker');
+  }
+  noWaitCrashOwner.kill('SIGKILL');
+  await new Promise((resolve) => noWaitCrashOwner.once('exit', resolve));
+  const noWaitCrashResultSource = `
+import { agentPromptResult } from ${JSON.stringify(pathToFileURL(path.join(projectRoot, 'src', 'agents.js')).href)};
+process.stdout.write(JSON.stringify(await agentPromptResult({ requestId: 'wait-false-crash-1' })));
+`;
+  const noWaitCrashResult = JSON.parse((await execFileAsync(process.execPath, ['--input-type=module', '-e', noWaitCrashResultSource], {
+    cwd: root,
+    env: childEnv,
+    maxBuffer: 2 * 1024 * 1024,
+  })).stdout);
+  if (
+    noWaitCrashResult.completion?.state !== 'completed' ||
+    noWaitCrashResult.result?.accepted !== true ||
+    noWaitCrashResult.result?.submission?.waitCompleted !== false ||
+    noWaitCrashResult.result?.runtimeDisposition?.reason !== 'wait_disabled' ||
+    !noWaitCrashResult.result?.transcript.includes('WAIT_FALSE_CRASH_TASK')
+  ) {
+    throw new Error(`wait=false owner crash did not converge to durable result: ${JSON.stringify(noWaitCrashResult)}`);
+  }
+  await agentStop({ agentId: noWaitCrashAgent.agent.agentId });
 
   const joinedAgent = await agentStart({ harness: 'agy', cwd: root, timeoutMs: 10_000 });
   state = JSON.parse(await fs.readFile(statePath, 'utf8'));
@@ -619,6 +795,116 @@ process.stdout.write(JSON.stringify({ capabilities: capabilities.runtime.session
   delete state.promptFailure;
   await fs.writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, 'utf8');
   await agentStop({ agentId: joinedAgent.agent.agentId });
+
+  const generationFenceAgent = await agentStart({ harness: 'agy', cwd: root, timeoutMs: 10_000 });
+  state = JSON.parse(await fs.readFile(statePath, 'utf8'));
+  const generationFenceRuntimeId = generationFenceAgent.agent.runtimeAgentId;
+  const generationFenceWorkspaceId = state.agents[generationFenceRuntimeId].workspace_id;
+  const generationFenceCount = state.promptCount ?? 0;
+  const originalReadFileForGenerationFence = fs.readFile;
+  let generationFenceInjected = false;
+  fs.readFile = async (candidate, ...args) => {
+    const value = await originalReadFileForGenerationFence(candidate, ...args);
+    if (!generationFenceInjected && path.resolve(String(candidate)) === path.resolve(metadataPath)) {
+      const text = typeof value === 'string' ? value : value.toString('utf8');
+      const metadata = JSON.parse(text);
+      if (metadata.completions?.['generation-before-dispatch-1']?.state === 'in_flight') {
+        generationFenceInjected = true;
+        metadata.agents[generationFenceAgent.agent.agentId].runtimeWorkspaceId = 'w-generation-raced';
+        await fs.writeFile(metadataPath, `${JSON.stringify(metadata, null, 2)}\n`, 'utf8');
+        return typeof value === 'string' ? `${JSON.stringify(metadata, null, 2)}\n` : Buffer.from(`${JSON.stringify(metadata, null, 2)}\n`);
+      }
+    }
+    return value;
+  };
+  let generationFenceResult;
+  try {
+    generationFenceResult = await agentPrompt({
+      agentId: generationFenceAgent.agent.agentId,
+      requestId: 'generation-before-dispatch-1',
+      task: 'MUST_NOT_DISPATCH_AFTER_GENERATION_CHANGE',
+      wait: true,
+      timeoutMs: 10_000,
+    });
+  } finally {
+    fs.readFile = originalReadFileForGenerationFence;
+  }
+  if (!generationFenceInjected) throw new Error('Generation-before-dispatch race was not injected after durable claim');
+  state = JSON.parse(await fs.readFile(statePath, 'utf8'));
+  if (
+    generationFenceResult.accepted !== false ||
+    generationFenceResult.submission?.state !== 'not_submitted' ||
+    generationFenceResult.error?.cause?.code !== 'agent_runtime_generation_changed' ||
+    state.promptCount !== generationFenceCount ||
+    state.agents[generationFenceRuntimeId].transcript.includes('MUST_NOT_DISPATCH_AFTER_GENERATION_CHANGE')
+  ) {
+    throw new Error(`Generation changed after claim but prompt was not failed closed: ${JSON.stringify({ generationFenceResult, promptCount: state.promptCount })}`);
+  }
+  let generationFenceMetadata = JSON.parse(await fs.readFile(metadataPath, 'utf8'));
+  if (generationFenceMetadata.completions?.['generation-before-dispatch-1']) {
+    throw new Error('Generation-mismatched pre-dispatch claim was not removed as definitely not submitted');
+  }
+  generationFenceMetadata.agents[generationFenceAgent.agent.agentId].runtimeAgentId = generationFenceRuntimeId;
+  generationFenceMetadata.agents[generationFenceAgent.agent.agentId].runtimeWorkspaceId = generationFenceWorkspaceId;
+  generationFenceMetadata.agents[generationFenceAgent.agent.agentId].lifecycle = 'active';
+  await fs.writeFile(metadataPath, `${JSON.stringify(generationFenceMetadata, null, 2)}\n`, 'utf8');
+  await agentStop({ agentId: generationFenceAgent.agent.agentId });
+
+  const cleanupGenerationAgent = await agentStart({ harness: 'agy', cwd: root, timeoutMs: 10_000 });
+  state = JSON.parse(await fs.readFile(statePath, 'utf8'));
+  const cleanupGenerationRuntimeId = cleanupGenerationAgent.agent.runtimeAgentId;
+  const cleanupGenerationWorkspaceId = state.agents[cleanupGenerationRuntimeId].workspace_id;
+  state.promptResultStatus = 'done';
+  await fs.writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, 'utf8');
+  const originalReadFileForCleanupGeneration = fs.readFile;
+  let cleanupGenerationInjected = false;
+  fs.readFile = async (candidate, ...args) => {
+    const value = await originalReadFileForCleanupGeneration(candidate, ...args);
+    if (!cleanupGenerationInjected && path.resolve(String(candidate)) === path.resolve(metadataPath)) {
+      const text = typeof value === 'string' ? value : value.toString('utf8');
+      const metadata = JSON.parse(text);
+      const completion = metadata.completions?.['cleanup-generation-race-1'];
+      if (completion?.state === 'completed' && completion.result?.runtimeDisposition?.action === 'pending') {
+        cleanupGenerationInjected = true;
+        metadata.agents[cleanupGenerationAgent.agent.agentId].runtimeAgentId = 'agent-ffffffffffffffffffffffffff';
+        metadata.agents[cleanupGenerationAgent.agent.agentId].runtimeWorkspaceId = 'w-new-generation';
+        await fs.writeFile(metadataPath, `${JSON.stringify(metadata, null, 2)}\n`, 'utf8');
+        return typeof value === 'string' ? `${JSON.stringify(metadata, null, 2)}\n` : Buffer.from(`${JSON.stringify(metadata, null, 2)}\n`);
+      }
+    }
+    return value;
+  };
+  let cleanupGenerationResult;
+  try {
+    cleanupGenerationResult = await agentPrompt({
+      agentId: cleanupGenerationAgent.agent.agentId,
+      requestId: 'cleanup-generation-race-1',
+      task: 'COMPLETE_BUT_DO_NOT_CLOSE_NEW_GENERATION',
+      wait: true,
+      timeoutMs: 10_000,
+    });
+  } finally {
+    fs.readFile = originalReadFileForCleanupGeneration;
+  }
+  if (!cleanupGenerationInjected) throw new Error('Cleanup generation race was not injected after durable completion persistence');
+  state = JSON.parse(await fs.readFile(statePath, 'utf8'));
+  if (
+    cleanupGenerationResult.runtimeDisposition?.action !== 'retained' ||
+    cleanupGenerationResult.runtimeDisposition?.reason !== 'runtime_generation_changed' ||
+    !state.agents[cleanupGenerationRuntimeId] ||
+    !state.workspaces[cleanupGenerationWorkspaceId]
+  ) {
+    throw new Error(`Completion cleanup touched or failed to fence a newer generation: ${JSON.stringify({ cleanupGenerationResult, state })}`);
+  }
+  let cleanupGenerationMetadata = JSON.parse(await fs.readFile(metadataPath, 'utf8'));
+  cleanupGenerationMetadata.agents[cleanupGenerationAgent.agent.agentId].runtimeAgentId = cleanupGenerationRuntimeId;
+  cleanupGenerationMetadata.agents[cleanupGenerationAgent.agent.agentId].runtimeWorkspaceId = cleanupGenerationWorkspaceId;
+  cleanupGenerationMetadata.agents[cleanupGenerationAgent.agent.agentId].lifecycle = 'active';
+  await fs.writeFile(metadataPath, `${JSON.stringify(cleanupGenerationMetadata, null, 2)}\n`, 'utf8');
+  state = JSON.parse(await fs.readFile(statePath, 'utf8'));
+  delete state.promptResultStatus;
+  await fs.writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, 'utf8');
+  await agentStop({ agentId: cleanupGenerationAgent.agent.agentId });
 
   const busyAgent = await agentStart({ harness: 'agy', cwd: root, timeoutMs: 10_000 });
   state = JSON.parse(await fs.readFile(statePath, 'utf8'));
@@ -677,6 +963,34 @@ process.stdout.write(JSON.stringify(result));
     state.agents[busyAgent.agent.agentId].transcript.includes('BUSY_CROSS_PROCESS_TASK')
   ) {
     throw new Error(`Different process was not rejected by durable busy state: ${JSON.stringify({ crossProcessBusy, promptCount: state.promptCount })}`);
+  }
+  const lifecycleBusySource = `
+import { agentStop, agentSuspend } from ${JSON.stringify(pathToFileURL(path.join(projectRoot, 'src', 'agents.js')).href)};
+const agentId = ${JSON.stringify(busyAgent.agent.agentId)};
+const result = {};
+for (const [name, fn] of [['stop', agentStop], ['suspend', agentSuspend]]) {
+  try {
+    await fn({ agentId });
+    result[name] = { ok: true };
+  } catch (error) {
+    result[name] = { ok: false, code: error?.code ?? error?.herdr?.code ?? null, message: error?.message ?? String(error) };
+  }
+}
+process.stdout.write(JSON.stringify(result));
+`;
+  const lifecycleBusy = JSON.parse((await execFileAsync(process.execPath, ['--input-type=module', '-e', lifecycleBusySource], {
+    cwd: root,
+    env: childEnv,
+    maxBuffer: 2 * 1024 * 1024,
+  })).stdout);
+  state = JSON.parse(await fs.readFile(statePath, 'utf8'));
+  if (
+    lifecycleBusy.stop?.code !== 'agent_prompt_in_flight' ||
+    lifecycleBusy.suspend?.code !== 'agent_prompt_in_flight' ||
+    !state.agents[busyAgent.agent.runtimeAgentId] ||
+    !state.workspaces[state.agents[busyAgent.agent.runtimeAgentId].workspace_id]
+  ) {
+    throw new Error(`Cross-process lifecycle mutation escaped prompt fence: ${JSON.stringify({ lifecycleBusy, state })}`);
   }
   busyController.abort();
   await busyFirst.catch(() => {});
