@@ -310,10 +310,6 @@ async function discoverCurated({ inventory, config, capabilitiesConfig, agentRun
       executable = harness?.path ?? null;
       version = harness?.version ?? null;
       item.available = harness?.available ?? false;
-    } else if (definition.name === 'herdr' && agentRuntime?.runtime?.kind === 'herdr') {
-      executable = agentRuntime.runtime.path ?? null;
-      version = agentRuntime.runtime.version ?? null;
-      item.available = agentRuntime.runtime.available ?? false;
     } else {
       executable = await deps.findExecutable(definition.name);
       item.available = executable !== null;

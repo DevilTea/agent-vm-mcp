@@ -9,7 +9,7 @@ if len(sys.argv) != 3:
 
 source = pathlib.Path(sys.argv[1])
 destination = pathlib.Path(sys.argv[2])
-keys = ['AGENT_USER', 'AGENT_GROUP', 'AGENT_HOME', 'MISE_SHIMS', 'HERDR_BIN', 'HERDR_SESSION']
+keys = ['AGENT_USER', 'AGENT_GROUP', 'AGENT_HOME', 'MISE_SHIMS']
 text = source.read_text()
 for key in keys:
     try:

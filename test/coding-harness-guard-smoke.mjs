@@ -11,8 +11,8 @@ function expectBlocked(command, harness) {
     if (error?.code !== 'raw_coding_harness_launch_forbidden') {
       throw new Error(`Unexpected guard error for ${JSON.stringify(command)}: ${error?.stack ?? error}`);
     }
-    if (!error.message.includes(harness) || !error.message.includes('agent_start')) {
-      throw new Error(`Guard error did not identify ${harness} and agent_start: ${error.message}`);
+    if (!error.message.includes(harness) || !error.message.includes('agent_run')) {
+      throw new Error(`Guard error did not identify ${harness} and agent_run: ${error.message}`);
     }
     return;
   }

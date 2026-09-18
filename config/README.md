@@ -253,9 +253,9 @@ The audit is fail-soft for source/network failures: affected items remain visibl
 
 ## Host profile
 
-MCP-managed Codex launches and resumes are always fixed to `gpt-5.6-luna` with reasoning effort `max`; this is an invariant of `agent-vm-mcp`, not optional deployment configuration. Omitted model/effort values are injected, the exact pair is accepted, and any other explicit model or effort fails with `agent_launch_policy_violation`. Durable logical-agent metadata records the fixed policy/profile fingerprint; absent or mismatched provenance is quarantined and cannot resume. Codex may append its own `[projects."..."]` `trust_level = "trusted"` entries after an explicit workspace-trust decision; those narrowly-scoped trust entries are accepted without weakening verification of the fixed model, effort, developer instructions, or downstream-agent defaults. `agent_stop` preserves exact-ownership cleanup for quarantined launch/runtime records.
+Bounded MCP-managed Codex runs are fixed to `gpt-5.6-luna` with reasoning effort `max`; this is an invariant of `agent_run`, not optional deployment configuration. Antigravity runs use non-interactive print mode with structured stream output. The caller owns task decomposition, Git/workspace state, verification, and any decision to continue from a native harness conversation ID.
 
-Each MCP-managed Codex workspace receives a session-scoped Codex profile with fixed root and default subagent model/effort plus managed developer instructions requiring downstream Codex delegation, including `x-review`, to remain `gpt-5.6-luna`/`max`. Codex CLI 0.153.2 exposes no immutable deny-override primitive, so an explicit in-session subagent override remains a residual limitation. Ordinary/manual Codex usage outside `agent_start`/`agent_resume`, including generic `exec`/`process_start`, is not covered by this policy.
+Interactive fallback is deliberately transport-only: use tmux and inspect raw TUI output. Do not infer durable lifecycle state from terminal wording, and do not auto-approve workspace trust, command permissions, hooks, or similar security-sensitive prompts.
 
 `AGENT_MCP_HOST` is connection/deployment context rather than a normal tool argument.
 
@@ -270,4 +270,4 @@ Host-specific behavior should remain isolated here. Prefer standard MCP content/
 
 The repository's Ubuntu provisioners remain opinionated and may create systemd units or `/opt/...` installations. Those are deployment choices, not portable source defaults.
 
-`config/examples/systemd/` contains optional drop-ins showing how a separately managed tunnel service can depend on Herdr or browser services. The core runtime does not require or manage an `agent-tunnel.service`.
+`config/examples/systemd/` contains optional drop-ins showing how a separately managed tunnel service can depend on browser services. The core runtime does not require or manage an `agent-tunnel.service`.

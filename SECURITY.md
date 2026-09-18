@@ -24,7 +24,7 @@ The following are intentional capabilities or deployment properties and are not 
 - persistent process control;
 - an authorized agent reading VM-local or VM-reachable credentials;
 - Docker-group access granting broad host/container control inside the dedicated VM;
-- Herdr workspaces, browser profiles, LSP host policies, path checks, or ownership markers not isolating processes that already share the same trusted Linux user;
+- browser profiles, LSP host policies, path checks, workspaces, or ownership markers not isolating processes that already share the same trusted Linux user;
 - an operator deliberately exposing additional files, mounts, services, credentials, or network access to the VM.
 
 Those mechanisms may still contain correctness bugs. A report is security-relevant when it crosses the documented trust boundary or grants capabilities to a party that was not already authorized for equivalent VM access.

@@ -26,7 +26,6 @@
     { "name": "systemctl", "category": "system", "summary": "systemd service manager", "versionArgs": ["--version"] },
     { "name": "journalctl", "category": "system", "summary": "systemd journal query tool", "versionArgs": ["--version"] },
     { "name": "docker", "category": "container", "summary": "Docker Engine CLI", "versionArgs": ["--version"] },
-    { "name": "herdr", "category": "agent-runtime", "summary": "Persistent terminal workspace runtime for coding agents", "versionArgs": ["--version"] },
     { "name": "codex", "category": "agent-harness", "summary": "OpenAI Codex CLI coding harness", "versionArgs": ["--version"] },
     { "name": "agy", "category": "agent-harness", "summary": "Google Antigravity CLI coding harness", "versionArgs": ["--version"] },
     { "name": "claude", "category": "agent-harness", "summary": "Anthropic Claude Code coding harness", "versionArgs": ["--version"] }

@@ -191,8 +191,6 @@ const client = new Client(
       ...process.env,
       ...env,
       MCP_BRIDGES_CONFIG: bridgeConfigPath,
-      AGENT_HERDR_BIN: path.join(root, 'missing-herdr'),
-      AGENT_HERDR_BOOTSTRAP: 'external',
     },
     stderr: 'pipe',
   });

@@ -46,14 +46,10 @@ mise_data_dir="$agent_home/.local/share/mise"
 mise_shims="$mise_data_dir/shims"
 node_version=24.20.0
 pnpm_version=11.25.0
-herdr_version=0.8.2
-herdr_session=agent-vm-mcp
 node_bin="$mise_data_dir/installs/node/$node_version/bin/node"
 node_bin_dir="$(dirname "$node_bin")"
 node_corepack_bin="$node_bin_dir/corepack"
 pnpm_bin="$mise_data_dir/installs/pnpm/$pnpm_version/pnpm"
-herdr_bin="$mise_data_dir/installs/herdr/$herdr_version/herdr"
-herdr_service_template="$repo_root/config/systemd/agent-herdr.service.template"
 legacy_pnpm_bin="$agent_home/.local/share/pnpm/bin"
 legacy_node="$legacy_pnpm_bin/node"
 
@@ -141,8 +137,7 @@ PY_ARCH
 apt-get update
 apt-get install -y --no-install-recommends mise
 
-# The dedicated agent must own its XDG config root so tools such as Herdr and
-# browser runtimes can create their own sibling configuration directories.
+# The dedicated agent must own its XDG config root so browser and other runtimes can create sibling configuration directories.
 install -d -m 0755 -o "$agent_user" -g "$agent_group" "$agent_config_root"
 install -d -m 0755 -o "$agent_user" -g "$agent_group" "$mise_config_dir"
 install -m 0644 -o "$agent_user" -g "$agent_group" "$mise_config_source" "$mise_config"
@@ -157,7 +152,7 @@ run_as_agent() {
     "$@"
 }
 
-run_as_agent /usr/bin/mise install "node@$node_version" "pnpm@$pnpm_version" "herdr@$herdr_version"
+run_as_agent /usr/bin/mise install "node@$node_version" "pnpm@$pnpm_version"
 
 # A legacy `corepack enable` can leave pnpm/pnpx shims inside the pinned Node
 # installation. Those binaries precede the standalone mise-managed pnpm in
@@ -177,14 +172,6 @@ if [[ ! -x $node_bin ]]; then
 fi
 if [[ ! -x $pnpm_bin ]]; then
   echo "Pinned mise-managed pnpm executable is missing: $pnpm_bin" >&2
-  exit 1
-fi
-if [[ ! -x $herdr_bin ]]; then
-  echo "Pinned mise-managed Herdr executable is missing: $herdr_bin" >&2
-  exit 1
-fi
-if [[ ! -r $herdr_service_template ]]; then
-  echo "Missing repo-managed Herdr systemd template." >&2
   exit 1
 fi
 
@@ -232,13 +219,9 @@ render_systemd_template() {
   AGENT_GROUP="$agent_group" \
   AGENT_HOME="$agent_home" \
   MISE_SHIMS="$mise_shims" \
-  HERDR_BIN="$herdr_bin" \
-  HERDR_SESSION="$herdr_session" \
   python3 "$repo_root/scripts/render-systemd-template.py" "$source" "$destination"
   chmod 0644 "$destination"
 }
-
-render_systemd_template "$herdr_service_template" /etc/systemd/system/agent-herdr.service
 
 bashrc="$agent_home/.bashrc"
 if [[ -f $bashrc ]]; then
@@ -260,7 +243,6 @@ PY
 fi
 
 systemctl daemon-reload
-systemctl enable agent-herdr.service
 
 tool_path="$mise_shims:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 run_as_agent env PATH="$tool_path" node --version
@@ -271,7 +253,6 @@ if [[ $resolved_pnpm_path != "$pnpm_bin" || $resolved_pnpm_version != "$pnpm_ver
   exit 1
 fi
 printf 'pnpm %s (%s)\n' "$resolved_pnpm_version" "$resolved_pnpm_path"
-run_as_agent env PATH="$tool_path" herdr --version
 
 if $cleanup_legacy; then
   stale_refs=$(rg -l --fixed-strings "$legacy_pnpm_bin" \
@@ -292,4 +273,3 @@ else
 fi
 
 echo "mise toolchain provisioned for $agent_user."
-echo "Herdr runtime service installed and enabled; start/restart it separately when using external bootstrap."

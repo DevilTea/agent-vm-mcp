@@ -17,7 +17,7 @@ flowchart LR
     subgraph VM[Dedicated Agent VM / customer trust boundary]
         T[tunnel-client<br/>long-lived daemon]
         M[agent-vm-mcp<br/>stdio MCP server]
-        H[Herdr / coding harnesses]
+        H[bounded coding harnesses]
         P[Playwright MCP]
         L[Language Server MCP]
 
@@ -232,7 +232,7 @@ KillMode=control-group
 WantedBy=multi-user.target
 ```
 
-Replace `/absolute/path/from-command-v/tunnel-client` with the absolute path returned by `command -v tunnel-client`. The explicit `PATH` keeps the `agent-vm-mcp` child able to discover mise-managed and user-local tools such as Herdr and coding harnesses.
+Replace `/absolute/path/from-command-v/tunnel-client` with the absolute path returned by `command -v tunnel-client`. The explicit `PATH` keeps the `agent-vm-mcp` child able to discover mise-managed and user-local tools such as coding harnesses.
 
 Then enable it:
 
@@ -244,9 +244,8 @@ sudo systemctl status agent-tunnel.service
 
 ### Optional service dependencies
 
-`agent-vm-mcp` deliberately does **not** own or manage `agent-tunnel.service`. If your deployment requires Herdr and/or the persistent browser before the tunnel starts, use the optional examples:
+`agent-vm-mcp` deliberately does **not** own or manage `agent-tunnel.service`. If your deployment requires the persistent browser before the tunnel starts, use the optional examples:
 
-- [`../config/examples/systemd/agent-tunnel-herdr.conf.template`](../config/examples/systemd/agent-tunnel-herdr.conf.template)
 - [`../config/examples/systemd/agent-tunnel-browser.conf`](../config/examples/systemd/agent-tunnel-browser.conf)
 
 Install adapted copies as systemd drop-ins under:
