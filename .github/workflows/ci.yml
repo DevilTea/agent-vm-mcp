@@ -38,5 +38,15 @@ jobs:
           pnpm install --frozen-lockfile
           pnpm --dir config/playwright-mcp install --frozen-lockfile --ignore-scripts
 
+      - name: Enforce removed runtime residue policy
+        shell: bash
+        run: |
+          set -euo pipefail
+          removed_runtime='h''erdr'
+          if git grep -n -i "$removed_runtime" -- .; then
+            echo "::error::Removed runtime residue detected in tracked repository content."
+            exit 1
+          fi
+
       - name: Run portable test suite
         run: pnpm test
