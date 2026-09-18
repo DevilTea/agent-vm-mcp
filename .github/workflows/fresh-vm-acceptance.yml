@@ -68,11 +68,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          sudo systemctl start agent-herdr.service
           sudo systemctl start agent-playwright-shared.service
           for unit in \
             docker.service \
-            agent-herdr.service \
             agent-browser-x.service \
             agent-browser-vnc.service \
             agent-browser-novnc.service \
@@ -143,14 +141,12 @@ jobs:
         run: |
           sudo systemctl --no-pager --full status \
             docker.service \
-            agent-herdr.service \
             agent-browser-x.service \
             agent-browser-vnc.service \
             agent-browser-novnc.service \
             agent-playwright-shared.service \
             tailscaled.service || true
           sudo journalctl --no-pager -n 300 \
-            -u agent-herdr.service \
             -u agent-browser-x.service \
             -u agent-browser-vnc.service \
             -u agent-browser-novnc.service \
