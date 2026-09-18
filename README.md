@@ -13,9 +13,9 @@ The native MCP surface includes:
 - bounded filesystem reads, deterministic directory listing, and strict unified-diff patching;
 - managed Git repository stores and isolated Git worktrees;
 - persistent interactive process sessions;
-- bounded coding-agent execution for Codex and Antigravity CLI, with raw tmux as the interactive fallback;
+- managed bounded coding-agent execution for Codex and Antigravity CLI, with no raw harness TUI fallback on the ChatGPT host;
 - CLI capability discovery and a read-only system maintenance audit;
-- host-facing `skill_list`/`skill_read` access to the published dot-agents skill projection;
+- generic-host projected-skill access; the ChatGPT host intentionally exposes no dot-agents skill surface;
 - opaque MCP artifact resources and host-native file/image presentation;
 - upstream MCP bridging over stdio or Streamable HTTP, with tool filtering, prefixing, renaming, adapters, and call policies.
 
@@ -73,7 +73,7 @@ The main configuration files are:
 | System audit | `system-audit.json` | `AGENT_MCP_SYSTEM_AUDIT_CONFIG` |
 | Shared Playwright stdio proxy | `playwright-shared-proxy.json` | `PLAYWRIGHT_SHARED_PROXY_CONFIG` |
 
-`AGENT_MCP_HOST` selects connection/deployment-specific host behavior. Supported values are `generic` (default) and `chatgpt`. Host-specific extensions are kept out of ordinary tool inputs; for example, ChatGPT file-input metadata is attached to `import_file` only when `AGENT_MCP_HOST=chatgpt`. The ChatGPT profile also enables the structured interaction adapter described below.
+`AGENT_MCP_HOST` selects connection/deployment-specific host behavior. Supported values are `generic` (default) and `chatgpt`. Host-specific extensions are kept out of ordinary tool inputs; for example, ChatGPT file-input metadata is attached to `import_file` only when `AGENT_MCP_HOST=chatgpt`. The ChatGPT profile also enables the structured interaction adapter, disables projected-skill protocol/tools, and forbids interactive terminal session launchers through `exec`/`process_start`.
 
 See [`config/README.md`](config/README.md) for bridge schema, fail-soft/fail-hard behavior, adapters, policies, capability discovery, system-audit configuration, and deployment examples.
 
@@ -101,7 +101,7 @@ The default projection root is:
 ${XDG_DATA_HOME:-$HOME/.local/share}/dot-agents/skill-projection/v1/
 ```
 
-Set `AGENT_MCP_SKILL_PROJECTION_ROOT` to use another projection root. The native `skill_list` and `skill_read` tools remain exposed as compatibility fallbacks for current ChatGPT behavior and delegate to the same validated registry where possible. They do not scan harness directories or infer or expose Codex system skills. Their optional `query` is a case-insensitive substring filter over skill names and descriptions; `skill_read` defaults to `SKILL.md` and reads bounded UTF-8 text from safe relative paths. Missing or invalid projections fail soft for this compatibility surface and do not prevent MCP startup. This repository has not verified that ChatGPT natively consumes SEP-2640, so no native-consumption support is claimed. Projection content is instructions/data, not executable capability.
+Set `AGENT_MCP_SKILL_PROJECTION_ROOT` to use another projection root. On the generic host profile, SEP-2640 and the native `skill_list`/`skill_read` compatibility tools consume the validated projection. The ChatGPT host profile intentionally registers neither surface, so ChatGPT does not consume dot-agents skills directly. Projection content remains instructions/data for hosts that explicitly opt into it.
 
 ## Structured user input
 
@@ -161,11 +161,15 @@ Workspace lifecycle does not install dependencies, trust repository toolchains, 
 
 `process_*` tools manage generic processes owned by the running MCP server. On graceful shutdown, managed process groups receive `SIGTERM` and are escalated to `SIGKILL` after a bounded grace period. These process sessions are not persisted across server restarts.
 
-Normal coding-agent work uses `agent_run`: one explicit bounded task in an existing working directory. The MCP server owns process timeout/cancellation and returns process exit plus structured harness output; it does not infer synthetic `idle`, `blocked`, or `done` states from terminal UI. Codex runs are fixed to `gpt-5.6-luna` with reasoning effort `max`; Antigravity runs use print mode with `stream-json`.
+Normal coding-agent work uses `agent_start` followed by repeated `agent_poll` calls. `agent_start` returns a durable `runId` immediately; each `agent_poll` waits at most 15 seconds, returns incremental stdout/stderr plus structured harness events, and gives orchestration frequent control so it can report progress instead of hiding behind one long MCP call. Terminal runs remain in a bounded in-memory registry so a later turn or conversation can recover them with `agent_result` or `work_status`. Run state does not survive an MCP server restart.
 
-The orchestrator should keep durable truth in Git/workspace state, split work into small verifiable steps, and prefer fresh runs. A native harness continuation ID may be returned as evidence for exceptional follow-up use, but conversation state is not treated as correctness state.
+`agent_run` remains only as a compatibility helper for short blocking work. Its MCP surface defaults to 15 seconds and is hard-capped at 30 seconds. Longer work should use the pollable lifecycle. The MCP server owns process timeout/cancellation and reports only process exit plus structured harness output; it does not infer synthetic `idle`, `blocked`, or `done` states from terminal UI. Codex runs are fixed to `gpt-5.6-luna` with reasoning effort `max`; Antigravity runs use print mode with `stream-json`.
 
-For exceptional interactive work, `tmux` is the fallback transport. The caller should inspect raw captured TUI text and decide what it means. The control plane must not convert TUI wording into lifecycle authority or automatically destroy a session because a screen appears finished.
+`work_status` is the recovery/observability surface for a silent or interrupted turn. It reports recent agent runs (including terminal runs), managed generic processes, and—when given a working directory—Git state plus a bounded filesystem-activity scan. It deliberately does not claim whether the ChatGPT UI or model turn is stuck.
+
+The orchestrator should keep durable truth in Git/workspace state, split work into small verifiable steps, prefer fresh runs, and re-check `work_status` whenever a previous turn may have stopped without a final response. A native harness continuation ID may be returned as evidence for exceptional follow-up use, but conversation state is not treated as correctness state.
+
+Raw coding-harness TUI execution is not a supported fallback. On the ChatGPT host, `exec` and `process_start` reject interactive terminal session launchers (`tmux`, `screen`, and `script`) as well as raw coding-harness execution. Codex and Antigravity work must flow through the managed `agent_*` tools.
 
 ## Read-only maintenance audit
 

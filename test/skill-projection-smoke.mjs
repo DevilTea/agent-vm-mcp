@@ -228,6 +228,7 @@ try {
     env: {
       ...process.env,
       ...env,
+      AGENT_MCP_HOST: 'generic',
       MCP_BRIDGES_CONFIG: bridgeConfigPath,
     },
     stderr: 'pipe',

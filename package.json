@@ -1,6 +1,6 @@
 {
   "name": "agent-vm-mcp",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "private": true,
   "description": "MCP control plane for dedicated Linux agent VMs with pluggable upstream MCP bridges",
   "type": "module",

@@ -11,7 +11,18 @@ import { serveStdio } from '@modelcontextprotocol/server/stdio';
 import * as z from 'zod/v4';
 
 import { McpBridgeManager } from './mcp-bridge.js';
-import { agentCapabilities, agentRun } from './agent-runner.js';
+import {
+  DEFAULT_AGENT_POLL_WAIT_MS,
+  MAX_AGENT_POLL_WAIT_MS,
+  agentCancel,
+  agentCapabilities,
+  agentPoll,
+  agentResult,
+  agentRun,
+  agentRunsSnapshot,
+  agentStart,
+  stopAgentRuns,
+} from './agent-runner.js';
 import { collectCapabilities, inspectCommands } from './capabilities.js';
 import { collectSystemAudit } from './system-audit.js';
 import { createBridgeToolAdapterFactory, validateBridgeToolAdapters } from './adapters/index.js';
@@ -43,12 +54,13 @@ import {
 import { applyUnifiedPatch, listDirectory, readTextFile, waitForFilesystemMutations } from './filesystem.js';
 import { resolveBashExecutable } from './shell.js';
 import { workspaceCreate, workspaceDelete, workspaceList, waitForWorkspaceMutations } from './workspaces.js';
+import { collectWorkStatus } from './work-status.js';
 
 const MAX_PROCESS_STREAM_BYTES = 4 * 1024 * 1024;
 const MAX_PROCESS_SESSIONS = 32;
 const DEFAULT_MAX_FILE_IMPORT_BYTES = 256 * 1024 * 1024;
 const SERVER_NAME = 'agent-vm-control';
-const SERVER_VERSION = '0.5.0';
+const SERVER_VERSION = '0.6.0';
 
 function positiveIntegerFromEnv(name, fallback) {
   const raw = process.env[name];
@@ -117,8 +129,10 @@ function killProcessGroup(child, signal) {
   }
 }
 
-async function executeCommand({ command, cwd, env, timeoutMs }, requestSignal, artifactStore) {
-  assertNoRawCodingHarnessLaunch(command, 'exec');
+async function executeCommand({ command, cwd, env, timeoutMs }, requestSignal, artifactStore, hostProfile) {
+  assertNoRawCodingHarnessLaunch(command, 'exec', {
+    forbidInteractiveTerminalCommands: !hostProfile.allowInteractiveTerminalCommands,
+  });
   const startedAt = Date.now();
   const executionArtifactId = randomUUID();
   const child = spawn(EXECUTION_SHELL, ['-lc', command], {
@@ -258,8 +272,10 @@ function getProcessSession(processId) {
   return session;
 }
 
-function startPersistentProcess({ command, cwd, env }, requestSignal) {
-  assertNoRawCodingHarnessLaunch(command, 'process_start');
+function startPersistentProcess({ command, cwd, env }, requestSignal, hostProfile) {
+  assertNoRawCodingHarnessLaunch(command, 'process_start', {
+    forbidInteractiveTerminalCommands: !hostProfile.allowInteractiveTerminalCommands,
+  });
   pruneFinishedProcesses();
   if (processes.size >= MAX_PROCESS_SESSIONS) {
     throw new Error(`Process session limit reached (${MAX_PROCESS_SESSIONS}). Kill or let existing processes exit first.`);
@@ -287,6 +303,7 @@ function startPersistentProcess({ command, cwd, env }, requestSignal) {
       stdout: new BoundedStreamBuffer(),
       stderr: new BoundedStreamBuffer(),
       startedAt: Date.now(),
+      lastActivityAt: Date.now(),
       exitedAt: null,
       exitCode: null,
       signal: null,
@@ -325,13 +342,20 @@ function startPersistentProcess({ command, cwd, env }, requestSignal) {
       child.off('error', onErrorBeforeSpawn);
       processes.set(session.id, session);
 
-      child.stdout.on('data', (chunk) => session.stdout.append(chunk));
-      child.stderr.on('data', (chunk) => session.stderr.append(chunk));
+      child.stdout.on('data', (chunk) => {
+        session.stdout.append(chunk);
+        session.lastActivityAt = Date.now();
+      });
+      child.stderr.on('data', (chunk) => {
+        session.stderr.append(chunk);
+        session.lastActivityAt = Date.now();
+      });
       child.on('error', (error) => session.stderr.append(`\n${error.stack ?? error.message}\n`));
       child.on('close', (exitCode, signal) => {
         session.exitCode = exitCode;
         session.signal = signal;
         session.exitedAt = Date.now();
+        session.lastActivityAt = session.exitedAt;
       });
 
       resolve(session);
@@ -349,6 +373,7 @@ function processSummary(session) {
     exitCode: session.exitCode,
     signal: session.signal,
     startedAt: new Date(session.startedAt).toISOString(),
+    lastActivityAt: new Date(session.lastActivityAt).toISOString(),
     exitedAt: session.exitedAt === null ? null : new Date(session.exitedAt).toISOString(),
   };
 }
@@ -402,7 +427,12 @@ const BASE_NATIVE_TOOL_NAMES = new Set([
   'workspace_list',
   'workspace_delete',
   'agent_capabilities',
+  'agent_start',
+  'agent_poll',
+  'agent_result',
+  'agent_cancel',
   'agent_run',
+  'work_status',
   'process_start',
   'process_list',
   'process_read',
@@ -417,13 +447,14 @@ const BASE_NATIVE_TOOL_NAMES = new Set([
   READ_ARTIFACT_TOOL,
   PRESENT_ARTIFACT_TOOL,
   PRESENT_FILE_TOOL,
-  SKILL_LIST_TOOL,
-  SKILL_READ_TOOL,
 ]);
+
+const SKILL_NATIVE_TOOL_NAMES = [SKILL_LIST_TOOL, SKILL_READ_TOOL];
 
 async function shutdown() {
   await waitForFilesystemMutations();
   await waitForWorkspaceMutations();
+  await stopAgentRuns();
   await stopManagedProcesses();
   await Promise.allSettled(
     [...activeBridgeManagers].map((manager) => manager.close()),
@@ -443,6 +474,7 @@ async function createServer() {
   const hostProfile = resolveHostProfile();
   const nativeToolNames = new Set([
     ...BASE_NATIVE_TOOL_NAMES,
+    ...(hostProfile.exposeProjectedSkills ? SKILL_NATIVE_TOOL_NAMES : []),
     ...interactionToolNamesForHost(hostProfile),
   ]);
   const catalogTracker = new ToolCatalogTracker();
@@ -459,12 +491,14 @@ async function createServer() {
   activeArtifactStores.add(artifactStore);
   await registerArtifactSystem(server, artifactStore);
   const interactionStore = await registerInteractionsForHost(server, hostProfile);
-  const sepSkillsAdapter = createSepSkillsAdapter();
-  registerSepSkillsExtension(server, sepSkillsAdapter);
-  registerSkillProjectionTools(server, {
-    list: sepSkillsAdapter.listCompatibility,
-    read: sepSkillsAdapter.readCompatibility,
-  });
+  if (hostProfile.exposeProjectedSkills) {
+    const sepSkillsAdapter = createSepSkillsAdapter();
+    registerSepSkillsExtension(server, sepSkillsAdapter);
+    registerSkillProjectionTools(server, {
+      list: sepSkillsAdapter.listCompatibility,
+      read: sepSkillsAdapter.readCompatibility,
+    });
+  }
 
   server.registerTool(
     'exec',
@@ -473,7 +507,7 @@ async function createServer() {
         'Execute an arbitrary shell command on the dedicated disposable Linux agent VM. ' +
         'Oversized stdout/stderr use bounded head/tail previews plus opaque model-only artifacts readable with read_artifact. ' +
         'Use this for commands that complete on their own. For servers, watchers, REPLs, or other long-running/interactive commands, use process_start instead. ' +
-        'Do not launch coding harness work directly through exec; use agent_run for bounded agent work. Harmless --help/--version probes remain allowed; tmux may be used explicitly for raw interactive fallback.',
+        'Do not launch coding harness work directly through exec; use agent_start for normal bounded agent work and agent_run only for short blocking tasks. Harmless --help/--version probes remain allowed. On the ChatGPT host, interactive terminal session launchers such as tmux/screen/script are also forbidden.',
       inputSchema: z.object({
         command: z.string().min(1).describe('Shell command to execute with bash -lc.'),
         cwd: z.string().optional().describe('Working directory. Defaults to the agent user home directory.'),
@@ -487,7 +521,7 @@ async function createServer() {
           .describe('Maximum execution time in milliseconds.'),
       }),
     },
-    async (args, ctx) => execResult(await executeCommand(args, ctx.mcpReq.signal, artifactStore)),
+    async (args, ctx) => execResult(await executeCommand(args, ctx.mcpReq.signal, artifactStore, hostProfile)),
   );
 
   server.registerTool(
@@ -579,30 +613,88 @@ async function createServer() {
     async (args, ctx) => jsonResult(await workspaceDelete(args, ctx.mcpReq.signal)),
   );
 
+  const agentTaskInput = {
+    harness: z.enum(['codex', 'agy']).describe('Bounded coding harness to run.'),
+    cwd: z.string().min(1).describe('Existing working directory for this bounded run.'),
+    task: z.string().min(1).max(100_000).refine((task) => !task.includes('\0'), 'task must not contain NUL characters'),
+    skills: z
+      .array(z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/))
+      .max(16)
+      .default([]),
+  };
+
   server.registerTool(
     'agent_capabilities',
     {
       description:
-        'Discover bounded coding-agent harnesses and the raw tmux interactive fallback. Runtime state is based on process exit and structured harness output; terminal UI is not converted into synthetic idle/blocked/done states.',
+        'Discover managed bounded coding-agent harnesses and polling limits. Runtime state is based only on process exit and structured harness output; raw harness TUI execution is intentionally outside this control plane.',
       inputSchema: z.object({}),
     },
     async () => jsonResult(await agentCapabilities()),
   );
 
   server.registerTool(
+    'agent_start',
+    {
+      description:
+        'Start one coding-agent task and return immediately with a durable runId. Prefer this for normal agent work or anything that may exceed about 15 seconds. Repeatedly call agent_poll so orchestration regains control and can report progress; completed runs remain rediscoverable until the bounded registry prunes old terminal entries.',
+      inputSchema: z.object({
+        ...agentTaskInput,
+        timeoutMs: z.number().int().min(1_000).max(600_000).default(120_000),
+      }),
+    },
+    async (args, ctx) => jsonResult(await agentStart(args, ctx.mcpReq.signal)),
+  );
+
+  server.registerTool(
+    'agent_poll',
+    {
+      description:
+        'Read incremental process and structured-output evidence for an agent_start run. If no unread evidence exists, wait only up to waitMs (maximum 15 seconds) before returning so the caller regains control. Pass returned next offsets into the next poll to receive only new evidence.',
+      inputSchema: z.object({
+        runId: z.string().uuid(),
+        stdoutOffset: z.number().int().min(0).optional(),
+        stderrOffset: z.number().int().min(0).optional(),
+        eventOffset: z.number().int().min(0).optional(),
+        invalidLineOffset: z.number().int().min(0).optional(),
+        waitMs: z.number().int().min(0).max(MAX_AGENT_POLL_WAIT_MS).default(DEFAULT_AGENT_POLL_WAIT_MS),
+      }),
+    },
+    async (args, ctx) => jsonResult(await agentPoll(args, ctx.mcpReq.signal)),
+  );
+
+  server.registerTool(
+    'agent_result',
+    {
+      description:
+        'Read the retained full result for an agent run, including terminal runs that completed before the current turn. This reports process/structured-output evidence without inferring semantic idle/blocked/done state.',
+      inputSchema: z.object({
+        runId: z.string().uuid(),
+      }),
+    },
+    async (args) => jsonResult(agentResult(args)),
+  );
+
+  server.registerTool(
+    'agent_cancel',
+    {
+      description:
+        'Cancel a managed agent run by runId. Cancellation sends SIGTERM and escalates to SIGKILL after a bounded grace period if the process does not exit.',
+      inputSchema: z.object({
+        runId: z.string().uuid(),
+      }),
+    },
+    async (args) => jsonResult(await agentCancel(args)),
+  );
+
+  server.registerTool(
     'agent_run',
     {
       description:
-        'Run one bounded, explicit coding-agent task and return only process/structured-output evidence. Use fresh runs by default and keep orchestration, verification, Git state, and task decomposition in the caller. Codex is fixed to gpt-5.6-luna/max; agy uses print mode with stream-json.',
+        'Compatibility blocking helper for a short bounded coding-agent task only. Prefer agent_start plus agent_poll for normal work. This surface is intentionally capped at 30 seconds so a single tool call cannot hide long-running work from the orchestrator.',
       inputSchema: z.object({
-        harness: z.enum(['codex', 'agy']).describe('Bounded coding harness to run.'),
-        cwd: z.string().min(1).describe('Existing working directory for this bounded run.'),
-        task: z.string().min(1).max(100_000).refine((task) => !task.includes('\0'), 'task must not contain NUL characters'),
-        skills: z
-          .array(z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/))
-          .max(16)
-          .default([]),
-        timeoutMs: z.number().int().min(1_000).max(600_000).default(120_000),
+        ...agentTaskInput,
+        timeoutMs: z.number().int().min(1_000).max(30_000).default(15_000),
       }),
     },
     async (args, ctx) => jsonResult(await agentRun(args, ctx.mcpReq.signal)),
@@ -716,7 +808,7 @@ async function createServer() {
     'process_start',
     {
       description:
-        'Start a long-running or interactive shell command and keep it alive across MCP tool calls. Returns a processId for process_read, process_write, and process_kill. Use agent_run for normal bounded coding-agent work. Interactive coding-harness fallback should be isolated behind tmux so the caller can inspect raw TUI output without synthetic semantic-state inference.',
+        'Start a long-running shell command and keep it alive across MCP tool calls. Returns a processId for process_read, process_write, and process_kill. Use agent_start for coding-agent work; agent_run is only for short blocking tasks. On the ChatGPT host, interactive terminal session launchers and raw coding-harness execution are forbidden.',
       inputSchema: z.object({
         command: z.string().min(1).describe('Shell command to start with bash -lc.'),
         cwd: z.string().optional().describe('Working directory. Defaults to the agent user home directory.'),
@@ -724,7 +816,7 @@ async function createServer() {
       }),
     },
     async (args, ctx) => {
-      const session = await startPersistentProcess(args, ctx.mcpReq.signal);
+      const session = await startPersistentProcess(args, ctx.mcpReq.signal, hostProfile);
       return jsonResult(processSummary(session));
     },
   );
@@ -784,6 +876,7 @@ async function createServer() {
       await new Promise((resolve, reject) => {
         session.child.stdin.write(data, (error) => (error ? reject(error) : resolve()));
       });
+      session.lastActivityAt = Date.now();
 
       return jsonResult({ processId, bytesWritten: Buffer.byteLength(data) });
     },
@@ -804,6 +897,37 @@ async function createServer() {
         killProcessGroup(session.child, signal);
       }
       return jsonResult({ ...processSummary(session), requestedSignal: signal });
+    },
+  );
+
+  server.registerTool(
+    'work_status',
+    {
+      description:
+        'Return a unified read-only snapshot for recovering orchestration after a silent or interrupted turn: recent managed agent runs (including terminal results), managed processes, and when cwd is provided its Git and bounded filesystem activity. This reports observable evidence only and does not claim whether the ChatGPT UI or model turn is stuck.',
+      inputSchema: z.object({
+        cwd: z.string().min(1).optional(),
+      }),
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+    },
+    async ({ cwd }) => {
+      const resolvedCwd = cwd ? path.resolve(cwd) : null;
+      const managedProcesses = [...processes.values()]
+        .filter((session) => resolvedCwd === null || path.resolve(session.cwd) === resolvedCwd)
+        .sort((a, b) => b.startedAt - a.startedAt)
+        .map((session) => processSummary(session));
+      return jsonResult(
+        await collectWorkStatus({
+          cwd: resolvedCwd,
+          agentRuns: agentRunsSnapshot({ cwd: resolvedCwd ?? undefined }),
+          managedProcesses,
+        }),
+      );
     },
   );
 
@@ -891,6 +1015,7 @@ async function createServer() {
     closed = true;
     await waitForFilesystemMutations();
     await waitForWorkspaceMutations();
+    await stopAgentRuns();
     await stopManagedProcesses();
     activeBridgeManagers.delete(bridgeManager);
     await bridgeManager.close();

@@ -293,7 +293,12 @@ exec /usr/bin/git "$@"
     'workspace_list',
     'workspace_delete',
     'agent_capabilities',
+    'agent_start',
+    'agent_poll',
+    'agent_result',
+    'agent_cancel',
     'agent_run',
+    'work_status',
     'import_file',
     'process_start',
     'process_list',
@@ -331,17 +336,59 @@ exec /usr/bin/git "$@"
   }
 
   const toolByName = new Map(allTools.map((tool) => [tool.name, tool]));
+  const agentStartTool = toolByName.get('agent_start');
+  if (!agentStartTool) throw new Error('agent_start schema missing');
+  const agentStartProperties = agentStartTool.inputSchema?.properties ?? {};
+  for (const property of ['harness', 'cwd', 'task', 'skills', 'timeoutMs']) {
+    if (!(property in agentStartProperties)) throw new Error(`agent_start schema missing property: ${property}`);
+  }
+  if (!agentStartTool.description?.includes('agent_poll')) {
+    throw new Error('agent_start description must direct the caller to polling');
+  }
+
+  const agentPollTool = toolByName.get('agent_poll');
+  if (!agentPollTool) throw new Error('agent_poll schema missing');
+  const pollWaitMaximum = agentPollTool.inputSchema?.properties?.waitMs?.maximum;
+  if (pollWaitMaximum !== 15_000) throw new Error(`agent_poll waitMs maximum mismatch: ${pollWaitMaximum}`);
+
   const agentRunTool = toolByName.get('agent_run');
   if (!agentRunTool) throw new Error('agent_run schema missing');
   const agentRunProperties = agentRunTool.inputSchema?.properties ?? {};
   for (const property of ['harness', 'cwd', 'task', 'skills', 'timeoutMs']) {
     if (!(property in agentRunProperties)) throw new Error(`agent_run schema missing property: ${property}`);
   }
-  if (!agentRunTool.description?.includes('bounded')) throw new Error('agent_run description must establish bounded execution');
+  if (agentRunProperties.timeoutMs?.maximum !== 30_000) {
+    throw new Error('agent_run must stay hard-capped as a short blocking compatibility surface');
+  }
+  if (!agentRunTool.description?.includes('agent_start')) {
+    throw new Error('agent_run description must prefer agent_start');
+  }
+
   const execTool = toolByName.get('exec');
-  if (!execTool?.description?.includes('agent_run')) throw new Error('exec description does not redirect coding-harness work to agent_run');
+  if (!execTool?.description?.includes('agent_start')) {
+    throw new Error('exec description does not redirect coding-harness work to agent_start');
+  }
   const processStartTool = toolByName.get('process_start');
-  if (!processStartTool?.description?.includes('agent_run')) throw new Error('process_start description does not prefer agent_run');
+  if (!processStartTool?.description?.includes('agent_start')) {
+    throw new Error('process_start description does not prefer agent_start');
+  }
+
+  const workStatus = await client.callTool({
+    name: 'work_status',
+    arguments: { cwd: workspaceSeedRoot },
+  });
+  if (workStatus.isError) throw new Error('work_status failed for a Git workspace');
+  const workStatusText = workStatus.content?.find((item) => item.type === 'text')?.text ?? '';
+  const workStatusValue = JSON.parse(workStatusText);
+  if (!workStatusValue.git?.available || workStatusValue.git?.head === null) {
+    throw new Error('work_status did not report Git evidence');
+  }
+  if (!workStatusValue.filesystem?.latestMtimeAt) {
+    throw new Error('work_status did not report filesystem activity');
+  }
+  if (!Array.isArray(workStatusValue.agentRuns) || !Array.isArray(workStatusValue.managedProcesses)) {
+    throw new Error('work_status did not report managed runtime collections');
+  }
 
   const expectedLspTools = [
     'lsp_hover',
@@ -404,9 +451,8 @@ exec /usr/bin/git "$@"
   const agentCapabilitiesResult = parseJsonToolResult(
     await client.callTool({ name: 'agent_capabilities', arguments: {} }),
   );
-  if (agentCapabilitiesResult.runtime?.kind !== 'bounded-process') throw new Error('agent_capabilities runtime kind mismatch');
+  if (agentCapabilitiesResult.runtime?.kind !== 'managed-bounded-process') throw new Error('agent_capabilities runtime kind mismatch');
   if (!Array.isArray(agentCapabilitiesResult.harnesses)) throw new Error('agent_capabilities harnesses missing');
-  if (agentCapabilitiesResult.interactiveFallback?.kind !== 'tmux') throw new Error('tmux fallback missing');
 
   await expectToolFailure('workspace_create', {
     repository: 'https://token@example.com/repository.git',
@@ -1004,6 +1050,9 @@ new mode 100755
   const importFileTool = allTools.find((tool) => tool.name === 'import_file');
   const importFileParams = importFileTool?._meta?.['openai/fileParams'];
   if (hostKind === 'chatgpt') {
+    if (allTools.some((tool) => tool.name === 'skill_list' || tool.name === 'skill_read')) {
+      throw new Error('ChatGPT host unexpectedly exposes projected-skill compatibility tools');
+    }
     if (importFileParams?.[0] !== 'file') {
       throw new Error('import_file ChatGPT fileParams metadata missing');
     }
@@ -1401,7 +1450,7 @@ new mode 100755
   const serverInfo = parseJsonToolResult(await client.callTool({ name: 'server_info', arguments: {} }));
   if (
     serverInfo.server?.name !== 'agent-vm-control' ||
-    serverInfo.server?.version !== '0.5.0' ||
+    serverInfo.server?.version !== '0.6.0' ||
     typeof serverInfo.server?.startedAt !== 'string' ||
     typeof serverInfo.server?.pid !== 'number'
   ) {
@@ -1744,8 +1793,8 @@ new mode 100755
   });
   if (!blockedRawExec.isError) throw new Error('exec unexpectedly allowed raw Codex agent work');
   const blockedRawExecText = blockedRawExec.content?.find((item) => item.type === 'text')?.text ?? '';
-  if (!blockedRawExecText.includes('agent_run')) {
-    throw new Error('exec raw-harness rejection did not direct the caller to agent_run');
+  if (!blockedRawExecText.includes('agent_start')) {
+    throw new Error('exec raw-harness rejection did not direct the caller to agent_start');
   }
 
   const blockedRawProcess = await client.callTool({
@@ -1754,8 +1803,22 @@ new mode 100755
   });
   if (!blockedRawProcess.isError) throw new Error('process_start unexpectedly allowed raw Agy agent work');
   const blockedRawProcessText = blockedRawProcess.content?.find((item) => item.type === 'text')?.text ?? '';
-  if (!blockedRawProcessText.includes('agent_run')) {
-    throw new Error('process_start raw-harness rejection did not direct the caller to agent_run');
+  if (!blockedRawProcessText.includes('agent_start')) {
+    throw new Error('process_start raw-harness rejection did not direct the caller to agent_start');
+  }
+
+  if (hostKind === 'chatgpt') {
+    const blockedTmuxExec = await client.callTool({
+      name: 'exec',
+      arguments: { command: 'tmux -V' },
+    });
+    if (!blockedTmuxExec.isError) throw new Error('ChatGPT exec unexpectedly allowed tmux');
+
+    const blockedTmuxProcess = await client.callTool({
+      name: 'process_start',
+      arguments: { command: "bash -lc 'tmux new-session -d -s forbidden'" },
+    });
+    if (!blockedTmuxProcess.isError) throw new Error('ChatGPT process_start unexpectedly allowed nested tmux');
   }
 
   const harmlessHarnessMention = await client.callTool({

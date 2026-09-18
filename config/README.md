@@ -26,7 +26,7 @@ The built-in `bridges.json` contains an empty bridge list. Machine-specific Play
 
 The canonical MCP-facing skill surface follows the [Final SEP-2640: Skills Extension](https://github.com/modelcontextprotocol/modelcontextprotocol/pull/2640). It declares the `io.modelcontextprotocol/skills` extension and uses `skills/list`, `skills/get`, standard `resources/read`, and `resources/directory/read` with `skill://` URIs. Listings contain complete parsed `SKILL.md` frontmatter and a digest/size manifest for every regular file; reads are lazy and bounded by the SEP limits.
 
-The dot-agents projection is an internal publication snapshot rather than a second protocol model. The native host-facing `skill_list` and `skill_read` tools remain compatibility fallbacks for current ChatGPT behavior and consume that published projection rather than scanning installed harness skill directories. The projection root defaults to:
+The dot-agents projection is an internal publication snapshot rather than a second protocol model. The generic host profile may consume the published projection through SEP-2640 and native `skill_list`/`skill_read` compatibility tools. The ChatGPT profile intentionally exposes neither surface. The projection root defaults to:
 
 ```text
 ${XDG_DATA_HOME:-$HOME/.local/share}/dot-agents/skill-projection/v1/
@@ -34,7 +34,7 @@ ${XDG_DATA_HOME:-$HOME/.local/share}/dot-agents/skill-projection/v1/
 
 Override it with `AGENT_MCP_SKILL_PROJECTION_ROOT`. The root contains a version 1 `catalog.json` with `source: "dot-agents"` and `skills/<name>/...`; each catalog entry must provide a sorted `name`, `description`, `entrypoint: "SKILL.md"`, and `sha256:<64 lowercase hex digits>` hash. The adapter validates the root/catalog layout and tree hash at request time. Filesystem paths are not exposed. Absent or invalid published data is reported as unavailable without blocking MCP startup for the compatibility tools. This repository has not verified ChatGPT native SEP-2640 consumption, so no such support is claimed.
 
-`skill_list` exposes availability, root source, and catalog metadata without filesystem paths, with an optional case-insensitive name/description query. Hosts should inspect it when reusable guidance may apply and then use `skill_read` for the selected skill. `skill_read` defaults to `SKILL.md` and permits only safe relative text reads within that skill, including references or scripts as text. Traversal, symlinks/escaping paths, non-regular files, binary/non-UTF-8 content, and reads above the 256 KiB bound are rejected. These skills are instructions/data, not executable capabilities; this surface does not expose Codex system skills.
+On hosts that enable projected skills, `skill_list` exposes availability and catalog metadata while `skill_read` provides bounded safe text reads. The ChatGPT host does not register this surface or the SEP-2640 skill extension.
 
 ## MCP bridges
 
@@ -253,16 +253,16 @@ The audit is fail-soft for source/network failures: affected items remain visibl
 
 ## Host profile
 
-Bounded MCP-managed Codex runs are fixed to `gpt-5.6-luna` with reasoning effort `max`; this is an invariant of `agent_run`, not optional deployment configuration. Antigravity runs use non-interactive print mode with structured stream output. The caller owns task decomposition, Git/workspace state, verification, and any decision to continue from a native harness conversation ID.
+Bounded MCP-managed Codex runs are fixed to `gpt-5.6-luna` with reasoning effort `max`; this is an invariant of both the pollable `agent_start` lifecycle and the short compatibility `agent_run` surface, not optional deployment configuration. Antigravity runs use non-interactive print mode with structured stream output. Normal work should use `agent_start` plus `agent_poll`; each poll is capped at 15 seconds so the caller repeatedly regains control. The caller owns task decomposition, progress reporting, Git/workspace state, verification, and any decision to continue from a native harness conversation ID.
 
-Interactive fallback is deliberately transport-only: use tmux and inspect raw TUI output. Do not infer durable lifecycle state from terminal wording, and do not auto-approve workspace trust, command permissions, hooks, or similar security-sensitive prompts.
+Raw harness TUI execution is not a fallback path. On the ChatGPT host, `exec`/`process_start` reject `tmux`, `screen`, and `script`; coding harnesses must be invoked through the managed `agent_*` tools.
 
 `AGENT_MCP_HOST` is connection/deployment context rather than a normal tool argument.
 
 Supported values:
 
 - `generic` — default, no vendor-specific tool metadata;
-- `chatgpt` — currently enables the OpenAI/ChatGPT file-input metadata needed by `import_file`.
+- `chatgpt` — enables OpenAI/ChatGPT file-input metadata and structured interactions, disables projected-skill/SEP skill exposure, and forbids interactive terminal session launchers through generic shell tools.
 
 Host-specific behavior should remain isolated here. Prefer standard MCP content/capabilities over host-name conditionals whenever possible.
 
