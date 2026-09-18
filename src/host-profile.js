@@ -10,5 +10,7 @@ export function resolveHostProfile(env = process.env) {
     kind,
     importFileToolMeta: kind === 'chatgpt' ? { 'openai/fileParams': ['file'] } : undefined,
     interactionAdapter: kind === 'chatgpt' ? 'chatgpt' : null,
+    exposeProjectedSkills: kind !== 'chatgpt',
+    allowInteractiveTerminalCommands: kind !== 'chatgpt',
   };
 }
