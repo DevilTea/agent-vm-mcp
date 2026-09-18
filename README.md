@@ -13,7 +13,7 @@ The native MCP surface includes:
 - bounded filesystem reads, deterministic directory listing, and strict unified-diff patching;
 - managed Git repository stores and isolated Git worktrees;
 - persistent interactive process sessions;
-- persistent coding-agent orchestration through Herdr for supported harnesses such as Codex, Antigravity CLI, and Claude Code;
+- bounded coding-agent execution for Codex and Antigravity CLI, with raw tmux as the interactive fallback;
 - CLI capability discovery and a read-only system maintenance audit;
 - host-facing `skill_list`/`skill_read` access to the published dot-agents skill projection;
 - opaque MCP artifact resources and host-native file/image presentation;
@@ -27,7 +27,7 @@ The supported model is deliberately simple:
 
 > Give the agent a dedicated VM. The operator decides what that VM can reach; inside the VM, assume the agent can reach everything available to its Linux user.
 
-`agent-vm-mcp` is **not** a sandbox, privilege boundary, multi-tenant isolation layer, or authorization broker between tools running inside the same VM. Path checks, ownership markers, bridge policies, Herdr workspace identity checks, and similar guards exist for orchestration correctness and accidental-cross-control prevention, not to protect secrets from a malicious process already running as the trusted VM user.
+`agent-vm-mcp` is **not** a sandbox, privilege boundary, multi-tenant isolation layer, or authorization broker between tools running inside the same VM. Path checks, ownership markers, bridge policies, workspace identity checks, and similar guards exist for orchestration correctness and accidental-cross-control prevention, not to protect secrets from a malicious process already running as the trusted VM user.
 
 For the full security model, see [`SECURITY.md`](SECURITY.md).
 
@@ -159,27 +159,13 @@ Workspace lifecycle does not install dependencies, trust repository toolchains, 
 
 ## Processes and coding agents
 
-`process_*` tools manage generic interactive processes owned by the running MCP server. On graceful shutdown, managed process groups receive `SIGTERM` and are escalated to `SIGKILL` after a bounded grace period. These sessions are not persisted across server restarts.
+`process_*` tools manage generic processes owned by the running MCP server. On graceful shutdown, managed process groups receive `SIGTERM` and are escalated to `SIGKILL` after a bounded grace period. These process sessions are not persisted across server restarts.
 
-Coding harnesses use a different lifecycle. `agent_start` launches supported harnesses through Herdr in dedicated Herdr workspaces. Production deployments can run Herdr as a separately managed service; `AGENT_HERDR_BOOTSTRAP=external` requires that arrangement, while `auto` allows development self-bootstrap. Durable `active` metadata is reconciled against the current Herdr snapshot; when the runtime is definitively gone, a record with a verified resumable native session becomes `suspended`, while an unrecoverable record becomes `orphaned` rather than disappearing or remaining falsely active. Exact orphan workspaces are closed only when ownership is unambiguous, and `agent_stop` can explicitly discard an orphaned logical record. After a successful `agent_prompt(wait=true)` whose final observed Herdr status is exactly `done`, native-session attribution is refreshed once more because some harnesses create their durable session only after the first prompt. A uniquely attributed resumable logical agent is suspended; a definitively non-resumable agent is stopped and discarded. Ambiguous attribution is retained fail-closed for explicit handling. Detached terminal `orphaned`/`quarantined` metadata is retained for diagnostics for up to 30 days and capped at the 100 most recent timestamped records; records that still reference a runtime/workspace or have uncertain timestamps are never garbage-collected automatically. `idle`, non-waited, blocked, working, and uncertain prompt outcomes remain active; completion cleanup failures are reported separately from the already-successful prompt result and preserve recoverable lifecycle state. Cross-process lifecycle transitions carry a durable transition token and live owner PID: competing lifecycle mutations fail closed while the owner is alive, while owner-dead transitional state is eligible for reconciliation.
+Normal coding-agent work uses `agent_run`: one explicit bounded task in an existing working directory. The MCP server owns process timeout/cancellation and returns process exit plus structured harness output; it does not infer synthetic `idle`, `blocked`, or `done` states from terminal UI. Codex runs are fixed to `gpt-5.6-luna` with reasoning effort `max`; Antigravity runs use print mode with `stream-json`.
 
-Relevant settings include:
+The orchestrator should keep durable truth in Git/workspace state, split work into small verifiable steps, and prefer fresh runs. A native harness continuation ID may be returned as evidence for exceptional follow-up use, but conversation state is not treated as correctness state.
 
-- `AGENT_HERDR_SESSION` — Herdr session name, default `agent-vm-mcp`;
-- `AGENT_HERDR_BIN` — optional Herdr executable override;
-- `AGENT_HERDR_BOOTSTRAP` — `auto` or `external`;
-- `AGENT_STATE_DIR` — optional durable logical-agent metadata directory;
-- `AGENT_INTERACTION_STATE_PATH` — optional durable `request_user_input` state file; by default it is `interactions.json` under `AGENT_STATE_DIR` or `$XDG_STATE_HOME/agent-vm-mcp/`;
-- MCP-managed Codex policy — every Codex session launched or resumed through `agent_start`/`agent_resume` is fixed to `gpt-5.6-luna` with reasoning effort `max`. Omitting model/effort injects those values; the exact pair is accepted; any other explicit value is rejected. This invariant is built into the MCP runtime and is not controlled by deployment environment variables.
-- MCP-managed Codex provenance — each logical Codex agent gets a durable policy/profile fingerprint. Missing or mismatched provenance fails closed and is quarantined; `agent_stop` retains the exact-ownership cleanup path for the resulting runtime.
-- MCP-managed Codex downstream defaults — the session-scoped Codex profile sets subagent defaults and managed developer instructions requiring delegated Codex, including `x-review`, to remain `gpt-5.6-luna`/`max`. Codex CLI 0.153.2 has no immutable deny-override primitive, so an explicit in-session subagent override remains a documented residual limitation.
-- Ordinary/manual Codex processes outside MCP-managed `agent_start`/`agent_resume` sessions are out of this policy scope. Generic `exec`/`process_start` policy is unchanged.
-
-`agent_prompt` distinguishes submission certainty from whether retrying the same task is useful. A definitely unsubmitted request reports `submission.state="not_submitted"` and `retrySafe=true`; when another prompt is already in flight, or submission may have begun, the result is `possibly_submitted` and is not safe to auto-retry.
-
-For durable handoff, callers should provide a stable `requestId` to `agent_prompt`. The completion envelope is persisted in the logical-agent metadata before any automatic suspend/stop cleanup and can be recovered with `agent_prompt_result` after caller cancellation, a lost MCP response, or an MCP process restart. Reusing the same request identity joins or recovers that request without submitting a duplicate; a different request for an agent with an `in_flight` or `uncertain` submission, or unfinished cleanup, is rejected fail-closed until the earlier request is safely resolved. Each claimed prompt is bound to the observed runtime/workspace generation and carries a unique submission marker; recovery requires marker evidence rather than inferring submission from unrelated runtime state changes. `agent_prompt_result` reads the durable envelope without requiring the live Herdr runtime; `ack=true` records result consumption separately and does not clear an unresolved `in_flight`/`uncertain` safety fence, delete the result, or imply that runtime cleanup occurred. Runtime lifecycle mutations and completion cleanup also re-check the claimed runtime generation so they cannot race into a newer workspace. Recovery and cleanup remain fail-closed when runtime ownership, workspace identity, submission provenance, native-session attribution, or MCP-managed Codex provenance is absent or ambiguous.
-
-Workspace trust, authentication, command approval, and similar harness interactions are surfaced to the caller. The runtime does not silently approve them.
+For exceptional interactive work, `tmux` is the fallback transport. The caller should inspect raw captured TUI text and decide what it means. The control plane must not convert TUI wording into lifecycle authority or automatically destroy a session because a screen appears finished.
 
 ## Read-only maintenance audit
 
@@ -205,13 +191,13 @@ sudo ./scripts/provision-browser-takeover.sh
 The scripts currently provision or configure:
 
 - Docker/Compose/Buildx;
-- mise-managed Node, pnpm, and Herdr plus `agent-herdr.service`;
+- mise-managed Node and pnpm;
 - a controlled read-only LSP integration under `/opt/language-server-mcp`;
 - a pinned Playwright MCP + Chromium deployment under `/opt/playwright-mcp`, plus optional persistent browser/noVNC infrastructure and launchers.
 
 `/opt/agent-vm-mcp` is the canonical deployment path for the optional systemd/browser takeover deployment. `scripts/provision-browser-takeover.sh` intentionally fails unless it is run from that checkout, because the installed shared-browser proxy launcher executes control-plane source from that stable path.
 
-Tunnel software is **not** part of the core lifecycle. Example systemd drop-ins under `config/examples/systemd/` show how a separately managed tunnel service can depend on Herdr or browser services, but the MCP server and provisioners do not require an `agent-tunnel.service`.
+Tunnel software is **not** part of the core lifecycle. Optional systemd examples may coordinate tunnel and browser services, but the MCP server and provisioners do not require an `agent-tunnel.service`.
 
 For a complete illustrated setup, systemd, verification, and troubleshooting walkthrough, see [`docs/openai-secure-mcp-tunnel.md`](docs/openai-secure-mcp-tunnel.md).
 

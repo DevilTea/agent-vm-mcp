@@ -37,8 +37,6 @@ async function connect(hostKind) {
       HOME: root,
       MCP_BRIDGES_CONFIG: bridgesPath,
       AGENT_INTERACTION_STATE_PATH: interactionStatePath,
-      AGENT_HERDR_BIN: path.join(root, 'missing-herdr'),
-      AGENT_HERDR_BOOTSTRAP: 'external',
       AGENT_MCP_HOST: hostKind,
     },
     stderr: 'pipe',

@@ -141,7 +141,7 @@ export function assertNoRawCodingHarnessLaunch(command, surface) {
     if (harness.args.length > 0 && SAFE_HARNESS_PROBES.has(harness.args[0])) continue;
     const error = new Error(
       `${surface} must not launch the ${harness.name} coding harness for agent work. ` +
-        'Use agent_start to create a dedicated persistent Herdr workspace, then agent_prompt; this is required for long-running, parallel, or cross-turn coding-agent work.',
+        'Use agent_run for bounded coding-agent work. For exceptional interactive work, launch the harness behind an explicit tmux session and inspect raw TUI output instead of inferring semantic state.',
     );
     error.code = 'raw_coding_harness_launch_forbidden';
     throw error;

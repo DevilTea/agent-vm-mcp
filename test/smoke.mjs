@@ -74,8 +74,6 @@ const transport = new StdioClientTransport({
     AGENT_ARTIFACT_MAX_BYTES: String(smokeArtifactMaxBytes),
     AGENT_WORKSPACE_ROOT: workspaceRoot,
     AGENT_REPOSITORY_ROOT: repositoryRoot,
-    AGENT_HERDR_BIN: `/tmp/agent-mcp-missing-herdr-${process.pid}`,
-    AGENT_HERDR_BOOTSTRAP: 'external',
     AGENT_MCP_HOST: hostKind,
   },
   stderr: 'inherit',
@@ -295,15 +293,7 @@ exec /usr/bin/git "$@"
     'workspace_list',
     'workspace_delete',
     'agent_capabilities',
-    'agent_start',
-    'agent_get',
-    'agent_read',
-    'agent_prompt',
-    'agent_prompt_result',
-    'agent_send_keys',
-    'agent_suspend',
-    'agent_resume',
-    'agent_stop',
+    'agent_run',
     'import_file',
     'process_start',
     'process_list',
@@ -341,54 +331,18 @@ exec /usr/bin/git "$@"
   }
 
   const toolByName = new Map(allTools.map((tool) => [tool.name, tool]));
-  const agentPromptTool = toolByName.get('agent_prompt');
-  if (!agentPromptTool) throw new Error('agent_prompt schema missing');
-  const agentPromptProperties = agentPromptTool.inputSchema?.properties ?? {};
-  for (const property of ['agentId', 'requestId', 'task', 'skills', 'wait', 'until', 'timeoutMs']) {
-    if (!(property in agentPromptProperties)) throw new Error(`agent_prompt schema missing property: ${property}`);
+  const agentRunTool = toolByName.get('agent_run');
+  if (!agentRunTool) throw new Error('agent_run schema missing');
+  const agentRunProperties = agentRunTool.inputSchema?.properties ?? {};
+  for (const property of ['harness', 'cwd', 'task', 'skills', 'timeoutMs']) {
+    if (!(property in agentRunProperties)) throw new Error(`agent_run schema missing property: ${property}`);
   }
-  const agentPromptResultTool = toolByName.get('agent_prompt_result');
-  if (!agentPromptResultTool?.description?.includes('independently of the live Herdr runtime')) {
-    throw new Error('agent_prompt_result description does not establish runtime-independent recovery');
-  }
-  const agentPromptResultProperties = agentPromptResultTool.inputSchema?.properties ?? {};
-  for (const property of ['requestId', 'agentId', 'ack']) {
-    if (!(property in agentPromptResultProperties)) throw new Error(`agent_prompt_result schema missing property: ${property}`);
-  }
-  const agentGetTool = toolByName.get('agent_get');
-  if (!agentGetTool?.description?.includes('delegation policy')) {
-    throw new Error('agent_get description does not delegate interaction decisions to orchestration policy');
-  }
-  const agentSendKeysTool = toolByName.get('agent_send_keys');
-  if (!agentSendKeysTool?.description?.includes('delegation policy')) {
-    throw new Error('agent_send_keys description does not require caller delegation-policy authorization');
-  }
-  if (!agentSendKeysTool.description.includes('does not grant approval')) {
-    throw new Error('agent_send_keys description does not preserve runtime/policy boundary');
-  }
-
-  const agentStartTool = toolByName.get('agent_start');
-  const agentStartProperties = agentStartTool?.inputSchema?.properties ?? {};
-  for (const property of ['harness', 'cwd', 'model', 'effort', 'timeoutMs']) {
-    if (!(property in agentStartProperties)) throw new Error(`agent_start schema missing property: ${property}`);
-  }
-  if (!agentStartTool?.description?.includes('not exec or process_start')) {
-    throw new Error('agent_start description does not establish the coding-harness lifecycle boundary');
-  }
-  if (!toolByName.get('agent_suspend')?.description?.includes('agent_stop')) {
-    throw new Error('agent_suspend description does not distinguish suspend from destructive stop');
-  }
-  if (!toolByName.get('agent_resume')?.description?.includes('same conversation')) {
-    throw new Error('agent_resume description does not promise exact-session continuation');
-  }
+  if (!agentRunTool.description?.includes('bounded')) throw new Error('agent_run description must establish bounded execution');
   const execTool = toolByName.get('exec');
-  if (!execTool?.description?.includes('use agent_start')) {
-    throw new Error('exec description does not redirect coding-harness work to agent_start');
-  }
+  if (!execTool?.description?.includes('agent_run')) throw new Error('exec description does not redirect coding-harness work to agent_run');
   const processStartTool = toolByName.get('process_start');
-  if (!processStartTool?.description?.includes('use agent_start')) {
-    throw new Error('process_start description does not redirect coding-harness work to agent_start');
-  }
+  if (!processStartTool?.description?.includes('agent_run')) throw new Error('process_start description does not prefer agent_run');
+
   const expectedLspTools = [
     'lsp_hover',
     'lsp_signature_help',
@@ -450,17 +404,9 @@ exec /usr/bin/git "$@"
   const agentCapabilitiesResult = parseJsonToolResult(
     await client.callTool({ name: 'agent_capabilities', arguments: {} }),
   );
-  if (agentCapabilitiesResult.runtime?.kind !== 'herdr') throw new Error('agent_capabilities runtime kind mismatch');
-  if (agentCapabilitiesResult.runtime.available !== false) throw new Error('missing Herdr should be reported unavailable');
-  if (agentCapabilitiesResult.runtime.error?.code !== 'herdr_unavailable') {
-    throw new Error('missing Herdr did not return structured capability error');
-  }
-  if (agentCapabilitiesResult.runtime.bootstrapMode !== 'external') {
-    throw new Error('agent_capabilities did not expose external bootstrap mode');
-  }
+  if (agentCapabilitiesResult.runtime?.kind !== 'bounded-process') throw new Error('agent_capabilities runtime kind mismatch');
   if (!Array.isArray(agentCapabilitiesResult.harnesses)) throw new Error('agent_capabilities harnesses missing');
-
-  await expectToolFailure('agent_get', { agentId: 'invalid-agent-id' });
+  if (agentCapabilitiesResult.interactiveFallback?.kind !== 'tmux') throw new Error('tmux fallback missing');
 
   await expectToolFailure('workspace_create', {
     repository: 'https://token@example.com/repository.git',
@@ -1798,8 +1744,8 @@ new mode 100755
   });
   if (!blockedRawExec.isError) throw new Error('exec unexpectedly allowed raw Codex agent work');
   const blockedRawExecText = blockedRawExec.content?.find((item) => item.type === 'text')?.text ?? '';
-  if (!blockedRawExecText.includes('agent_start')) {
-    throw new Error('exec raw-harness rejection did not direct the caller to agent_start');
+  if (!blockedRawExecText.includes('agent_run')) {
+    throw new Error('exec raw-harness rejection did not direct the caller to agent_run');
   }
 
   const blockedRawProcess = await client.callTool({
@@ -1808,8 +1754,8 @@ new mode 100755
   });
   if (!blockedRawProcess.isError) throw new Error('process_start unexpectedly allowed raw Agy agent work');
   const blockedRawProcessText = blockedRawProcess.content?.find((item) => item.type === 'text')?.text ?? '';
-  if (!blockedRawProcessText.includes('agent_start')) {
-    throw new Error('process_start raw-harness rejection did not direct the caller to agent_start');
+  if (!blockedRawProcessText.includes('agent_run')) {
+    throw new Error('process_start raw-harness rejection did not direct the caller to agent_run');
   }
 
   const harmlessHarnessMention = await client.callTool({

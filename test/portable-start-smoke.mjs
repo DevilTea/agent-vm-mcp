@@ -31,8 +31,6 @@ Object.assign(env, {
   XDG_STATE_HOME: xdgState,
   AGENT_WORKSPACE_ROOT: workspaceRoot,
   AGENT_REPOSITORY_ROOT: repositoryRoot,
-  AGENT_HERDR_BIN: path.join(root, 'missing-herdr'),
-  AGENT_HERDR_BOOTSTRAP: 'external',
 });
 
 const client = new Client({ name: 'portable-start-smoke', version: '1.0.0' });
@@ -54,7 +52,7 @@ try {
     cursor = page.nextCursor;
   } while (cursor);
 
-  for (const native of ['exec', 'read_file', 'agent_start', 'read_artifact', 'present_artifact', 'present_file', 'mcp_bridge_status', 'server_info']) {
+  for (const native of ['exec', 'read_file', 'agent_run', 'read_artifact', 'present_artifact', 'present_file', 'mcp_bridge_status', 'server_info']) {
     assert.ok(names.includes(native), `missing native tool: ${native}`);
   }
   assert.equal(names.some((name) => name.startsWith('browser_')), false, 'portable defaults unexpectedly expose Playwright');

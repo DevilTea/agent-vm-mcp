@@ -19,8 +19,6 @@ async function importFileToolFor(hostKind) {
     ...process.env,
     HOME: root,
     MCP_BRIDGES_CONFIG: bridgesPath,
-    AGENT_HERDR_BIN: path.join(root, 'missing-herdr'),
-    AGENT_HERDR_BOOTSTRAP: 'external',
   };
   if (hostKind === null) delete env.AGENT_MCP_HOST;
   else env.AGENT_MCP_HOST = hostKind;

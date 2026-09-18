@@ -11,18 +11,7 @@ import { serveStdio } from '@modelcontextprotocol/server/stdio';
 import * as z from 'zod/v4';
 
 import { McpBridgeManager } from './mcp-bridge.js';
-import {
-  agentCapabilities,
-  agentGet,
-  agentPrompt,
-  agentPromptResult,
-  agentRead,
-  agentSendKeys,
-  agentStart,
-  agentStop,
-  agentSuspend,
-  agentResume,
-} from './agents.js';
+import { agentCapabilities, agentRun } from './agent-runner.js';
 import { collectCapabilities, inspectCommands } from './capabilities.js';
 import { collectSystemAudit } from './system-audit.js';
 import { createBridgeToolAdapterFactory, validateBridgeToolAdapters } from './adapters/index.js';
@@ -413,15 +402,7 @@ const BASE_NATIVE_TOOL_NAMES = new Set([
   'workspace_list',
   'workspace_delete',
   'agent_capabilities',
-  'agent_start',
-  'agent_get',
-  'agent_read',
-  'agent_prompt',
-  'agent_prompt_result',
-  'agent_send_keys',
-  'agent_suspend',
-  'agent_resume',
-  'agent_stop',
+  'agent_run',
   'process_start',
   'process_list',
   'process_read',
@@ -492,7 +473,7 @@ async function createServer() {
         'Execute an arbitrary shell command on the dedicated disposable Linux agent VM. ' +
         'Oversized stdout/stderr use bounded head/tail previews plus opaque model-only artifacts readable with read_artifact. ' +
         'Use this for commands that complete on their own. For servers, watchers, REPLs, or other long-running/interactive commands, use process_start instead. ' +
-        'Do not launch Codex, Antigravity CLI (agy), or Claude Code agent work through exec; use agent_start so coding agents run in persistent Herdr workspaces. Harmless --help/--version probes remain allowed.',
+        'Do not launch coding harness work directly through exec; use agent_run for bounded agent work. Harmless --help/--version probes remain allowed; tmux may be used explicitly for raw interactive fallback.',
       inputSchema: z.object({
         command: z.string().min(1).describe('Shell command to execute with bash -lc.'),
         cwd: z.string().optional().describe('Working directory. Defaults to the agent user home directory.'),
@@ -602,160 +583,29 @@ async function createServer() {
     'agent_capabilities',
     {
       description:
-        'Discover the Herdr agent runtime, configured persistent session, installed coding harnesses, active/suspended/quarantined MCP-managed logical agents, native/runtime IDs, lifecycle states, resumability/legacy status, fixed MCP-managed Codex launch/downstream policy, installed skills, and resume support.',
+        'Discover bounded coding-agent harnesses and the raw tmux interactive fallback. Runtime state is based on process exit and structured harness output; terminal UI is not converted into synthetic idle/blocked/done states.',
       inputSchema: z.object({}),
     },
-    async (_args, ctx) => jsonResult(await agentCapabilities({ signal: ctx.mcpReq.signal })),
+    async () => jsonResult(await agentCapabilities()),
   );
 
   server.registerTool(
-    'agent_start',
+    'agent_run',
     {
       description:
-        'Start a persistent interactive coding agent in a dedicated Herdr workspace. Use this, not exec or process_start, for coding-harness work; it is required for long-running, parallel, or cross-turn Codex/agy/Claude tasks. MCP-managed Codex is always fixed to gpt-5.6-luna/max: omitted values are injected, the exact pair is accepted, and other explicit model/effort values are rejected. Production persistence requires the separately managed Herdr service; startup trust/auth prompts are reported, never auto-approved.',
+        'Run one bounded, explicit coding-agent task and return only process/structured-output evidence. Use fresh runs by default and keep orchestration, verification, Git state, and task decomposition in the caller. Codex is fixed to gpt-5.6-luna/max; agy uses print mode with stream-json.',
       inputSchema: z.object({
-        harness: z.enum(['codex', 'agy', 'claude']).describe('Coding harness to launch.'),
-        cwd: z.string().min(1).describe('Existing directory to use as the agent workspace.'),
-        model: z.string().min(1).max(128).optional().describe('Optional harness model override. For MCP-managed Codex, omission injects gpt-5.6-luna and any other explicit value is rejected.'),
-        effort: z
-          .enum(['low', 'medium', 'high', 'xhigh', 'max', 'ultra'])
-          .optional()
-          .describe('Optional reasoning-effort override. For MCP-managed Codex, omission injects max and any other explicit value is rejected; other harnesses retain their existing behavior.'),
-        timeoutMs: z
-          .number()
-          .int()
-          .min(5_000)
-          .max(300_000)
-          .default(60_000)
-          .describe('Maximum time to wait for interactive harness startup.'),
-      }),
-    },
-    async (args, ctx) => jsonResult(await agentStart(args, ctx.mcpReq.signal)),
-  );
-
-  const agentIdSchema = z
-    .string()
-    .regex(/^agent-[0-9a-f]{26}$/)
-    .describe('MCP-managed persistent agent ID returned by agent_start.');
-
-  server.registerTool(
-    'agent_get',
-    {
-      description:
-        'Inspect one MCP-managed Herdr agent, including lifecycle state and detected interactions that require an orchestration policy decision. requiresDecision means the caller must apply its delegation policy; it does not imply automatic human escalation.',
-      inputSchema: z.object({ agentId: agentIdSchema }),
-    },
-    async (args, ctx) => jsonResult(await agentGet(args, ctx.mcpReq.signal)),
-  );
-
-  server.registerTool(
-    'agent_read',
-    {
-      description:
-        'Read bounded terminal transcript from an MCP-managed Herdr agent. Use recent-unwrapped for orchestration-oriented text inspection.',
-      inputSchema: z.object({
-        agentId: agentIdSchema,
-        source: z
-          .enum(['visible', 'recent', 'recent-unwrapped', 'detection'])
-          .default('recent-unwrapped'),
-        lines: z.number().int().min(1).max(1_000).default(120),
-      }),
-    },
-    async (args, ctx) => jsonResult(await agentRead(args, ctx.mcpReq.signal)),
-  );
-
-  server.registerTool(
-    'agent_prompt',
-    {
-      description:
-        'Submit a task to an MCP-managed coding agent after a positive readiness check. Definite preflight rejection is not submitted; if another prompt is already in flight or timeout/cancellation occurs after Herdr starts, submission is uncertain/possibly submitted and unsafe to auto-retry.',
-      inputSchema: z.object({
-        agentId: agentIdSchema,
-        requestId: z
-          .string()
-          .regex(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/)
-          .optional()
-          .describe('Stable caller-chosen prompt identity. Reuse it to join or recover the same request after a lost response.'),
+        harness: z.enum(['codex', 'agy']).describe('Bounded coding harness to run.'),
+        cwd: z.string().min(1).describe('Existing working directory for this bounded run.'),
         task: z.string().min(1).max(100_000).refine((task) => !task.includes('\0'), 'task must not contain NUL characters'),
         skills: z
           .array(z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/))
           .max(16)
           .default([]),
-        wait: z.boolean().default(true),
-        until: z
-          .array(z.enum(['idle', 'working', 'blocked', 'done', 'unknown']))
-          .max(5)
-          .default([]),
         timeoutMs: z.number().int().min(1_000).max(600_000).default(120_000),
       }),
     },
-    async (args, ctx) => jsonResult(await agentPrompt(args, ctx.mcpReq.signal)),
-  );
-
-  server.registerTool(
-    'agent_prompt_result',
-    {
-      description:
-        'Recover a durable agent_prompt completion independently of the live Herdr runtime. Use the same requestId after caller cancellation, process restart, or a lost MCP response. Set ack=true only after the result has been consumed; acknowledgement is separate from runtime suspend/stop. If requestId is unavailable, agentId can select one unacknowledged completion when it is unambiguous.',
-      inputSchema: z
-        .object({
-          requestId: z
-            .string()
-            .regex(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/)
-            .optional()
-            .describe('Stable prompt identity returned by agent_prompt or chosen by the caller.'),
-          agentId: agentIdSchema.optional().describe('Optional logical agent ID for unambiguous latest-result recovery.'),
-          ack: z.boolean().default(false).describe('Mark a completed/uncertain durable result as consumed after reading it.'),
-        })
-        .refine(({ requestId, agentId }) => Boolean(requestId || agentId), 'requestId or agentId is required.'),
-    },
-    async (args, ctx) => jsonResult(await agentPromptResult(args, ctx.mcpReq.signal)),
-  );
-
-  server.registerTool(
-    'agent_send_keys',
-    {
-      description:
-        'Send only bounded control/navigation keys to an MCP-managed agent terminal after the orchestrator has inspected the current interaction and determined the action is authorized under the caller delegation policy. The runtime does not grant approval or decide whether human escalation is required. Arbitrary text must use agent_prompt instead.',
-      inputSchema: z.object({
-        agentId: agentIdSchema,
-        keys: z
-          .array(z.enum(['enter', 'esc', 'up', 'down', 'left', 'right', 'tab', 'backspace']))
-          .min(1)
-          .max(16),
-      }),
-    },
-    async (args, ctx) => jsonResult(await agentSendKeys(args, ctx.mcpReq.signal)),
-  );
-
-  server.registerTool(
-    'agent_suspend',
-    {
-      description:
-        'Suspend an idle or finished MCP-managed logical agent by closing its dedicated Herdr workspace while retaining a uniquely attributed native harness session ID. Use at a task/turn boundary to release runtime resources; legacy agents and sessions without verified native attribution fail clearly. This is distinct from agent_stop, which discards the logical agent.',
-      inputSchema: z.object({ agentId: agentIdSchema }),
-    },
-    async (args, ctx) => jsonResult(await agentSuspend(args, ctx.mcpReq.signal)),
-  );
-
-  server.registerTool(
-    'agent_resume',
-    {
-      description:
-        'Resume a suspended logical coding-agent session by creating a fresh Herdr workspace and launching the harness with its verified native session/conversation ID. This continues the same conversation; start a new agent for independent work. MCP-managed Codex resumes require verified fixed-policy provenance and launch at gpt-5.6-luna/max; absent or mismatched provenance is quarantined and fails closed. Fails clearly when native resume is unavailable.',
-      inputSchema: z.object({ agentId: agentIdSchema }),
-    },
-    async (args, ctx) => jsonResult(await agentResume(args, ctx.mcpReq.signal)),
-  );
-
-  server.registerTool(
-    'agent_stop',
-    {
-      description:
-        'Stop an MCP-managed agent with destructive terminal semantics: close its dedicated Herdr workspace when active, or discard its durable logical metadata when suspended. This never stops the shared Herdr session or other agents.',
-      inputSchema: z.object({ agentId: agentIdSchema }),
-    },
-    async (args, ctx) => jsonResult(await agentStop(args, ctx.mcpReq.signal)),
+    async (args, ctx) => jsonResult(await agentRun(args, ctx.mcpReq.signal)),
   );
 
   server.registerTool(
@@ -866,7 +716,7 @@ async function createServer() {
     'process_start',
     {
       description:
-        'Start a long-running or interactive non-agent shell command and keep it alive across MCP tool calls. Returns a processId for process_read, process_write, and process_kill. Do not use process_start for Codex, Antigravity CLI (agy), or Claude Code agent work; use agent_start because Herdr provides dedicated parallel workspaces and survives MCP/conversation lifecycle changes.',
+        'Start a long-running or interactive shell command and keep it alive across MCP tool calls. Returns a processId for process_read, process_write, and process_kill. Use agent_run for normal bounded coding-agent work. Interactive coding-harness fallback should be isolated behind tmux so the caller can inspect raw TUI output without synthetic semantic-state inference.',
       inputSchema: z.object({
         command: z.string().min(1).describe('Shell command to start with bash -lc.'),
         cwd: z.string().optional().describe('Working directory. Defaults to the agent user home directory.'),
