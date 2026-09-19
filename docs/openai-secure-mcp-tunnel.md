@@ -277,7 +277,7 @@ For a stronger check:
 MCP_PID=$(pgrep -P "$TUNNEL_PID" -f '/opt/agent-vm-mcp/src/index.js')
 tr '\0' ' ' < "/proc/$MCP_PID/cmdline"; echo
 tr '\0' '\n' < "/proc/$MCP_PID/environ" | \
-  grep -E '^(AGENT_MCP_HOST|HOME|XDG_CONFIG_HOME)='
+  grep -E '^(AGENT_MCP_HOST|HOME|XDG_CONFIG_HOME|PATH)='
 ```
 
 Expected environment includes:
@@ -286,6 +286,7 @@ Expected environment includes:
 AGENT_MCP_HOST=chatgpt
 HOME=/home/agent
 XDG_CONFIG_HOME=/home/agent/.config
+PATH=/home/agent/.local/share/mise/shims:/home/agent/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 ```
 
 ## 10. Connect it from ChatGPT
