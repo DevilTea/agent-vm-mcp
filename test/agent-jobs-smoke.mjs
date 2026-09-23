@@ -39,6 +39,10 @@ case "$*" in
     printf '%s\n' '{"event":"tool","status":"ERROR","error":"recoverable fixture error"}'
     printf '%s\n' '{"event":"result","result":{"status":"SUCCESS","response":"done","denied_actions":[]}}'
     ;;
+  *agy-omitted-denied-sentinel*)
+    printf '%s\n' '{"event":"init","conversation_id":"agy-omitted-conversation"}'
+    printf '%s\n' '{"event":"result","result":{"status":"SUCCESS","response":"done"}}'
+    ;;
   *agy-error-sentinel*)
     printf '%s\n' '{"event":"init","conversation_id":"agy-error-conversation"}'
     printf '%s\n' '{"event":"result","result":{"status":"ERROR","response":"failed","denied_actions":[]}}'
@@ -46,6 +50,10 @@ case "$*" in
   *agy-denied-sentinel*)
     printf '%s\n' '{"event":"init","conversation_id":"agy-denied-conversation"}'
     printf '%s\n' '{"event":"result","result":{"status":"SUCCESS","response":"blocked","denied_actions":["write_file"]}}'
+    ;;
+  *agy-malformed-denied-sentinel*)
+    printf '%s\n' '{"event":"init","conversation_id":"agy-malformed-conversation"}'
+    printf '%s\n' '{"event":"result","result":{"status":"SUCCESS","response":"bad","denied_actions":null}}'
     ;;
   *agy-missing-sentinel*)
     printf '%s\n' '{"event":"init","conversation_id":"agy-missing-conversation"}'
@@ -320,6 +328,14 @@ try {
     'Durable agy invocation must include its permission flag');
   assert.ok(agyArgs.includes('-p'), 'Durable agy invocation must remain non-interactive -p mode');
 
+  // Real agy SUCCESS omits denied_actions when no permission was denied.
+  const agyOmittedJob = await jobStart({
+    harness: 'agy', cwd: workspace, task: 'agy-omitted-denied-sentinel', timeoutMs: 5000,
+  });
+  const agyOmitted = await waitFor(agyOmittedJob.runId);
+  assert.equal(agyOmitted.status, 'completed');
+  assert.equal(agyOmitted.exitCode, 0);
+
   const agyErrorJob = await jobStart({
     harness: 'agy', cwd: workspace, task: 'agy-error-sentinel', timeoutMs: 5000,
   });
@@ -335,6 +351,14 @@ try {
   assert.equal(agyDenied.status, 'failed');
   assert.equal(agyDenied.exitCode, 0);
   assert.equal(agyDenied.terminationReason, 'agy_denied_actions');
+
+  const agyMalformedDeniedJob = await jobStart({
+    harness: 'agy', cwd: workspace, task: 'agy-malformed-denied-sentinel', timeoutMs: 5000,
+  });
+  const agyMalformedDenied = await waitFor(agyMalformedDeniedJob.runId);
+  assert.equal(agyMalformedDenied.status, 'ambiguous');
+  assert.equal(agyMalformedDenied.exitCode, 0);
+  assert.equal(agyMalformedDenied.terminationReason, 'agy_malformed_terminal_result');
 
   const agyMissingJob = await jobStart({
     harness: 'agy', cwd: workspace, task: 'agy-missing-sentinel', timeoutMs: 5000,
@@ -376,7 +400,7 @@ try {
   assert.ok(giantInvalid.structured.invalidLines.nextOffset > 0);
 
   const all = await jobList({ cwd: workspace });
-  assert.equal(all.jobs.length, 16);
+  assert.equal(all.jobs.length, 18);
 
   const bridgeConfig = path.join(root, 'bridges.json');
   await fs.writeFile(bridgeConfig, '{"version":1,"bridges":[]}\n');

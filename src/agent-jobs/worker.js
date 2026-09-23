@@ -48,10 +48,13 @@ function classifyAgyResult(event) {
     return { status: 'ambiguous', reason: 'agy_malformed_terminal_result' };
   }
   if (result.status === 'ERROR') return { status: 'failed', reason: 'agy_result_error' };
-  if (result.status !== 'SUCCESS' || !Array.isArray(result.denied_actions)) {
+  if (result.status !== 'SUCCESS' ||
+      (result.denied_actions !== undefined && !Array.isArray(result.denied_actions))) {
     return { status: 'ambiguous', reason: 'agy_malformed_terminal_result' };
   }
-  if (result.denied_actions.length > 0) {
+  // Real agy omits denied_actions entirely when no permission was denied.
+  // A present but non-array value still fails closed as malformed output.
+  if (result.denied_actions?.length > 0) {
     return { status: 'failed', reason: 'agy_denied_actions' };
   }
   return { status: 'completed', reason: null };

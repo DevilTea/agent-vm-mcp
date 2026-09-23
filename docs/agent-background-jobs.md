@@ -18,7 +18,7 @@ For V1 durable background jobs only, the worker invokes agy in non-interactive `
 
 This flag does not sandbox the VM account. The agent account's existing privileges remain available, including access to paths outside the requested worktree. Treat the worktree and task as trusted input, and review the full logs and artifacts accordingly.
 
-An agy job is marked `completed` only when it exits successfully and emits a terminal JSONL `event:"result"` with `result.status:"SUCCESS"` and an empty `result.denied_actions` array. A structured success is evidence that the CLI reported success, not proof that the task is correct; verify the requested files, tests, and other task-specific evidence independently. Missing or malformed terminal results stay `ambiguous`, and terminal errors or denied actions are failures.
+An agy job is marked `completed` only when it exits successfully and emits a terminal JSONL `event:"result"` with `result.status:"SUCCESS"` and no denied actions (agy may omit `result.denied_actions` entirely, or return an empty array). A present non-array value remains `ambiguous`. A structured success is evidence that the CLI reported success, not proof that the task is correct; verify the requested files, tests, and other task-specific evidence independently. Missing or malformed terminal results stay `ambiguous`, and terminal errors or denied actions are failures.
 
 ## Deployment on Ubuntu
 
