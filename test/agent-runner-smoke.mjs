@@ -17,11 +17,13 @@ import {
 const root = await fs.mkdtemp(path.join(os.tmpdir(), 'agent-runner-smoke-'));
 const bin = path.join(root, 'bin');
 const work = path.join(root, 'work');
+const codexArgsFile = path.join(root, 'codex-args.txt');
 await fs.mkdir(bin);
 await fs.mkdir(work);
 
 const originalPath = process.env.PATH;
 process.env.PATH = `${bin}:${originalPath}`;
+process.env.AGENT_TEST_CODEX_ARGS_FILE = codexArgsFile;
 
 async function executable(name, source) {
   const target = path.join(bin, name);
@@ -35,6 +37,9 @@ await executable(
 if [ "$1" = "--version" ]; then
   echo "codex-cli test"
   exit 0
+fi
+if [ -n "$AGENT_TEST_CODEX_ARGS_FILE" ]; then
+  printf '%s\n' "$@" > "$AGENT_TEST_CODEX_ARGS_FILE"
 fi
 case "$*" in
   *pollable*)
@@ -104,7 +109,11 @@ try {
   assert.equal(codexResult.status, 'completed');
   assert.equal(codexResult.exitCode, 0);
   assert.equal(codexResult.continuationId, 'thread-test');
-  assert.deepEqual(codexResult.policy, { model: 'gpt-5.6-luna', effort: 'max' });
+  assert.deepEqual(codexResult.policy, { model: 'gpt-6-luna', effort: 'max' });
+  assert.deepEqual((await fs.readFile(codexArgsFile, 'utf8')).trimEnd().split('\n'), [
+    'exec', '--json', '--model', 'gpt-6-luna', '--config', 'model_reasoning_effort="max"',
+    'Perform one bounded task.',
+  ]);
   assert.equal(codexResult.structured.events.length, 2);
 
   const agyResult = await agentRun({

@@ -13,7 +13,7 @@ const MAX_AGENT_RUNS = 64;
 const DEFAULT_TIMEOUT_MS = 120_000;
 export const DEFAULT_AGENT_POLL_WAIT_MS = 10_000;
 export const MAX_AGENT_POLL_WAIT_MS = 15_000;
-const CODEX_MODEL = 'gpt-5.6-luna';
+const CODEX_MODEL = 'gpt-6-luna';
 const CODEX_EFFORT = 'max';
 
 class BoundedStreamBuffer {
