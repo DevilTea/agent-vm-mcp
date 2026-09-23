@@ -9,9 +9,11 @@ if len(sys.argv) != 3:
 
 source = pathlib.Path(sys.argv[1])
 destination = pathlib.Path(sys.argv[2])
-keys = ['AGENT_USER', 'AGENT_GROUP', 'AGENT_HOME', 'MISE_SHIMS']
+keys = ['AGENT_USER', 'AGENT_GROUP', 'AGENT_HOME', 'MISE_SHIMS', 'AGENT_MCP_ROOT', 'CONTROL_NODE']
 text = source.read_text()
 for key in keys:
+    if f'@{key}@' not in text:
+        continue
     try:
         value = os.environ[key]
     except KeyError as error:

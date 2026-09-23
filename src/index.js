@@ -14,15 +14,17 @@ import { McpBridgeManager } from './mcp-bridge.js';
 import {
   DEFAULT_AGENT_POLL_WAIT_MS,
   MAX_AGENT_POLL_WAIT_MS,
-  agentCancel,
-  agentCapabilities,
-  agentPoll,
-  agentResult,
+  agentCapabilities as boundedAgentCapabilities,
   agentRun,
   agentRunsSnapshot,
-  agentStart,
   stopAgentRuns,
 } from './agent-runner.js';
+import {
+  jobCancel, jobHealth, jobList, jobPoll, jobResult, jobStart,
+} from './agent-jobs/client.js';
+import {
+  DEFAULT_JOB_TIMEOUT_MS, MAX_JOB_TIMEOUT_MS,
+} from './agent-jobs/store.js';
 import { collectCapabilities, inspectCommands } from './capabilities.js';
 import { collectSystemAudit } from './system-audit.js';
 import { createBridgeToolAdapterFactory, validateBridgeToolAdapters } from './adapters/index.js';
@@ -431,6 +433,7 @@ const BASE_NATIVE_TOOL_NAMES = new Set([
   'agent_poll',
   'agent_result',
   'agent_cancel',
+  'agent_list',
   'agent_run',
   'work_status',
   'process_start',
@@ -627,30 +630,51 @@ async function createServer() {
     'agent_capabilities',
     {
       description:
-        'Discover managed bounded coding-agent harnesses and polling limits. Runtime state is based only on process exit and structured harness output; raw harness TUI execution is intentionally outside this control plane.',
+        'Discover Codex/agy capabilities and independent durable background job service health. ' +
+        'Only process exit and structured output are evidence of completion.',
       inputSchema: z.object({}),
     },
-    async () => jsonResult(await agentCapabilities()),
+    async () => {
+      const legacy = await boundedAgentCapabilities();
+      let manager;
+      try { manager = await jobHealth(); }
+      catch (error) { manager = { ok: false, error: error.message }; }
+      return jsonResult({
+        ...legacy,
+        runtime: {
+          ...legacy.runtime,
+          kind: 'durable-background-service',
+          persistentAgentState: true,
+          persistentAcrossServerRestart: true,
+          maxJobTimeoutMs: MAX_JOB_TIMEOUT_MS,
+          service: manager,
+        },
+      });
+    },
   );
 
   server.registerTool(
     'agent_start',
     {
       description:
-        'Start one coding-agent task and return immediately with a durable runId. Prefer this for normal agent work or anything that may exceed about 15 seconds. Repeatedly call agent_poll so orchestration regains control and can report progress; completed runs remain rediscoverable until the bounded registry prunes old terminal entries.',
+        'Queue one durable background Codex/agy job, immediately return its persisted runId, then use agent_poll, agent_result, or agent_list later (including across chats and MCP restarts). ' +
+        'Always pass a unique stable idempotencyKey for jobs that may be retried after a lost response. ' +
+        'The VM worker owns execution independently of this MCP request. Timeout is per job (2h default; 8h maximum), not an MCP request timeout.',
       inputSchema: z.object({
         ...agentTaskInput,
-        timeoutMs: z.number().int().min(1_000).max(600_000).default(120_000),
+        timeoutMs: z.number().int().min(1_000).max(MAX_JOB_TIMEOUT_MS).default(DEFAULT_JOB_TIMEOUT_MS),
+        idempotencyKey: z.string().min(1).max(128).optional(),
       }),
     },
-    async (args, ctx) => jsonResult(await agentStart(args, ctx.mcpReq.signal)),
+    async (args, ctx) => jsonResult(await jobStart(args, ctx.mcpReq.signal)),
   );
 
   server.registerTool(
     'agent_poll',
     {
       description:
-        'Read incremental process and structured-output evidence for an agent_start run. If no unread evidence exists, wait only up to waitMs (maximum 15 seconds) before returning so the caller regains control. Pass returned next offsets into the next poll to receive only new evidence.',
+        'Poll a persistent background job for incremental stdout/stderr and JSONL events, including across MCP restarts. ' +
+        'Offsets are byte positions for all four streams; pass returned nextOffset values. Each poll waits at most 15 seconds.',
       inputSchema: z.object({
         runId: z.string().uuid(),
         stdoutOffset: z.number().int().min(0).optional(),
@@ -660,31 +684,50 @@ async function createServer() {
         waitMs: z.number().int().min(0).max(MAX_AGENT_POLL_WAIT_MS).default(DEFAULT_AGENT_POLL_WAIT_MS),
       }),
     },
-    async (args, ctx) => jsonResult(await agentPoll(args, ctx.mcpReq.signal)),
+    async (args, ctx) => jsonResult(await jobPoll(args, ctx.mcpReq.signal)),
   );
 
   server.registerTool(
     'agent_result',
     {
       description:
-        'Read the retained full result for an agent run, including terminal runs that completed before the current turn. This reports process/structured-output evidence without inferring semantic idle/blocked/done state.',
+        'Read persisted background job result, bounded tail previews and absolute paths to full on-disk stdout/stderr/JSONL logs. ' +
+        'Use read_file or present_file for full logs; results survive MCP and job-manager restarts.',
       inputSchema: z.object({
         runId: z.string().uuid(),
       }),
     },
-    async (args) => jsonResult(agentResult(args)),
+    async (args, ctx) => jsonResult(await jobResult(args, ctx.mcpReq.signal)),
   );
 
   server.registerTool(
     'agent_cancel',
     {
       description:
-        'Cancel a managed agent run by runId. Cancellation sends SIGTERM and escalates to SIGKILL after a bounded grace period if the process does not exit.',
+        'Cancel a durable background job by runId. A running worker receives SIGTERM, then SIGKILL after a bounded grace period.',
       inputSchema: z.object({
         runId: z.string().uuid(),
       }),
     },
-    async (args) => jsonResult(await agentCancel(args)),
+    async (args, ctx) => jsonResult(await jobCancel(args, ctx.mcpReq.signal)),
+  );
+
+  server.registerTool(
+    'agent_list',
+    {
+      description: 'Rediscover persistent background jobs after an interrupted conversation or MCP restart. Optionally filter by exact cwd.',
+      inputSchema: z.object({
+        cwd: z.string().min(1).optional(),
+        limit: z.number().int().min(1).max(128).default(64),
+      }),
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+    },
+    async (args, ctx) => jsonResult(await jobList(args, ctx.mcpReq.signal)),
   );
 
   server.registerTool(
@@ -921,13 +964,28 @@ async function createServer() {
         .filter((session) => resolvedCwd === null || path.resolve(session.cwd) === resolvedCwd)
         .sort((a, b) => b.startedAt - a.startedAt)
         .map((session) => processSummary(session));
-      return jsonResult(
-        await collectWorkStatus({
+      let backgroundJobs = [];
+      let backgroundJobService = { available: true };
+      try {
+        backgroundJobs = (await jobList({ cwd: resolvedCwd ?? undefined })).jobs;
+      } catch (error) {
+        backgroundJobService = {
+          available: false,
+          error: error.code || 'agent_job_service_unavailable',
+          message: error.message,
+        };
+      }
+      return jsonResult({
+        ...(await collectWorkStatus({
           cwd: resolvedCwd,
-          agentRuns: agentRunsSnapshot({ cwd: resolvedCwd ?? undefined }),
+          agentRuns: [
+            ...backgroundJobs,
+            ...agentRunsSnapshot({ cwd: resolvedCwd ?? undefined }),
+          ],
           managedProcesses,
-        }),
-      );
+        })),
+        backgroundJobService,
+      });
     },
   );
 

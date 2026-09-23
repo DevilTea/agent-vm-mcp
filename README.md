@@ -161,13 +161,17 @@ Workspace lifecycle does not install dependencies, trust repository toolchains, 
 
 `process_*` tools manage generic processes owned by the running MCP server. On graceful shutdown, managed process groups receive `SIGTERM` and are escalated to `SIGKILL` after a bounded grace period. These process sessions are not persisted across server restarts.
 
-Normal coding-agent work uses `agent_start` followed by repeated `agent_poll` calls. `agent_start` returns a durable `runId` immediately; each `agent_poll` waits at most 15 seconds, returns incremental stdout/stderr plus structured harness events, and gives orchestration frequent control so it can report progress instead of hiding behind one long MCP call. Terminal runs remain in a bounded in-memory registry so a later turn or conversation can recover them with `agent_result` or `work_status`. Run state does not survive an MCP server restart.
+Normal coding-agent work uses **durable background jobs**. `agent_start` writes a job to a separate VM-owned `agent-jobd` service and returns an immutable `runId` once SQLite has accepted it. Jobs queue when the configured worker limit is reached; no ChatGPT/MCP connection must remain open. `agent_poll` reads incrementally with at most a 15-second wait. `agent_result` returns a bounded output preview **plus absolute paths to complete stdout/stderr and structured JSONL logs**. `agent_list` rediscovers jobs across ChatGPT turns, MCP restarts, and background-manager restarts. `agent_cancel` can cancel queued or running jobs.
 
-`agent_run` remains only as a compatibility helper for short blocking work. Its MCP surface defaults to 15 seconds and is hard-capped at 30 seconds. Longer work should use the pollable lifecycle. The MCP server owns process timeout/cancellation and reports only process exit plus structured harness output; it does not infer synthetic `idle`, `blocked`, or `done` states from terminal UI. Codex runs are fixed to `gpt-5.6-luna` with reasoning effort `max`; Antigravity runs use print mode with `stream-json`.
+- **Defaults:** two concurrent jobs per VM, two-hour per-job timeout, eight-hour maximum. A job timeout is *not* the lifetime of an MCP request. Worker health comes from Linux PID/start-time identity and database state, never from guessing that a quiet model is stalled.
+- **Safe retry:** send an `idempotencyKey` unique to a logical job. A repeated identical request returns the same `runId`; reusing the key with different inputs is rejected. Without the key, a request whose response was lost may be duplicated by retrying.
+- **Restart semantics:** the job-manager and MCP processes are separate from detached worker process groups. Manager restart reattaches to still-running workers without restarting them; reboot or lost workers are marked `interrupted` instead of being replayed. SQLite and log files remain available. A failed/interrupted job must be examined and explicitly reissued.
+- **Persistence:** jobs live in the configured `AGENT_JOB_STATE_DIR` (default `~/.local/state/agent-vm-mcp/jobs`); its SQLite database and per-run output directories are private to the VM account. Back up this directory if the results matter.
+- **Scope:** V1 is individual Codex/agy jobs only. Orchestrating multiple independent reviewers and final synthesis stays with ChatGPT for now; job groups, dependency graphs and completion notifications are reserved for V2.
 
-`work_status` is the recovery/observability surface for a silent or interrupted turn. It reports recent agent runs (including terminal runs), managed generic processes, and—when given a working directory—Git state plus a bounded filesystem-activity scan. It deliberately does not claim whether the ChatGPT UI or model turn is stuck.
+`agent_run` remains the unchanged **short, synchronous compatibility helper** (15-second default, 30-second maximum) and still uses the preexisting in-MCP bounded runner. It is not a background job and is cancelled if the MCP process terminates. The Codex model for existing MCP-managed invocations is fixed to `gpt-5.6-luna` / `max`, independently of dot-agents user defaults; the background service inherits the same configured deployment policy. Antigravity uses non-interactive print mode and structured output.
 
-The orchestrator should keep durable truth in Git/workspace state, split work into small verifiable steps, prefer fresh runs, and re-check `work_status` whenever a previous turn may have stopped without a final response. A native harness continuation ID may be returned as evidence for exceptional follow-up use, but conversation state is not treated as correctness state.
+`work_status` now includes persistent background jobs plus legacy short-run metadata and managed generic processes. The repository/filesystem evidence is read separately. A successful process exit is not evidence that a review is semantically correct; inspect the saved findings and Git state before claiming completion.
 
 Raw coding-harness TUI execution is not a supported fallback. On the ChatGPT host, `exec` and `process_start` reject interactive terminal session launchers (`tmux`, `screen`, and `script`) as well as raw coding-harness execution. Codex and Antigravity work must flow through the managed `agent_*` tools.
 
@@ -190,6 +194,7 @@ sudo ./scripts/provision-docker.sh
 sudo ./scripts/provision-mise.sh
 sudo ./scripts/provision-lsp.sh
 sudo ./scripts/provision-browser-takeover.sh
+sudo ./scripts/provision-agent-jobs.sh  # after deploying sources to /opt/agent-vm-mcp
 ```
 
 The scripts currently provision or configure:
@@ -202,6 +207,8 @@ The scripts currently provision or configure:
 `/opt/agent-vm-mcp` is the canonical deployment path for the optional systemd/browser takeover deployment. `scripts/provision-browser-takeover.sh` intentionally fails unless it is run from that checkout, because the installed shared-browser proxy launcher executes control-plane source from that stable path.
 
 Tunnel software is **not** part of the core lifecycle. Optional systemd examples may coordinate tunnel and browser services, but the MCP server and provisioners do not require an `agent-tunnel.service`.
+
+For durable coding-agent background work and the independent systemd service, see [`docs/agent-background-jobs.md`](docs/agent-background-jobs.md).
 
 For a complete illustrated setup, systemd, verification, and troubleshooting walkthrough, see [`docs/openai-secure-mcp-tunnel.md`](docs/openai-secure-mcp-tunnel.md).
 
