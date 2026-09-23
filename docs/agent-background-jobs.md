@@ -12,6 +12,14 @@ V1 moves long Codex and agy work into `agent-jobd`, a separate systemd-managed V
 - Existing `agent_run` remains the short blocking compatibility path. `process_*` tools remain in-process and **are not** made persistent by this feature.
 - V1 does not do group scheduling, reviewer synthesis, task dependencies, automatic completion notifications or automatic retries.
 
+### agy background permission and completion policy
+
+For V1 durable background jobs only, the worker invokes agy in non-interactive `-p` stream-JSON mode with `--dangerously-skip-permissions`. This is scoped to the durable worker; it does not change interactive agy defaults or the short blocking `agent_run` path.
+
+This flag does not sandbox the VM account. The agent account's existing privileges remain available, including access to paths outside the requested worktree. Treat the worktree and task as trusted input, and review the full logs and artifacts accordingly.
+
+An agy job is marked `completed` only when it exits successfully and emits a terminal JSONL `event:"result"` with `result.status:"SUCCESS"` and an empty `result.denied_actions` array. A structured success is evidence that the CLI reported success, not proof that the task is correct; verify the requested files, tests, and other task-specific evidence independently. Missing or malformed terminal results stay `ambiguous`, and terminal errors or denied actions are failures.
+
 ## Deployment on Ubuntu
 
 Deploy this repository to the stable runtime checkout at `/opt/agent-vm-mcp` and install production dependencies. The provisioner requires root and an already deployed source directory:
