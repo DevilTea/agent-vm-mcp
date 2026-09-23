@@ -253,7 +253,7 @@ The audit is fail-soft for source/network failures: affected items remain visibl
 
 ## Host profile
 
-Bounded MCP-managed Codex runs are fixed to `gpt-5.6-luna` with reasoning effort `max`; this is an invariant of both the pollable `agent_start` lifecycle and the short compatibility `agent_run` surface, not optional deployment configuration. Antigravity runs use non-interactive print mode with structured stream output. Normal work should use `agent_start` plus `agent_poll`; each poll is capped at 15 seconds so the caller repeatedly regains control. The caller owns task decomposition, progress reporting, Git/workspace state, verification, and any decision to continue from a native harness conversation ID.
+Bounded MCP-managed Codex runs are fixed to `gpt-6-luna` with reasoning effort `max`; this is an invariant of both the pollable `agent_start` lifecycle and the short compatibility `agent_run` surface, not optional deployment configuration. Antigravity runs use non-interactive print mode with structured stream output. Normal work should use `agent_start` plus `agent_poll`; each poll is capped at 15 seconds so the caller repeatedly regains control. The caller owns task decomposition, progress reporting, Git/workspace state, verification, and any decision to continue from a native harness conversation ID.
 
 Raw harness TUI execution is not a fallback path. On the ChatGPT host, `exec`/`process_start` reject `tmux`, `screen`, and `script`; coding harnesses must be invoked through the managed `agent_*` tools.
 
