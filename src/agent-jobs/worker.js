@@ -34,11 +34,27 @@ function invocation(job) {
   if (job.harness === 'agy') {
     return {
       command: process.env.AGENT_JOB_AGY_BIN || 'agy',
-      args: ['-p', task, '--output-format', 'stream-json',
+      args: ['--dangerously-skip-permissions', '-p', task, '--output-format', 'stream-json',
         '--print-timeout', Math.ceil(job.timeout_ms / 1000) + 's'],
     };
   }
   throw new Error('Unsupported harness: ' + job.harness);
+}
+
+function classifyAgyResult(event) {
+  if (!event) return { status: 'ambiguous', reason: 'agy_missing_terminal_result' };
+  const result = event.result;
+  if (!result || typeof result !== 'object' || Array.isArray(result)) {
+    return { status: 'ambiguous', reason: 'agy_malformed_terminal_result' };
+  }
+  if (result.status === 'ERROR') return { status: 'failed', reason: 'agy_result_error' };
+  if (result.status !== 'SUCCESS' || !Array.isArray(result.denied_actions)) {
+    return { status: 'ambiguous', reason: 'agy_malformed_terminal_result' };
+  }
+  if (result.denied_actions.length > 0) {
+    return { status: 'failed', reason: 'agy_denied_actions' };
+  }
+  return { status: 'completed', reason: null };
 }
 
 async function main() {
@@ -69,6 +85,7 @@ async function main() {
   let stdoutBytes = 0;
   const decoder = new StringDecoder('utf8');
   let remainder = '';
+  let agyTerminalEvent = null;
 
   function reportOutput() {
     const now = Date.now();
@@ -92,6 +109,10 @@ async function main() {
       try {
         const event = JSON.parse(line);
         currentContinuationId ||= continuationId(event);
+        if (job.harness === 'agy' && event && typeof event === 'object' &&
+            event.event === 'result') {
+          agyTerminalEvent = event;
+        }
         await events.write(JSON.stringify(event) + '\n');
       } catch {
         await invalid.write(JSON.stringify(line) + '\n');
@@ -172,15 +193,23 @@ async function main() {
     await Promise.all([stdout.close(), stderr.close(), events.close(), invalid.close()]);
     reportOutput();
     const requestedCancel = Boolean(store.get(id)?.cancel_requested);
+    const agyClassification = job.harness === 'agy' && !spawnError && exitCode === 0
+      ? classifyAgyResult(agyTerminalEvent) : null;
     const status = requestedCancel || reason === 'cancel' ? 'cancelled' :
       reason === 'timeout' ? 'timed_out' :
       reason === 'interrupted' ? 'interrupted' :
       spawnError || exitCode !== 0 ? 'failed' :
+      job.harness === 'agy' ? agyClassification.status :
       stdoutBytes === 0 ? 'ambiguous' : 'completed';
+    const agyReason = job.harness !== 'agy' ? null :
+      spawnError ? 'agy_spawn_error' :
+      exitCode === null ? 'agy_exit_signal' :
+      exitCode !== 0 ? 'agy_nonzero_exit' :
+      agyClassification?.reason || null;
     store.finish(id, status, {
       exitCode,
       signal: exitSignal,
-      reason: requestedCancel ? 'cancel' : reason,
+      reason: requestedCancel ? 'cancel' : reason || agyReason,
       continuationId: currentContinuationId,
     });
     store.close();

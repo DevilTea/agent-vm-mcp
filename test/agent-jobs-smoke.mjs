@@ -30,13 +30,44 @@ await fs.writeFile(fakeCodex, [
   ''
 ].join('\n'), { mode: 0o755 });
 const fakeAgy = path.join(bin, 'agy');
-await fs.writeFile(fakeAgy, '#!/bin/sh\necho \'{"type":"session.started","conversation_id":"agy-test-conversation"}\'\n', { mode: 0o755 });
+const agyArgsLog = path.join(root, 'agy-args.log');
+await fs.writeFile(fakeAgy, String.raw`#!/bin/sh
+printf '%s\n' "$@" >> "$AGENT_JOB_AGY_ARGS_LOG"
+case "$*" in
+  *agy-success-sentinel*)
+    printf '%s\n' '{"event":"init","conversation_id":"agy-success-conversation"}'
+    printf '%s\n' '{"event":"tool","status":"ERROR","error":"recoverable fixture error"}'
+    printf '%s\n' '{"event":"result","result":{"status":"SUCCESS","response":"done","denied_actions":[]}}'
+    ;;
+  *agy-error-sentinel*)
+    printf '%s\n' '{"event":"init","conversation_id":"agy-error-conversation"}'
+    printf '%s\n' '{"event":"result","result":{"status":"ERROR","response":"failed","denied_actions":[]}}'
+    ;;
+  *agy-denied-sentinel*)
+    printf '%s\n' '{"event":"init","conversation_id":"agy-denied-conversation"}'
+    printf '%s\n' '{"event":"result","result":{"status":"SUCCESS","response":"blocked","denied_actions":["write_file"]}}'
+    ;;
+  *agy-missing-sentinel*)
+    printf '%s\n' '{"event":"init","conversation_id":"agy-missing-conversation"}'
+    ;;
+  *agy-nonzero-sentinel*)
+    printf '%s\n' '{"event":"init","conversation_id":"agy-nonzero-conversation"}'
+    printf '%s\n' '{"event":"result","result":{"status":"SUCCESS","response":"done","denied_actions":[]}}'
+    exit 3
+    ;;
+  *)
+    printf '%s\n' '{"event":"init","conversation_id":"agy-default-conversation"}'
+    printf '%s\n' '{"event":"result","result":{"status":"SUCCESS","response":"done","denied_actions":[]}}'
+    ;;
+esac
+`, { mode: 0o755 });
 const env = {
   ...process.env,
   AGENT_JOB_STATE_DIR: state,
   AGENT_JOB_MAX_CONCURRENT: '1',
   AGENT_JOB_CODEX_BIN: fakeCodex,
   AGENT_JOB_AGY_BIN: fakeAgy,
+  AGENT_JOB_AGY_ARGS_LOG: agyArgsLog,
 };
 process.env.AGENT_JOB_STATE_DIR = state;
 const { jobHealth, jobStart, jobList, jobPoll, jobResult, jobCancel } =
@@ -279,10 +310,47 @@ try {
   assert.equal((await waitFor(failedJob.runId)).status, 'failed');
   assert.match((await jobResult({ runId: failedJob.runId })).stderr, /synthetic failure/);
   const agyJob = await jobStart({
-    harness: 'agy', cwd: workspace, task: 'agy-sentinel', timeoutMs: 5000,
+    harness: 'agy', cwd: workspace, task: 'agy-success-sentinel', timeoutMs: 5000,
   });
-  assert.equal((await waitFor(agyJob.runId)).status, 'completed');
-  assert.equal((await jobResult({ runId: agyJob.runId })).continuationId, 'agy-test-conversation');
+  const agyFinished = await waitFor(agyJob.runId);
+  assert.equal(agyFinished.status, 'completed');
+  assert.equal((await jobResult({ runId: agyJob.runId })).continuationId, 'agy-success-conversation');
+  const agyArgs = (await fs.readFile(agyArgsLog, 'utf8')).split('\n').filter(Boolean);
+  assert.ok(agyArgs.includes('--dangerously-skip-permissions'),
+    'Durable agy invocation must include its permission flag');
+  assert.ok(agyArgs.includes('-p'), 'Durable agy invocation must remain non-interactive -p mode');
+
+  const agyErrorJob = await jobStart({
+    harness: 'agy', cwd: workspace, task: 'agy-error-sentinel', timeoutMs: 5000,
+  });
+  const agyError = await waitFor(agyErrorJob.runId);
+  assert.equal(agyError.status, 'failed');
+  assert.equal(agyError.exitCode, 0);
+  assert.equal(agyError.terminationReason, 'agy_result_error');
+
+  const agyDeniedJob = await jobStart({
+    harness: 'agy', cwd: workspace, task: 'agy-denied-sentinel', timeoutMs: 5000,
+  });
+  const agyDenied = await waitFor(agyDeniedJob.runId);
+  assert.equal(agyDenied.status, 'failed');
+  assert.equal(agyDenied.exitCode, 0);
+  assert.equal(agyDenied.terminationReason, 'agy_denied_actions');
+
+  const agyMissingJob = await jobStart({
+    harness: 'agy', cwd: workspace, task: 'agy-missing-sentinel', timeoutMs: 5000,
+  });
+  const agyMissing = await waitFor(agyMissingJob.runId);
+  assert.equal(agyMissing.status, 'ambiguous');
+  assert.equal(agyMissing.exitCode, 0);
+  assert.equal(agyMissing.terminationReason, 'agy_missing_terminal_result');
+
+  const agyNonzeroJob = await jobStart({
+    harness: 'agy', cwd: workspace, task: 'agy-nonzero-sentinel', timeoutMs: 5000,
+  });
+  const agyNonzero = await waitFor(agyNonzeroJob.runId);
+  assert.equal(agyNonzero.status, 'failed');
+  assert.equal(agyNonzero.exitCode, 3);
+  assert.equal(agyNonzero.terminationReason, 'agy_nonzero_exit');
 
   const partialJob = await jobStart({
     harness: 'codex', cwd: workspace, task: 'partial-sentinel', timeoutMs: 5000,
@@ -308,7 +376,7 @@ try {
   assert.ok(giantInvalid.structured.invalidLines.nextOffset > 0);
 
   const all = await jobList({ cwd: workspace });
-  assert.equal(all.jobs.length, 12);
+  assert.equal(all.jobs.length, 16);
 
   const bridgeConfig = path.join(root, 'bridges.json');
   await fs.writeFile(bridgeConfig, '{"version":1,"bridges":[]}\n');
