@@ -1,0 +1,27 @@
+[Unit]
+Description=Durable background coding-agent job manager
+Wants=network-online.target
+After=network-online.target
+Before=agent-tunnel.service
+
+[Service]
+Type=simple
+User=@AGENT_USER@
+Group=@AGENT_GROUP@
+WorkingDirectory=@AGENT_MCP_ROOT@
+Environment=HOME=@AGENT_HOME@
+Environment=XDG_CONFIG_HOME=@AGENT_HOME@/.config
+Environment=PATH=@MISE_SHIMS@:@AGENT_HOME@/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=AGENT_JOB_STATE_DIR=@AGENT_HOME@/.local/state/agent-vm-mcp/jobs
+Environment=AGENT_JOB_MAX_CONCURRENT=2
+Environment=AGENT_CODEX_ENFORCED_MODEL=gpt-5.6-luna
+Environment=AGENT_CODEX_ENFORCED_EFFORT=max
+ExecStart=@CONTROL_NODE@ @AGENT_MCP_ROOT@/src/agent-jobs/manager.js
+Restart=always
+RestartSec=3s
+TimeoutStopSec=10s
+# The manager must restart without killing independently detached worker groups.
+KillMode=process
+
+[Install]
+WantedBy=multi-user.target

@@ -297,6 +297,7 @@ exec /usr/bin/git "$@"
     'agent_poll',
     'agent_result',
     'agent_cancel',
+    'agent_list',
     'agent_run',
     'work_status',
     'import_file',
@@ -451,7 +452,7 @@ exec /usr/bin/git "$@"
   const agentCapabilitiesResult = parseJsonToolResult(
     await client.callTool({ name: 'agent_capabilities', arguments: {} }),
   );
-  if (agentCapabilitiesResult.runtime?.kind !== 'managed-bounded-process') throw new Error('agent_capabilities runtime kind mismatch');
+  if (agentCapabilitiesResult.runtime?.kind !== 'durable-background-service') throw new Error('agent_capabilities runtime kind mismatch');
   if (!Array.isArray(agentCapabilitiesResult.harnesses)) throw new Error('agent_capabilities harnesses missing');
 
   await expectToolFailure('workspace_create', {
