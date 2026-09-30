@@ -15,9 +15,12 @@ import {
   normalizeInteractionAnswers,
 } from '../src/interactions/model.js';
 import {
+  CHATGPT_INTERACTION_V1_RESOURCE_URI,
   CHATGPT_INTERACTION_RESOURCE_URI,
   REQUEST_USER_INPUT_STATE_TOOL,
   REQUEST_USER_INPUT_SUBMIT_TOOL,
+  REQUEST_USER_INPUT_V2_STATE_TOOL,
+  REQUEST_USER_INPUT_V2_SUBMIT_TOOL,
 } from '../src/interactions/hosts/chatgpt.js';
 
 const projectRoot = path.resolve(import.meta.dirname, '..');
@@ -283,13 +286,19 @@ try {
     const interactionTool = tools.find((tool) => tool.name === REQUEST_USER_INPUT_TOOL);
     const interactionStateTool = tools.find((tool) => tool.name === REQUEST_USER_INPUT_STATE_TOOL);
     const interactionSubmitTool = tools.find((tool) => tool.name === REQUEST_USER_INPUT_SUBMIT_TOOL);
+    const interactionV2StateTool = tools.find((tool) => tool.name === REQUEST_USER_INPUT_V2_STATE_TOOL);
+    const interactionV2SubmitTool = tools.find((tool) => tool.name === REQUEST_USER_INPUT_V2_SUBMIT_TOOL);
     assert.ok(interactionTool, 'ChatGPT interaction tool missing');
     assert.ok(interactionStateTool, 'ChatGPT interaction state tool missing');
     assert.ok(interactionSubmitTool, 'ChatGPT interaction submit tool missing');
+    assert.ok(interactionV2StateTool, 'ChatGPT v2 interaction state tool missing');
+    assert.ok(interactionV2SubmitTool, 'ChatGPT v2 interaction submit tool missing');
     assert.deepEqual(interactionStateTool._meta?.ui?.visibility, ['app']);
     assert.deepEqual(interactionSubmitTool._meta?.ui?.visibility, ['app']);
-    assert.equal(interactionStateTool._meta?.ui?.resourceUri, CHATGPT_INTERACTION_RESOURCE_URI);
-    assert.equal(interactionSubmitTool._meta?.ui?.resourceUri, CHATGPT_INTERACTION_RESOURCE_URI);
+    assert.equal(interactionStateTool._meta?.ui?.resourceUri, CHATGPT_INTERACTION_V1_RESOURCE_URI);
+    assert.equal(interactionSubmitTool._meta?.ui?.resourceUri, CHATGPT_INTERACTION_V1_RESOURCE_URI);
+    assert.equal(interactionV2StateTool._meta?.ui?.resourceUri, CHATGPT_INTERACTION_RESOURCE_URI);
+    assert.equal(interactionV2SubmitTool._meta?.ui?.resourceUri, CHATGPT_INTERACTION_RESOURCE_URI);
     assert.equal(interactionTool._meta?.ui?.resourceUri, CHATGPT_INTERACTION_RESOURCE_URI);
     assert.equal(interactionTool._meta?.['ui/resourceUri'], CHATGPT_INTERACTION_RESOURCE_URI);
     assert.deepEqual(interactionTool._meta?.ui?.visibility, ['model']);
@@ -303,6 +312,24 @@ try {
     assert.match(JSON.stringify(interactionTool.inputSchema), /reserved `other` choice/);
     const capabilities = parseJsonToolResult(await chatgpt.callTool({ name: 'capabilities', arguments: {} }));
     assert.equal(capabilities.mcp.nativeTools.includes(REQUEST_USER_INPUT_TOOL), true);
+
+    const historicalResource = await chatgpt.readResource({ uri: CHATGPT_INTERACTION_V1_RESOURCE_URI });
+    assert.equal(historicalResource.contents.length, 1);
+    const historicalContent = historicalResource.contents[0];
+    const historicalHtml = await fs.readFile(
+      new URL('../src/interactions/hosts/chatgpt-app.html', import.meta.url),
+      'utf8',
+    );
+    assert.equal(CHATGPT_INTERACTION_V1_RESOURCE_URI, 'ui://agent-vm/request-user-input/v1-d372f81529be.html');
+    assert.equal(historicalContent.uri, CHATGPT_INTERACTION_V1_RESOURCE_URI);
+    assert.equal(historicalContent.text, historicalHtml, 'historical v1 resource bytes changed');
+    const historicalDigest = createHash('sha256')
+      .update(historicalContent.text)
+      .update('\0')
+      .update(JSON.stringify(historicalContent._meta))
+      .digest('hex')
+      .slice(0, 12);
+    assert.equal(CHATGPT_INTERACTION_V1_RESOURCE_URI, `ui://agent-vm/request-user-input/v1-${historicalDigest}.html`);
 
     const resource = await chatgpt.readResource({ uri: CHATGPT_INTERACTION_RESOURCE_URI });
     assert.equal(resource.contents.length, 1);
@@ -319,7 +346,7 @@ try {
       .slice(0, 12);
     assert.equal(
       CHATGPT_INTERACTION_RESOURCE_URI,
-      `ui://agent-vm/request-user-input/v1-${resourceDigest}.html`,
+      `ui://agent-vm/request-user-input/v2-${resourceDigest}.html`,
     );
     assert.match(content.text, /ui\/initialize/);
     assert.match(content.text, /ui\/notifications\/initialized/);
@@ -335,9 +362,12 @@ try {
     assert.match(content.text, /FORM_STATE_PREFIX/);
     assert.match(content.text, /window\.localStorage\.setItem/);
     assert.match(content.text, /restorePersistedForm/);
-    assert.match(content.text, /request_user_input_state/);
-    assert.match(content.text, /request_user_input_submit/);
+    assert.match(content.text, /request_user_input_state_v2/);
+    assert.match(content.text, /request_user_input_submit_v2/);
     assert.match(content.text, /tools\/call/);
+    assert.ok(content.text.indexOf("request('ui\/message'") < content.text.indexOf('await submitAuthoritativeState(payload, answers)'),
+      'v2 must attempt ui/message before persisting submitted state');
+    assert.match(content.text, /APP_REQUEST_TIMEOUT_MS = 30_000/);
     assert.match(content.text, /Array\.from\(text\(value\)\)/);
     assert.match(content.text, /truncateToUnicodeLength/);
     assert.doesNotMatch(content.text, /input\.maxLength\s*=/);
@@ -481,6 +511,29 @@ try {
       }),
       /already been submitted with different answers/,
     );
+
+    const v2PersistedInteraction = await chatgpt.callTool({
+      name: REQUEST_USER_INPUT_TOOL,
+      arguments: {
+        title: 'V2 secondary persistence',
+        questions: [{ id: 'reason', kind: 'text', prompt: 'Why this choice?' }],
+      },
+    });
+    const v2PersistedInteractionId = v2PersistedInteraction.structuredContent.interactionId;
+    const v2Persisted = await chatgpt.callTool({
+      name: REQUEST_USER_INPUT_V2_SUBMIT_TOOL,
+      arguments: {
+        interactionId: v2PersistedInteractionId,
+        answers: [{ questionId: 'reason', kind: 'text', value: 'Keep the state durable.' }],
+      },
+    });
+    assert.equal(v2Persisted.structuredContent?.status, 'submitted');
+    const v2PersistedState = await chatgpt.callTool({
+      name: REQUEST_USER_INPUT_V2_STATE_TOOL,
+      arguments: { interactionId: v2PersistedInteractionId },
+    });
+    assert.equal(v2PersistedState.structuredContent?.status, 'submitted');
+    assert.deepEqual(v2PersistedState.structuredContent?.answers, v2Persisted.structuredContent?.answers);
 
     const unknownInteractionId = '00000000-0000-4000-8000-000000000000';
     await assertToolError(

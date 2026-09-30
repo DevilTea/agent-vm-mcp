@@ -1,0 +1,1097 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Structured user input</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      font-family: var(--font-sans, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif);
+      background: transparent;
+      color: var(--color-text-primary, CanvasText);
+    }
+
+    * { box-sizing: border-box; }
+    html, body { margin: 0; padding: 0; background: transparent; }
+
+    #root {
+      width: 100%;
+      padding: 0;
+    }
+
+    .card {
+      display: grid;
+      gap: 14px;
+      max-width: 760px;
+    }
+
+    h1 {
+      margin: 12px 12px 0;
+      font-size: 1rem;
+      line-height: 1.4;
+      font-weight: 650;
+    }
+
+    .description,
+    .question-description,
+    .option-description,
+    .status {
+      color: var(--color-text-secondary, GrayText);
+    }
+
+    .description,
+    .question-description {
+      margin: 4px 0 0;
+      font-size: 0.9rem;
+      line-height: 1.45;
+      white-space: pre-wrap;
+    }
+
+    fieldset {
+      border: 0;
+      padding: 0 12px;
+      margin: 0;
+      min-width: 0;
+      display: grid;
+      gap: 8px;
+    }
+
+    legend {
+      padding: 0;
+      font-size: 0.94rem;
+      line-height: 1.4;
+      font-weight: 600;
+    }
+
+    .required::after { content: " *"; }
+
+    #root > .description {
+      margin-inline: 12px;
+    }
+
+    .options {
+      display: grid;
+      gap: 7px;
+    }
+
+    .option-block {
+      display: grid;
+      gap: 6px;
+    }
+
+    .option {
+      display: grid;
+      grid-template-columns: auto 1fr;
+      gap: 8px;
+      align-items: start;
+      padding: 9px 10px;
+      border: 1px solid var(--color-border-default, color-mix(in srgb, CanvasText 18%, transparent));
+      border-radius: 10px;
+      cursor: pointer;
+      background: var(--color-background-secondary, color-mix(in srgb, Canvas 96%, CanvasText 4%));
+      transition: border-color 120ms ease, background 120ms ease;
+    }
+
+    .option:hover {
+      border-color: var(--color-border-emphasis, color-mix(in srgb, CanvasText 35%, transparent));
+    }
+
+    .option-block.selected > .option {
+      border-color: var(--color-border-emphasis, color-mix(in srgb, CanvasText 48%, transparent));
+      background: var(--color-background-tertiary, color-mix(in srgb, Canvas 91%, CanvasText 9%));
+    }
+
+    .option input { margin: 3px 0 0; }
+    .option-main { min-width: 0; }
+    .option-label { font-size: 0.92rem; line-height: 1.35; }
+    .option-description { margin-top: 2px; font-size: 0.8rem; line-height: 1.35; }
+
+    .recommended {
+      display: inline-block;
+      margin-left: 6px;
+      padding: 1px 6px;
+      border-radius: 999px;
+      font-size: 0.72rem;
+      font-weight: 600;
+      color: var(--color-text-info, HighlightText);
+      background: var(--color-background-info, Highlight);
+      vertical-align: 1px;
+    }
+
+    .custom-input {
+      display: grid;
+      gap: 5px;
+      margin: 0 10px 2px 30px;
+    }
+
+    .custom-input[hidden] { display: none; }
+
+    .custom-input-label {
+      font-size: 0.78rem;
+      line-height: 1.35;
+      color: var(--color-text-secondary, GrayText);
+    }
+
+    textarea {
+      width: 100%;
+      border: 1px solid var(--color-border-default, color-mix(in srgb, CanvasText 18%, transparent));
+      border-radius: 9px;
+      padding: 9px 10px;
+      font: inherit;
+      color: inherit;
+      background: var(--color-background-primary, Canvas);
+      resize: vertical;
+    }
+
+    textarea:focus {
+      outline: 2px solid var(--color-border-emphasis, Highlight);
+      outline-offset: 1px;
+    }
+
+    textarea[aria-invalid="true"] {
+      border-color: var(--color-border-danger, #d92d20);
+    }
+
+
+    .error {
+      min-height: 1.2em;
+      font-size: 0.8rem;
+      color: var(--color-text-danger, #b42318);
+    }
+
+    .actions {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin: 0 12px 12px;
+    }
+
+    button {
+      appearance: none;
+      border: 0;
+      border-radius: 9px;
+      padding: 8px 13px;
+      font: inherit;
+      font-weight: 600;
+      color: var(--color-text-on-emphasis, HighlightText);
+      background: var(--color-background-inverse, Highlight);
+      cursor: pointer;
+    }
+
+    button:disabled { opacity: 0.55; cursor: default; }
+    .status { font-size: 0.82rem; }
+
+    .fatal {
+      margin: 12px;
+      padding: 10px;
+      border: 1px solid var(--color-border-danger, #d92d20);
+      border-radius: 9px;
+      color: var(--color-text-danger, #b42318);
+      white-space: pre-wrap;
+    }
+  </style>
+</head>
+<body>
+  <main id="root" class="card" aria-live="polite"></main>
+
+  <script>
+    (() => {
+      'use strict';
+
+      const APP_PROTOCOL_VERSION = '2026-01-26';
+      const FORM_STATE_VERSION = 1;
+      const FORM_STATE_PREFIX = 'agent-vm:request-user-input:v2:';
+      const APP_REQUEST_TIMEOUT_MS = 30_000;
+      const SERVER_STATE_TOOL = 'request_user_input_state_v2';
+      const SERVER_SUBMIT_TOOL = 'request_user_input_submit_v2';
+      const pending = new Map();
+      const sendingInteractions = new Set();
+      const sentInteractions = new Map();
+      const sendErrors = new Map();
+      let nextRequestId = 1;
+      let initialized = false;
+      let hostCapabilities = null;
+      let latestInput = null;
+      let latestResult = null;
+      let authoritativeState = null;
+      let authoritativeInteractionId = null;
+      let renderGeneration = 0;
+      let resizeObserver = null;
+
+      const root = document.getElementById('root');
+
+      function post(message) {
+        window.parent.postMessage({ jsonrpc: '2.0', ...message }, '*');
+      }
+
+      function request(method, params, timeoutMs = APP_REQUEST_TIMEOUT_MS) {
+        const id = nextRequestId++;
+        return new Promise((resolve, reject) => {
+          let timeout = null;
+          const finish = (settle, value) => {
+            if (!pending.has(id)) return;
+            pending.delete(id);
+            if (timeout !== null) clearTimeout(timeout);
+            settle(value);
+          };
+          pending.set(id, {
+            resolve: (value) => finish(resolve, value),
+            reject: (error) => finish(reject, error),
+          });
+          if (timeoutMs > 0) {
+            timeout = setTimeout(() => {
+              finish(reject, new Error(`The host did not acknowledge ${method} within ${timeoutMs / 1000} seconds.`));
+            }, timeoutMs);
+          }
+          try {
+            post({ id, method, params });
+          } catch (error) {
+            finish(reject, error);
+          }
+        });
+      }
+
+      function notify(method, params = {}) {
+        post({ method, params });
+      }
+
+      function text(value) {
+        return value == null ? '' : String(value);
+      }
+
+      function unicodeLength(value) {
+        return Array.from(text(value)).length;
+      }
+
+      function truncateToUnicodeLength(value, maxLength) {
+        return Array.from(text(value)).slice(0, maxLength).join('');
+      }
+
+      function enforceTextMaxLength(input, maxLength) {
+        const limited = truncateToUnicodeLength(input.value, maxLength);
+        if (limited !== input.value) input.value = limited;
+      }
+
+      function setHostContext(hostContext) {
+        const theme = hostContext?.theme;
+        if (theme === 'light' || theme === 'dark') {
+          document.documentElement.dataset.theme = theme;
+          document.documentElement.style.colorScheme = theme;
+        }
+        const variables = hostContext?.styles?.variables;
+        if (variables && typeof variables === 'object') {
+          for (const [name, value] of Object.entries(variables)) {
+            if (typeof value === 'string') document.documentElement.style.setProperty(name, value);
+          }
+        }
+      }
+
+      function sendSize() {
+        if (!initialized) return;
+        const rect = document.documentElement.getBoundingClientRect();
+        notify('ui/notifications/size-changed', {
+          width: Math.ceil(window.innerWidth),
+          height: Math.ceil(rect.height),
+        });
+      }
+
+      function startResizeObserver() {
+        if (typeof ResizeObserver !== 'function' || resizeObserver) return;
+        resizeObserver = new ResizeObserver(() => requestAnimationFrame(sendSize));
+        resizeObserver.observe(document.documentElement);
+        resizeObserver.observe(document.body);
+      }
+
+      function currentPayload() {
+        const result = latestResult?.structuredContent;
+        if (result?.request) return result;
+        const args = latestInput?.arguments;
+        if (args?.questions) {
+          return {
+            schemaVersion: 1,
+            interactionId: null,
+            request: args,
+          };
+        }
+        return null;
+      }
+
+      function formStateKey(payload) {
+        return payload?.interactionId ? `${FORM_STATE_PREFIX}${payload.interactionId}` : null;
+      }
+
+      function readPersistedFormState(payload) {
+        const key = formStateKey(payload);
+        if (!key) return null;
+        try {
+          const parsed = JSON.parse(window.localStorage.getItem(key) ?? 'null');
+          if (
+            parsed?.version !== FORM_STATE_VERSION ||
+            parsed?.interactionId !== payload.interactionId ||
+            !parsed.fields ||
+            typeof parsed.fields !== 'object'
+          ) return null;
+          return parsed;
+        } catch {
+          return null;
+        }
+      }
+
+      function writePersistedFormState(payload, state) {
+        const key = formStateKey(payload);
+        if (!key) return;
+        try {
+          window.localStorage.setItem(key, JSON.stringify({
+            version: FORM_STATE_VERSION,
+            interactionId: payload.interactionId,
+            savedAt: new Date().toISOString(),
+            fields: state.fields,
+          }));
+        } catch {
+          // Storage may be unavailable in a host sandbox; the in-memory form still works.
+        }
+      }
+
+      function make(tag, className, value) {
+        const node = document.createElement(tag);
+        if (className) node.className = className;
+        if (value !== undefined) node.textContent = text(value);
+        return node;
+      }
+
+      function recommendationBadge() {
+        return make('span', 'recommended', 'Recommended');
+      }
+
+      function optionRow(question, option, inputType) {
+        const row = make('div', 'option-block');
+        row.dataset.optionId = option.id;
+
+        const label = make('label', 'option');
+        const input = document.createElement('input');
+        input.type = inputType;
+        input.name = question.id;
+        input.value = option.id;
+        input.dataset.optionChoice = 'true';
+        label.append(input);
+
+        const main = make('span', 'option-main');
+        const heading = make('span', 'option-label', option.label);
+        if (option.recommended) heading.append(recommendationBadge());
+        main.append(heading);
+        if (option.description) main.append(make('div', 'option-description', option.description));
+        label.append(main);
+        row.append(label);
+
+        let customInput = null;
+        if (option.allowCustomInput === true) {
+          const custom = make('div', 'custom-input');
+          custom.hidden = true;
+
+          const customId = `custom-${question.id}-${option.id}`;
+          const customLabel = make('label', 'custom-input-label', `Additional details for ${option.label}`);
+          customLabel.htmlFor = customId;
+
+          customInput = document.createElement('textarea');
+          customInput.rows = 2;
+          customInput.id = customId;
+          customInput.name = `${question.id}__custom__${option.id}`;
+          customInput.placeholder = option.customInputPlaceholder ?? 'Please specify';
+          customInput.dataset.customInput = 'true';
+          customInput.dataset.optionId = option.id;
+          customInput.disabled = true;
+          customInput.setAttribute('aria-required', 'true');
+
+          custom.append(customLabel, customInput);
+          row.append(custom);
+        }
+
+        return { row, label, input, customInput };
+      }
+
+      function syncOptionState(section) {
+        for (const row of section.querySelectorAll('.option-block')) {
+          const choice = row.querySelector('[data-option-choice="true"]');
+          if (!choice) continue;
+
+          row.classList.toggle('selected', choice.checked);
+          const customInput = row.querySelector('[data-custom-input="true"]');
+          const custom = customInput?.closest('.custom-input');
+          if (!customInput || !custom) continue;
+
+          custom.hidden = !choice.checked;
+          customInput.disabled = !choice.checked;
+          if (!choice.checked) customInput.removeAttribute('aria-invalid');
+        }
+      }
+
+      function booleanRow(question, value, labelText) {
+        return optionRow(
+          question,
+          {
+            id: value ? 'true' : 'false',
+            label: labelText,
+            recommended: question.recommendedValue === value,
+          },
+          'radio',
+        );
+      }
+
+      function displayQuestionPrompt(question, index) {
+        const ordinal = `${index + 1}.`;
+        let prompt = text(question.prompt).trimStart();
+        if (prompt.startsWith(ordinal) && /^\s/.test(prompt.slice(ordinal.length))) {
+          prompt = prompt.slice(ordinal.length).trimStart();
+        }
+        return `${ordinal} ${prompt}`;
+      }
+
+      function renderQuestion(question, index) {
+        const section = document.createElement('fieldset');
+        section.dataset.questionId = question.id;
+        section.dataset.kind = question.kind;
+        section.dataset.required = question.required === false ? 'false' : 'true';
+
+        const legend = make('legend', question.required === false ? '' : 'required', displayQuestionPrompt(question, index));
+        section.append(legend);
+        if (question.description) section.append(make('p', 'question-description', question.description));
+
+        if (question.kind === 'single_select' || question.kind === 'multi_select') {
+          const options = make('div', 'options');
+          for (const option of question.options ?? []) {
+            const { row } = optionRow(question, option, question.kind === 'single_select' ? 'radio' : 'checkbox');
+            options.append(row);
+          }
+          options.addEventListener('change', (event) => {
+            if (event.target?.matches?.('[data-option-choice="true"]')) syncOptionState(section);
+          });
+          section.append(options);
+          section.dataset.minSelections = String(question.minSelections ?? 0);
+          section.dataset.maxSelections = question.maxSelections == null ? '' : String(question.maxSelections);
+          syncOptionState(section);
+        } else if (question.kind === 'boolean') {
+          const options = make('div', 'options');
+          options.append(booleanRow(question, true, question.trueLabel ?? 'Yes').row);
+          options.append(booleanRow(question, false, question.falseLabel ?? 'No').row);
+          options.addEventListener('change', (event) => {
+            if (event.target?.matches?.('[data-option-choice="true"]')) syncOptionState(section);
+          });
+          section.append(options);
+          syncOptionState(section);
+        } else if (question.kind === 'text') {
+          const input = document.createElement('textarea');
+          input.rows = 2;
+          input.name = question.id;
+          const maxLength = Number(question.maxLength ?? 2000);
+          input.dataset.maxLength = String(maxLength);
+          input.addEventListener('input', () => enforceTextMaxLength(input, maxLength));
+          input.addEventListener('paste', () => requestAnimationFrame(() => enforceTextMaxLength(input, maxLength)));
+          if (question.placeholder) input.placeholder = question.placeholder;
+          section.append(input);
+        }
+
+        const error = make('div', 'error');
+        error.dataset.errorFor = question.id;
+        section.append(error);
+        return section;
+      }
+
+      function selectedLabels(question, values) {
+        const byId = new Map((question.options ?? []).map((option) => [option.id, option.label]));
+        return values.map((value) => byId.get(value) ?? value);
+      }
+
+      function collectCustomValues(question, fieldset, values) {
+        const customValues = {};
+        const missingLabels = [];
+
+        for (const input of fieldset.querySelectorAll('[data-custom-input="true"]')) {
+          input.removeAttribute('aria-invalid');
+        }
+
+        for (const value of values) {
+          const row = fieldset.querySelector(`[data-option-id="${CSS.escape(value)}"]`);
+          const input = row?.querySelector('[data-custom-input="true"]');
+          if (!input) continue;
+
+          const customValue = input.value.trim();
+          if (!customValue) {
+            input.setAttribute('aria-invalid', 'true');
+            missingLabels.push(selectedLabels(question, [value])[0] ?? value);
+          } else {
+            customValues[value] = customValue;
+          }
+        }
+
+        return { customValues, missingLabels };
+      }
+
+      function customInputError(labels) {
+        if (labels.length === 0) return '';
+        const quoted = labels.map((label) => `“${label}”`).join(', ');
+        return `Please provide additional details for ${quoted}.`;
+      }
+
+      function collectAnswers(requestData, form) {
+        const answers = [];
+        let valid = true;
+
+        for (const question of requestData.questions) {
+          const fieldset = form.querySelector(`[data-question-id="${CSS.escape(question.id)}"]`);
+          const error = fieldset.querySelector(`[data-error-for="${CSS.escape(question.id)}"]`);
+          error.textContent = '';
+          const required = question.required !== false;
+
+          if (question.kind === 'single_select') {
+            const checked = fieldset.querySelector(`input[name="${CSS.escape(question.id)}"]:checked`);
+            if (!checked && required) {
+              error.textContent = 'Please select an option.';
+              valid = false;
+              continue;
+            }
+            const value = checked?.value ?? null;
+            const { customValues, missingLabels } = collectCustomValues(
+              question,
+              fieldset,
+              value == null ? [] : [value],
+            );
+            if (missingLabels.length > 0) {
+              error.textContent = customInputError(missingLabels);
+              valid = false;
+              continue;
+            }
+            answers.push({
+              questionId: question.id,
+              kind: question.kind,
+              value,
+              customValues,
+            });
+          } else if (question.kind === 'multi_select') {
+            const values = [...fieldset.querySelectorAll(`input[name="${CSS.escape(question.id)}"]:checked`)].map((input) => input.value);
+            const minSelections = Math.max(required ? 1 : 0, Number(question.minSelections ?? 0));
+            const maxSelections = question.maxSelections == null ? Infinity : Number(question.maxSelections);
+            if (values.length < minSelections) {
+              error.textContent = `Select at least ${minSelections} option${minSelections === 1 ? '' : 's'}.`;
+              valid = false;
+              continue;
+            }
+            if (values.length > maxSelections) {
+              error.textContent = `Select at most ${maxSelections} options.`;
+              valid = false;
+              continue;
+            }
+            const { customValues, missingLabels } = collectCustomValues(question, fieldset, values);
+            if (missingLabels.length > 0) {
+              error.textContent = customInputError(missingLabels);
+              valid = false;
+              continue;
+            }
+            answers.push({
+              questionId: question.id,
+              kind: question.kind,
+              value: values,
+              customValues,
+            });
+          } else if (question.kind === 'boolean') {
+            const checked = fieldset.querySelector(`input[name="${CSS.escape(question.id)}"]:checked`);
+            if (!checked && required) {
+              error.textContent = 'Please choose yes or no.';
+              valid = false;
+              continue;
+            }
+            const value = checked ? checked.value === 'true' : null;
+            answers.push({ questionId: question.id, kind: question.kind, value });
+          } else if (question.kind === 'text') {
+            const input = fieldset.querySelector(`[name="${CSS.escape(question.id)}"]`);
+            const maxLength = Number(question.maxLength ?? 2000);
+            enforceTextMaxLength(input, maxLength);
+            if (unicodeLength(input.value) > maxLength) {
+              error.textContent = `Response must be at most ${maxLength} character${maxLength === 1 ? '' : 's'}.`;
+              valid = false;
+              continue;
+            }
+            const value = input.value.trim();
+            if (!value && required) {
+              error.textContent = 'Please enter a response.';
+              valid = false;
+              continue;
+            }
+            answers.push({ questionId: question.id, kind: question.kind, value: value || null });
+          }
+        }
+
+        return { valid, answers };
+      }
+
+      function snapshotFormFields(requestData, form) {
+        const fields = {};
+
+        for (const question of requestData.questions) {
+          const fieldset = form.querySelector(`[data-question-id="${CSS.escape(question.id)}"]`);
+          if (!fieldset) continue;
+
+          const customValues = {};
+          for (const input of fieldset.querySelectorAll('[data-custom-input="true"]')) {
+            customValues[input.dataset.optionId] = input.value;
+          }
+
+          if (question.kind === 'single_select' || question.kind === 'boolean') {
+            const checked = fieldset.querySelector(`input[name="${CSS.escape(question.id)}"]:checked`);
+            fields[question.id] = { value: checked?.value ?? null, customValues };
+          } else if (question.kind === 'multi_select') {
+            const values = [...fieldset.querySelectorAll(`input[name="${CSS.escape(question.id)}"]:checked`)]
+              .map((input) => input.value);
+            fields[question.id] = { value: values, customValues };
+          } else if (question.kind === 'text') {
+            const input = fieldset.querySelector(`[name="${CSS.escape(question.id)}"]`);
+            fields[question.id] = { value: input?.value ?? '' };
+          }
+        }
+
+        return fields;
+      }
+
+      function persistCurrentForm(payload, form) {
+        writePersistedFormState(payload, {
+          fields: snapshotFormFields(payload.request, form),
+        });
+      }
+
+      function restorePersistedForm(payload, form) {
+        const persisted = readPersistedFormState(payload);
+        if (!persisted) return { restored: false };
+
+        for (const question of payload.request.questions) {
+          const saved = persisted.fields[question.id];
+          if (!saved || typeof saved !== 'object') continue;
+          const fieldset = form.querySelector(`[data-question-id="${CSS.escape(question.id)}"]`);
+          if (!fieldset) continue;
+
+          if (question.kind === 'single_select' || question.kind === 'boolean') {
+            const allowed = new Set(
+              question.kind === 'boolean'
+                ? ['true', 'false']
+                : (question.options ?? []).map((option) => option.id),
+            );
+            if (typeof saved.value === 'string' && allowed.has(saved.value)) {
+              const input = fieldset.querySelector(
+                `input[name="${CSS.escape(question.id)}"][value="${CSS.escape(saved.value)}"]`,
+              );
+              if (input) input.checked = true;
+            }
+          } else if (question.kind === 'multi_select' && Array.isArray(saved.value)) {
+            const allowed = new Set((question.options ?? []).map((option) => option.id));
+            for (const value of saved.value) {
+              if (typeof value !== 'string' || !allowed.has(value)) continue;
+              const input = fieldset.querySelector(
+                `input[name="${CSS.escape(question.id)}"][value="${CSS.escape(value)}"]`,
+              );
+              if (input) input.checked = true;
+            }
+          } else if (question.kind === 'text' && typeof saved.value === 'string') {
+            const input = fieldset.querySelector(`[name="${CSS.escape(question.id)}"]`);
+            if (input) input.value = truncateToUnicodeLength(saved.value, Number(question.maxLength ?? 2000));
+          }
+
+          if (saved.customValues && typeof saved.customValues === 'object') {
+            for (const input of fieldset.querySelectorAll('[data-custom-input="true"]')) {
+              const value = saved.customValues[input.dataset.optionId];
+              if (typeof value === 'string') input.value = value;
+            }
+          }
+
+          syncOptionState(fieldset);
+        }
+
+        return { restored: true };
+      }
+
+      function knownAuthoritativeState(payload) {
+        if (authoritativeInteractionId === payload.interactionId) return authoritativeState;
+        const resultState = latestResult?.structuredContent?.state;
+        if (resultState?.interactionId === payload.interactionId) return resultState;
+        return null;
+      }
+
+      function serverToolsAvailable() {
+        return hostCapabilities?.serverTools != null;
+      }
+
+      function describeResponseShape(value, depth = 0, seen = new WeakSet()) {
+        if (value === null) return 'null';
+        if (Array.isArray(value)) {
+          if (depth >= 3 || value.length === 0) return `array(${value.length})`;
+          return `array(${value.length})[${describeResponseShape(value[0], depth + 1, seen)}]`;
+        }
+
+        const valueType = typeof value;
+        if (valueType !== 'object') return valueType;
+        if (seen.has(value)) return 'object{circular}';
+        seen.add(value);
+
+        const keys = Object.keys(value).sort();
+        if (depth >= 3) return `object{${keys.join(',')}}`;
+        return `object{${keys.map((key) => `${key}:${describeResponseShape(value[key], depth + 1, seen)}`).join(',')}}`;
+      }
+
+      function isValidInteractionState(state, payload) {
+        return Boolean(
+          state &&
+          state.schemaVersion === 1 &&
+          state.interactionId === payload.interactionId &&
+          (state.status === 'pending' || state.status === 'submitted') &&
+          (state.status !== 'pending' || state.answers === null) &&
+          (state.status !== 'submitted' || Array.isArray(state.answers))
+        );
+      }
+
+      function stateFromToolResult(result, payload) {
+        const toolResult = result?.toolResult ?? result;
+        if (toolResult?.isError) throw new Error('The server rejected the interaction state request.');
+
+        let state = toolResult?.structuredContent;
+        if (!isValidInteractionState(state, payload) && Array.isArray(toolResult?.content)) {
+          const fallback = toolResult.content.find(
+            (block) => block?.type === 'text' && typeof block.text === 'string',
+          );
+          if (fallback) {
+            try {
+              const fallbackState = JSON.parse(fallback.text);
+              if (isValidInteractionState(fallbackState, payload)) state = fallbackState;
+            } catch {
+              // Validation below reports a single stable error for malformed server state.
+            }
+          }
+        }
+        if (!isValidInteractionState(state, payload)) {
+          throw new Error(
+            `The server returned invalid interaction state. Response shape: ${describeResponseShape(result)}`,
+          );
+        }
+        return state;
+      }
+
+      async function readAuthoritativeState(payload) {
+        const result = await request('tools/call', {
+          name: SERVER_STATE_TOOL,
+          arguments: { interactionId: payload.interactionId },
+        });
+        return stateFromToolResult(result, payload);
+      }
+
+      async function submitAuthoritativeState(payload, answers) {
+        const result = await request('tools/call', {
+          name: SERVER_SUBMIT_TOOL,
+          arguments: {
+            interactionId: payload.interactionId,
+            answers,
+          },
+        });
+        return stateFromToolResult(result, payload);
+      }
+
+      function restoreAuthoritativeAnswers(payload, form, answers) {
+        const answerById = new Map((answers ?? []).map((answer) => [answer.questionId, answer]));
+        for (const question of payload.request.questions) {
+          const fieldset = form.querySelector(`[data-question-id="${CSS.escape(question.id)}"]`);
+          const answer = answerById.get(question.id);
+          if (!fieldset || !answer) continue;
+
+          for (const input of fieldset.querySelectorAll('[data-option-choice="true"]')) input.checked = false;
+          for (const input of fieldset.querySelectorAll('[data-custom-input="true"]')) input.value = '';
+
+          if (question.kind === 'single_select') {
+            if (typeof answer.value === 'string') {
+              const input = fieldset.querySelector(
+                `input[name="${CSS.escape(question.id)}"][value="${CSS.escape(answer.value)}"]`,
+              );
+              if (input) input.checked = true;
+            }
+          } else if (question.kind === 'multi_select') {
+            for (const value of Array.isArray(answer.value) ? answer.value : []) {
+              const input = fieldset.querySelector(
+                `input[name="${CSS.escape(question.id)}"][value="${CSS.escape(value)}"]`,
+              );
+              if (input) input.checked = true;
+            }
+          } else if (question.kind === 'boolean') {
+            if (typeof answer.value === 'boolean') {
+              const value = String(answer.value);
+              const input = fieldset.querySelector(
+                `input[name="${CSS.escape(question.id)}"][value="${CSS.escape(value)}"]`,
+              );
+              if (input) input.checked = true;
+            }
+          } else if (question.kind === 'text') {
+            const input = fieldset.querySelector(`[name="${CSS.escape(question.id)}"]`);
+            if (input) input.value = truncateToUnicodeLength(answer.value ?? '', Number(question.maxLength ?? 2000));
+          }
+
+          for (const input of fieldset.querySelectorAll('[data-custom-input="true"]')) {
+            const value = answer.customValues?.[input.dataset.optionId];
+            if (typeof value === 'string') input.value = value;
+          }
+          syncOptionState(fieldset);
+        }
+      }
+
+      function responseText(payload, answers) {
+        const requestData = payload.request;
+        const lines = [`Title: ${requestData.title}`];
+        if (requestData.description) lines.push(`Context: ${requestData.description}`);
+        lines.push('');
+
+        const answerById = new Map(answers.map((answer) => [answer.questionId, answer]));
+        requestData.questions.forEach((question, index) => {
+          const answer = answerById.get(question.id);
+          lines.push(`${index + 1}. ${question.prompt}`);
+          lines.push(`   Question ID: ${question.id}`);
+          if (!answer || answer.value == null || (Array.isArray(answer.value) && answer.value.length === 0)) {
+            lines.push('   Answer: (no response)');
+            lines.push('   Value: null');
+            lines.push('');
+            return;
+          }
+          if (question.kind === 'text') {
+            lines.push(`   Answer: ${answer.value}`);
+            lines.push(`   Value: ${JSON.stringify(answer.value)}`);
+          } else if (question.kind === 'single_select' || question.kind === 'multi_select') {
+            const values = Array.isArray(answer.value) ? answer.value : [answer.value];
+            const optionsById = new Map((question.options ?? []).map((option) => [option.id, option]));
+            const customValues = answer.customValues ?? {};
+            for (const optionId of values) {
+              const option = optionsById.get(optionId);
+              lines.push(`   Answer: ${option?.label ?? optionId}`);
+              lines.push(`   Value: ${optionId}`);
+              if (Object.hasOwn(customValues, optionId)) {
+                lines.push(`   Custom value [${option?.label ?? optionId} / ${optionId}]: ${customValues[optionId]}`);
+              }
+            }
+          } else {
+            const label = answer.value ? question.trueLabel ?? 'Yes' : question.falseLabel ?? 'No';
+            lines.push(`   Answer: ${label}`);
+            lines.push(`   Value: ${String(answer.value)}`);
+          }
+          lines.push('');
+        });
+
+        return lines.join('\n').trimEnd();
+      }
+
+      async function submitForm(payload, form, submitButton, status, controls) {
+        if (
+          controls.submitted ||
+          controls.submitting ||
+          (payload.interactionId && sendingInteractions.has(payload.interactionId))
+        ) return;
+        const { valid, answers } = collectAnswers(payload.request, form);
+        if (!valid) {
+          sendSize();
+          return;
+        }
+
+        controls.submitting = true;
+        if (payload.interactionId) {
+          sendingInteractions.add(payload.interactionId);
+          sendErrors.delete(payload.interactionId);
+        }
+        submitButton.disabled = true;
+        status.textContent = 'Sending response…';
+        persistCurrentForm(payload, form);
+        let messageResult;
+        try {
+          messageResult = await request('ui/message', {
+            role: 'user',
+            content: [{ type: 'text', text: responseText(payload, answers) }],
+          });
+          if (messageResult?.isError === true) {
+            throw new Error('The host did not accept the response message.');
+          }
+        } catch (error) {
+          controls.submitting = false;
+          if (payload.interactionId) {
+            sendingInteractions.delete(payload.interactionId);
+            sendErrors.set(payload.interactionId, `Could not send response: ${error?.message ?? error}`);
+          }
+          submitButton.disabled = false;
+          status.textContent = `Could not send response: ${error?.message ?? error}`;
+          if (payload.interactionId) render();
+          else sendSize();
+          return;
+        }
+
+        controls.submitting = false;
+        controls.submitted = true;
+        if (payload.interactionId) {
+          sendingInteractions.delete(payload.interactionId);
+          sentInteractions.set(payload.interactionId, {
+            answers,
+            status: 'Response sent. Saving submission state…',
+          });
+        }
+        for (const input of form.querySelectorAll('input, textarea, button')) input.disabled = true;
+        status.textContent = payload.interactionId
+          ? sentInteractions.get(payload.interactionId).status
+          : 'Response sent.';
+        persistCurrentForm(payload, form);
+
+        if (payload.interactionId && serverToolsAvailable()) {
+          try {
+            const state = await submitAuthoritativeState(payload, answers);
+            if (state.status !== 'submitted') {
+              throw new Error('The server did not confirm the submitted state.');
+            }
+            authoritativeInteractionId = payload.interactionId;
+            authoritativeState = state;
+            sentInteractions.get(payload.interactionId).status = 'Response sent.';
+            status.textContent = 'Response sent.';
+          } catch (error) {
+            const message = `Response sent, but submission state could not be saved: ${error?.message ?? error}`;
+            sentInteractions.get(payload.interactionId).status = message;
+            status.textContent = message;
+          }
+        } else if (payload.interactionId) {
+          sentInteractions.get(payload.interactionId).status = 'Response sent.';
+          status.textContent = 'Response sent.';
+        }
+        if (payload.interactionId) render();
+        else sendSize();
+      }
+
+      function render() {
+        const payload = currentPayload();
+        if (!payload?.request?.questions) return;
+        const generation = ++renderGeneration;
+        const knownState = knownAuthoritativeState(payload);
+        const locallySentAnswers = payload.interactionId
+          ? sentInteractions.get(payload.interactionId)
+          : null;
+        const controls = {
+          submitted: locallySentAnswers !== undefined || knownState?.status === 'submitted',
+          submitting: Boolean(payload.interactionId && sendingInteractions.has(payload.interactionId)),
+        };
+
+        root.replaceChildren();
+        root.append(make('h1', '', payload.request.title));
+        if (payload.request.description) root.append(make('p', 'description', payload.request.description));
+
+        const form = document.createElement('form');
+        form.className = 'card';
+        payload.request.questions.forEach((question, index) => form.append(renderQuestion(question, index)));
+
+        const actions = make('div', 'actions');
+        const submitButton = make('button', '', payload.request.submitLabel ?? 'Submit');
+        submitButton.type = 'submit';
+        const status = make('span', 'status');
+        if (!payload.interactionId) {
+          submitButton.disabled = true;
+          status.textContent = 'Preparing…';
+        }
+        actions.append(submitButton, status);
+        form.append(actions);
+        restorePersistedForm(payload, form);
+        if (controls.submitted) {
+          restoreAuthoritativeAnswers(payload, form, locallySentAnswers?.answers ?? knownState?.answers);
+          for (const input of form.querySelectorAll('input, textarea, button')) input.disabled = true;
+          status.textContent = locallySentAnswers?.status ?? 'Submitted.';
+        } else if (controls.submitting) {
+          for (const input of form.querySelectorAll('input, textarea, button')) input.disabled = true;
+          status.textContent = 'Sending response…';
+        }
+        form.addEventListener('input', () => {
+          if (!controls.submitted) persistCurrentForm(payload, form);
+        });
+        form.addEventListener('change', () => {
+          if (!controls.submitted) persistCurrentForm(payload, form);
+        });
+        form.addEventListener('submit', (event) => {
+          event.preventDefault();
+          void submitForm(payload, form, submitButton, status, controls);
+        });
+        root.append(form);
+
+        if (payload.interactionId && !controls.submitted && !controls.submitting) {
+          if (hostCapabilities === null) {
+            submitButton.disabled = true;
+            status.textContent = 'Preparing server state…';
+          } else if (!serverToolsAvailable()) {
+            submitButton.disabled = false;
+            status.textContent = sendErrors.get(payload.interactionId) ?? '';
+          } else {
+            submitButton.disabled = true;
+            status.textContent = 'Checking server state…';
+            void readAuthoritativeState(payload).then((state) => {
+              if (generation !== renderGeneration) return;
+              authoritativeInteractionId = payload.interactionId;
+              authoritativeState = state;
+              if (state.status === 'submitted') {
+                controls.submitted = true;
+                restoreAuthoritativeAnswers(payload, form, state.answers);
+                for (const input of form.querySelectorAll('input, textarea, button')) input.disabled = true;
+                status.textContent = 'Submitted.';
+                return;
+              }
+              submitButton.disabled = false;
+              status.textContent = sendErrors.get(payload.interactionId) ?? '';
+            }).catch((error) => {
+              if (generation !== renderGeneration) return;
+              submitButton.disabled = false;
+              status.textContent = sendErrors.get(payload.interactionId) ??
+                `Could not read saved state; you can still submit: ${error?.message ?? error}`;
+            });
+          }
+        }
+
+        requestAnimationFrame(sendSize);
+      }
+
+      function showFatal(error) {
+        root.replaceChildren(make('div', 'fatal', `Unable to initialize interaction UI.\n${error?.message ?? error}`));
+      }
+
+      window.addEventListener('message', (event) => {
+        if (event.source !== window.parent) return;
+        const message = event.data;
+        if (!message || message.jsonrpc !== '2.0') return;
+
+        if (message.id !== undefined && pending.has(message.id)) {
+          const waiter = pending.get(message.id);
+          if (message.error) waiter.reject(new Error(message.error.message ?? 'Host request failed'));
+          else waiter.resolve(message.result);
+          return;
+        }
+
+        if (message.method === 'ui/notifications/tool-input') {
+          latestInput = message.params;
+          render();
+        } else if (message.method === 'ui/notifications/tool-result') {
+          latestResult = message.params;
+          render();
+        } else if (message.method === 'ui/notifications/host-context-changed') {
+          setHostContext(message.params);
+        }
+      }, { passive: true });
+
+      void (async () => {
+        try {
+          const result = await request('ui/initialize', {
+            appInfo: { name: 'Agent VM structured user input', version: '2.0.0' },
+            appCapabilities: { availableDisplayModes: ['inline'] },
+            protocolVersion: APP_PROTOCOL_VERSION,
+          });
+          hostCapabilities = result?.hostCapabilities ?? {};
+          setHostContext(result?.hostContext);
+          notify('ui/notifications/initialized');
+          initialized = true;
+          startResizeObserver();
+          render();
+          sendSize();
+        } catch (error) {
+          showFatal(error);
+        }
+      })();
+    })();
+  </script>
+</body>
+</html>

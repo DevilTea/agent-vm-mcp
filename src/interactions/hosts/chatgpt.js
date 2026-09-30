@@ -20,35 +20,46 @@ import {
 } from '../model.js';
 import { InteractionStore, stateFromRecord } from '../store.js';
 
+const CHATGPT_V1_INTERACTION_RESOURCE_NAME = 'Agent VM structured user input v1';
 const CHATGPT_INTERACTION_RESOURCE_NAME = 'Agent VM structured user input';
 export const REQUEST_USER_INPUT_STATE_TOOL = 'request_user_input_state';
 export const REQUEST_USER_INPUT_SUBMIT_TOOL = 'request_user_input_submit';
+export const REQUEST_USER_INPUT_V2_STATE_TOOL = 'request_user_input_state_v2';
+export const REQUEST_USER_INPUT_V2_SUBMIT_TOOL = 'request_user_input_submit_v2';
 export const CHATGPT_INTERACTION_TOOL_NAMES = [
   REQUEST_USER_INPUT_TOOL,
   REQUEST_USER_INPUT_STATE_TOOL,
   REQUEST_USER_INPUT_SUBMIT_TOOL,
+  REQUEST_USER_INPUT_V2_STATE_TOOL,
+  REQUEST_USER_INPUT_V2_SUBMIT_TOOL,
 ];
-const CHATGPT_UI_PATH = new URL('./chatgpt-app.html', import.meta.url);
-const CHATGPT_UI_HTML = readFileSync(CHATGPT_UI_PATH, 'utf8');
+// Keep chatgpt-app.html byte-for-byte compatible with cards already in conversations.
+const CHATGPT_V1_UI_HTML = readFileSync(new URL('./chatgpt-app.html', import.meta.url), 'utf8');
+const CHATGPT_V2_UI_HTML = readFileSync(new URL('./chatgpt-app-v2.html', import.meta.url), 'utf8');
 const CHATGPT_UI_RESOURCE_META = {
   'openai/widgetPrefersBorder': true,
   ui: {
     prefersBorder: true,
   },
 };
-const CHATGPT_UI_REVISION = createHash('sha256')
-  .update(CHATGPT_UI_HTML)
-  .update('\0')
-  .update(JSON.stringify(CHATGPT_UI_RESOURCE_META))
-  .digest('hex')
-  .slice(0, 12);
-export const CHATGPT_INTERACTION_RESOURCE_URI =
-  `ui://agent-vm/request-user-input/v1-${CHATGPT_UI_REVISION}.html`;
+function resourceUri(version, html) {
+  const revision = createHash('sha256')
+    .update(html)
+    .update('\0')
+    .update(JSON.stringify(CHATGPT_UI_RESOURCE_META))
+    .digest('hex')
+    .slice(0, 12);
+  return `ui://agent-vm/request-user-input/${version}-${revision}.html`;
+}
 
-function appToolMeta() {
+export const CHATGPT_INTERACTION_V1_RESOURCE_URI = resourceUri('v1', CHATGPT_V1_UI_HTML);
+export const CHATGPT_INTERACTION_RESOURCE_URI =
+  resourceUri('v2', CHATGPT_V2_UI_HTML);
+
+function appToolMeta(resourceUri) {
   return {
     ui: {
-      resourceUri: CHATGPT_INTERACTION_RESOURCE_URI,
+      resourceUri,
       visibility: ['app'],
     },
   };
@@ -71,6 +82,26 @@ export async function registerChatgptInteractionAdapter(server) {
 
   registerAppResource(
     server,
+    CHATGPT_V1_INTERACTION_RESOURCE_NAME,
+    CHATGPT_INTERACTION_V1_RESOURCE_URI,
+    {
+      description: 'Historical v1 inline structured question form retained for existing conversation cards.',
+      _meta: CHATGPT_UI_RESOURCE_META,
+    },
+    async () => ({
+      contents: [
+        {
+          uri: CHATGPT_INTERACTION_V1_RESOURCE_URI,
+          mimeType: RESOURCE_MIME_TYPE,
+          text: CHATGPT_V1_UI_HTML,
+          _meta: CHATGPT_UI_RESOURCE_META,
+        },
+      ],
+    }),
+  );
+
+  registerAppResource(
+    server,
     CHATGPT_INTERACTION_RESOURCE_NAME,
     CHATGPT_INTERACTION_RESOURCE_URI,
     {
@@ -82,7 +113,7 @@ export async function registerChatgptInteractionAdapter(server) {
         {
           uri: CHATGPT_INTERACTION_RESOURCE_URI,
           mimeType: RESOURCE_MIME_TYPE,
-          text: CHATGPT_UI_HTML,
+          text: CHATGPT_V2_UI_HTML,
           _meta: CHATGPT_UI_RESOURCE_META,
         },
       ],
@@ -152,7 +183,7 @@ export async function registerChatgptInteractionAdapter(server) {
         idempotentHint: true,
         openWorldHint: false,
       },
-      _meta: appToolMeta(),
+      _meta: appToolMeta(CHATGPT_INTERACTION_V1_RESOURCE_URI),
     },
     async ({ interactionId }) => stateToolResult(await interactionStore.getState(interactionId)),
   );
@@ -174,7 +205,48 @@ export async function registerChatgptInteractionAdapter(server) {
         idempotentHint: false,
         openWorldHint: false,
       },
-      _meta: appToolMeta(),
+      _meta: appToolMeta(CHATGPT_INTERACTION_V1_RESOURCE_URI),
+    },
+    async ({ interactionId, answers }) => stateToolResult(await interactionStore.submit(interactionId, answers)),
+  );
+
+  registerAppTool(
+    server,
+    REQUEST_USER_INPUT_V2_STATE_TOOL,
+    {
+      title: 'Read request user input state (v2)',
+      description: 'Read the authoritative server-side state for one v2 request_user_input interaction from this App.',
+      inputSchema: z.object({ interactionId: z.string().uuid() }).strict(),
+      outputSchema: interactionStateSchema,
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+      _meta: appToolMeta(CHATGPT_INTERACTION_RESOURCE_URI),
+    },
+    async ({ interactionId }) => stateToolResult(await interactionStore.getState(interactionId)),
+  );
+
+  registerAppTool(
+    server,
+    REQUEST_USER_INPUT_V2_SUBMIT_TOOL,
+    {
+      title: 'Save request user input submission (v2)',
+      description: 'Persist validated structured answers after the v2 App has sent the user response message.',
+      inputSchema: z.object({
+        interactionId: z.string().uuid(),
+        answers: interactionAnswersSchema,
+      }).strict(),
+      outputSchema: interactionSubmissionResultSchema,
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: false,
+        openWorldHint: false,
+      },
+      _meta: appToolMeta(CHATGPT_INTERACTION_RESOURCE_URI),
     },
     async ({ interactionId, answers }) => stateToolResult(await interactionStore.submit(interactionId, answers)),
   );
