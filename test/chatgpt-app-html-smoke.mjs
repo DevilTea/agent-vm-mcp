@@ -600,7 +600,7 @@ function makeV2Server(id, { messageFailures = 0, lostMessageAcks = 0, persistenc
   return { server, state, events, messages };
 }
 
-async function openV2Form(testServer, id) {
+function mountV2Interaction(testServer, id) {
   const harness = makeHarness(testServer.server, v2ScriptSource, { accelerateTimeouts: true });
   harness.window.dispatchMessage({
     jsonrpc: '2.0',
@@ -619,6 +619,11 @@ async function openV2Form(testServer, id) {
       },
     },
   });
+  return harness;
+}
+
+async function openV2Form(testServer, id) {
+  const harness = mountV2Interaction(testServer, id);
   await waitFor(
     () => harness.document.root.querySelector('form')?.querySelector('button')?.disabled === false,
     `v2 form did not become available for submission (status: ${harness.document.root.querySelector('.status')?.textContent ?? 'missing'})`,
@@ -637,6 +642,16 @@ function assertV2FreeTextControlsAreTwoRowTextareas(form) {
     assert.equal(input.tagName?.toLowerCase(), 'textarea', 'v2 custom free-text inputs must render as textarea');
     assert.equal(input.rows, 2, 'v2 custom free-text inputs must default to two rows');
   }
+}
+
+function assertSubmittedSummary(harness, expectedResponseText, statusPattern = /Submitted|Response sent/) {
+  const summary = harness.document.root.querySelector('[data-submitted-summary="true"]');
+  assert.ok(summary, 'submitted v2 interaction must render a visible summary');
+  assert.equal(harness.document.root.querySelector('form'), null, 'submitted summary must replace editable form controls');
+  assert.equal(summary.querySelector('.submission-summary-title')?.textContent, 'Submitted response');
+  assert.match(summary.querySelector('.submission-summary-status')?.textContent ?? '', statusPattern);
+  assert.equal(summary.querySelector('.submission-summary-body')?.textContent, expectedResponseText);
+  return summary;
 }
 
 function fillV2Form(form) {
@@ -702,10 +717,25 @@ assert.match(responseText, /3\. Why is this suitable\?/);
 assert.match(responseText, /Answer: Keep provenance/);
 assert.match(responseText, /Value: "Keep provenance"/);
 assert.equal('structuredContent' in sentMessage, false, 'the user response must be understandable without a structured payload');
-const submittedForm = retryHarness.document.root.querySelector('form');
-submittedForm.dispatchEvent(event('submit', submittedForm));
+await waitFor(
+  () => retryHarness.document.root.querySelector('[data-submitted-summary="true"]'),
+  'successful submission did not replace the form with a visible summary',
+);
+assertSubmittedSummary(retryHarness, responseText);
+retryableForm.dispatchEvent(event('submit', retryableForm));
 await new Promise((resolve) => setTimeout(resolve, 10));
-assert.equal(retryServer.messages.length, 1, 'a submitted v2 form must not send a duplicate message');
+assert.equal(retryServer.messages.length, 1, 'a stale pre-submit form must not resend after summary is shown');
+
+const hydratedInteractionId = '7cf71094-6059-4aa1-8a88-ce8352ce4031';
+const hydratedServer = makeV2Server(hydratedInteractionId);
+hydratedServer.state.status = 'submitted';
+hydratedServer.state.answers = clone(retryServer.state.answers);
+const hydratedHarness = mountV2Interaction(hydratedServer, hydratedInteractionId);
+await waitFor(
+  () => hydratedHarness.document.root.querySelector('[data-submitted-summary="true"]'),
+  'authoritative submitted state did not hydrate into a summary',
+);
+assertSubmittedSummary(hydratedHarness, responseText, /Submitted/);
 
 const lostAckInteractionId = '870a05d6-91c5-4483-91c6-ffbfb2c22da2';
 const lostAckServer = makeV2Server(lostAckInteractionId, { lostMessageAcks: 1 });
@@ -735,12 +765,16 @@ const persistenceFailureForm = persistenceFailureHarness.document.root.querySele
 fillV2Form(persistenceFailureForm);
 persistenceFailureForm.dispatchEvent(event('submit', persistenceFailureForm));
 await waitFor(
-  () => persistenceFailureForm.querySelector('.status')?.textContent.includes('submission state could not be saved'),
-  'successful ui/message followed by persistence failure was not reported',
+  () => persistenceFailureHarness.document.root.querySelector('.submission-summary-status')?.textContent.includes('submission state could not be saved'),
+  'successful ui/message followed by persistence failure was not reported in the submitted summary',
 );
 assert.equal(persistenceFailureServer.state.status, 'pending', 'simulated secondary persistence failure must not change server state');
 assert.equal(persistenceFailureServer.messages.length, 1, 'the primary user message should still be sent once');
-assert.equal(persistenceFailureForm.querySelector('button').disabled, true, 'successful message must latch the rendered form');
+assertSubmittedSummary(
+  persistenceFailureHarness,
+  persistenceFailureServer.messages[0].content[0].text,
+  /submission state could not be saved/,
+);
 persistenceFailureHarness.window.dispatchMessage({
   jsonrpc: '2.0',
   method: 'ui/notifications/tool-input',
@@ -759,12 +793,11 @@ persistenceFailureHarness.window.dispatchMessage({
   },
 });
 await waitFor(
-  () => persistenceFailureHarness.document.root.querySelector('form')?.querySelector('button')?.disabled === true,
-  'v2 re-render lost its local sent-message latch after persistence failure',
+  () => persistenceFailureHarness.document.root.querySelector('[data-submitted-summary="true"]'),
+  'v2 re-render lost its local submitted summary after persistence failure',
 );
-persistenceFailureHarness.document.root.querySelector('form').dispatchEvent(
-  event('submit', persistenceFailureHarness.document.root.querySelector('form')),
-);
+assert.equal(persistenceFailureHarness.document.root.querySelector('form'), null);
+persistenceFailureForm.dispatchEvent(event('submit', persistenceFailureForm));
 await new Promise((resolve) => setTimeout(resolve, 10));
 assert.equal(persistenceFailureServer.messages.length, 1, 'secondary persistence failure must not automatically resend the user message');
 assert.equal(persistenceFailureServer.events.filter((entry) => entry === 'submit').length, 1);
