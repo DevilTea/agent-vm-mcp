@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process';
+import { createHash, randomUUID } from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { TextDecoder } from 'node:util';
@@ -11,8 +12,9 @@ const MAX_DIRECTORY_ENTRIES = 4_096;
 const MAX_PATCH_BYTES = 2 * 1024 * 1024;
 const MAX_PATCH_FILES = 1_024;
 const MAX_GIT_DIAGNOSTIC_BYTES = 256 * 1024;
+const REVISION_PREFIX = 'sha256:';
 
-const activePatchCommits = new Set();
+const activeFilesystemMutations = new Set();
 
 function resolveFromCwd(inputPath, cwd) {
   return path.resolve(cwd ?? process.env.HOME, inputPath);
@@ -23,6 +25,10 @@ function splitLinesPreservingNewlines(text) {
   const lines = text.match(/[^\n]*(?:\n|$)/g) ?? [];
   if (lines.at(-1) === '') lines.pop();
   return lines;
+}
+
+function contentRevision(data) {
+  return `${REVISION_PREFIX}${createHash('sha256').update(data).digest('hex')}`;
 }
 
 export async function readTextFile({ path: inputPath, cwd, startLine = 1, endLine }) {
@@ -90,9 +96,254 @@ export async function readTextFile({ path: inputPath, cwd, startLine = 1, endLin
     totalLines,
     bytes: contentBytes,
     truncated,
+    revision: contentRevision(data),
     nextLine: truncated ? returnedEndLine + 1 : null,
   };
 }
+
+
+function assertRelativeEditPath(inputPath) {
+  if (path.isAbsolute(inputPath)) throw new Error(`edit_files path must be relative to cwd: ${inputPath}`);
+  const normalized = path.normalize(inputPath);
+  if (normalized === '.' || normalized === '..' || normalized.startsWith(`..${path.sep}`)) {
+    throw new Error(`edit_files path escapes cwd or does not name a file: ${inputPath}`);
+  }
+  return normalized;
+}
+
+async function assertNoSymlinkComponents(root, relativePath) {
+  const parts = relativePath.split(path.sep).filter(Boolean);
+  let current = root;
+  for (const part of parts) {
+    current = path.join(current, part);
+    let stat;
+    try {
+      stat = await fs.lstat(current);
+    } catch (error) {
+      if (error?.code === 'ENOENT') throw new Error(`edit_files target does not exist: ${relativePath}`);
+      throw error;
+    }
+    if (stat.isSymbolicLink()) {
+      throw new Error(`edit_files refuses symlink path components: ${relativePath}`);
+    }
+  }
+}
+
+function exactMatchSummary(text, needle) {
+  const firstIndexes = [];
+  let count = 0;
+  let from = 0;
+  while (from <= text.length - needle.length) {
+    const index = text.indexOf(needle, from);
+    if (index < 0) break;
+    count += 1;
+    if (firstIndexes.length < 8) firstIndexes.push(index);
+    from = index + needle.length;
+  }
+  return { count, firstIndexes };
+}
+
+function lineNumberAt(text, index) {
+  let line = 1;
+  for (let cursor = 0; cursor < index; cursor += 1) {
+    if (text.charCodeAt(cursor) === 10) line += 1;
+  }
+  return line;
+}
+
+function requireExactOccurrences({ text, needle, expected, filePath, operationIndex, label }) {
+  const { count, firstIndexes } = exactMatchSummary(text, needle);
+  if (count !== expected) {
+    const lines = firstIndexes.map((index) => lineNumberAt(text, index));
+    const location = lines.length > 0 ? ` Matches start on line(s): ${lines.join(', ')}.` : '';
+    throw new Error(
+      `edit_files ${filePath} operation ${operationIndex + 1}: expected ${expected} exact ${label} match(es), found ${count}.${location}`,
+    );
+  }
+  return firstIndexes;
+}
+
+function applyTextEdits(text, edits, filePath) {
+  let next = text;
+  for (let index = 0; index < edits.length; index += 1) {
+    const edit = edits[index];
+    if (edit.type === 'replace') {
+      requireExactOccurrences({
+        text: next,
+        needle: edit.oldText,
+        expected: edit.expectedOccurrences ?? 1,
+        filePath,
+        operationIndex: index,
+        label: 'oldText',
+      });
+      next = next.split(edit.oldText).join(edit.newText);
+      continue;
+    }
+
+    const [anchorIndex] = requireExactOccurrences({
+      text: next,
+      needle: edit.anchor,
+      expected: 1,
+      filePath,
+      operationIndex: index,
+      label: 'anchor',
+    });
+    if (edit.type === 'insert_before') {
+      next = `${next.slice(0, anchorIndex)}${edit.text}${next.slice(anchorIndex)}`;
+      continue;
+    }
+    if (edit.type === 'insert_after') {
+      const insertionIndex = anchorIndex + edit.anchor.length;
+      next = `${next.slice(0, insertionIndex)}${edit.text}${next.slice(insertionIndex)}`;
+      continue;
+    }
+    throw new Error(`Unsupported edit_files operation: ${edit.type}`);
+  }
+  return next;
+}
+
+async function readEditableFile(resolvedPath, relativePath) {
+  let data;
+  try {
+    ({ data } = await readBoundedRegularFile(resolvedPath, MAX_READ_SOURCE_BYTES));
+  } catch (error) {
+    if (error?.code === 'not_regular_file') throw new Error(`edit_files target is not a regular file: ${relativePath}`);
+    if (error?.code === 'too_large') {
+      throw new Error(`edit_files target exceeds ${MAX_READ_SOURCE_BYTES} bytes: ${relativePath}`);
+    }
+    throw error;
+  }
+
+  let text;
+  try {
+    text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(data);
+  } catch {
+    throw new Error(`edit_files target is not valid UTF-8 text: ${relativePath}`);
+  }
+  return { data, text, revision: contentRevision(data) };
+}
+
+async function cleanupPaths(paths) {
+  await Promise.allSettled(paths.map((target) => fs.rm(target, { force: true })));
+}
+
+export async function editTextFiles({ cwd, files }, requestSignal) {
+  const resolvedCwd = path.resolve(cwd ?? process.env.HOME);
+  const cwdStat = await fs.stat(resolvedCwd);
+  if (!cwdStat.isDirectory()) throw new Error(`edit_files cwd is not a directory: ${resolvedCwd}`);
+
+  const plans = [];
+  const seenPaths = new Set();
+
+  for (const file of files) {
+    const relativePath = assertRelativeEditPath(file.path);
+    if (seenPaths.has(relativePath)) throw new Error(`edit_files path appears more than once: ${relativePath}`);
+    seenPaths.add(relativePath);
+
+    const resolvedPath = path.resolve(resolvedCwd, relativePath);
+    if (!resolvedPath.startsWith(`${resolvedCwd}${path.sep}`)) {
+      throw new Error(`edit_files path escapes cwd: ${file.path}`);
+    }
+
+    await assertNoSymlinkComponents(resolvedCwd, relativePath);
+    const current = await readEditableFile(resolvedPath, relativePath);
+    if (file.ifMatch !== undefined && file.ifMatch !== current.revision) {
+      throw new Error(
+        `edit_files revision mismatch for ${relativePath}: expected ${file.ifMatch}, actual ${current.revision}.`,
+      );
+    }
+
+    const nextText = applyTextEdits(current.text, file.edits, relativePath);
+    const nextData = Buffer.from(nextText, 'utf8');
+    if (nextData.length > MAX_READ_SOURCE_BYTES) {
+      throw new Error(`edit_files result exceeds ${MAX_READ_SOURCE_BYTES} bytes: ${relativePath}`);
+    }
+    plans.push({
+      relativePath,
+      resolvedPath,
+      current,
+      nextData,
+      nextRevision: contentRevision(nextData),
+      editCount: file.edits.length,
+    });
+  }
+
+  requestSignal?.throwIfAborted();
+  const mutation = commitTextEditPlans(plans, resolvedCwd);
+  activeFilesystemMutations.add(mutation);
+  try {
+    return await mutation;
+  } finally {
+    activeFilesystemMutations.delete(mutation);
+  }
+}
+
+async function commitTextEditPlans(plans, resolvedCwd) {
+  const temporaryPaths = [];
+  const backupPaths = [];
+  try {
+    for (const plan of plans) {
+      const stat = await fs.stat(plan.resolvedPath);
+      const token = randomUUID();
+      plan.tempPath = path.join(path.dirname(plan.resolvedPath), `.${path.basename(plan.resolvedPath)}.edit-${token}.tmp`);
+      plan.backupPath = path.join(path.dirname(plan.resolvedPath), `.${path.basename(plan.resolvedPath)}.edit-${token}.bak`);
+      await fs.writeFile(plan.tempPath, plan.nextData, { mode: stat.mode & 0o777 });
+      temporaryPaths.push(plan.tempPath);
+      backupPaths.push(plan.backupPath);
+    }
+
+    for (const plan of plans) {
+      await assertNoSymlinkComponents(resolvedCwd, plan.relativePath);
+      const latest = await readEditableFile(plan.resolvedPath, plan.relativePath);
+      if (latest.revision !== plan.current.revision) {
+        throw new Error(
+          `edit_files target changed during validation for ${plan.relativePath}: expected ${plan.current.revision}, actual ${latest.revision}.`,
+        );
+      }
+    }
+
+    try {
+      for (const plan of plans) {
+        await fs.rename(plan.resolvedPath, plan.backupPath);
+        plan.backedUp = true;
+        await fs.rename(plan.tempPath, plan.resolvedPath);
+        plan.installed = true;
+      }
+    } catch (error) {
+      const rollbackErrors = [];
+      for (const plan of [...plans].reverse()) {
+        if (!plan.backedUp) continue;
+        try {
+          if (plan.installed) await fs.rm(plan.resolvedPath, { force: true });
+          await fs.rename(plan.backupPath, plan.resolvedPath);
+          plan.backedUp = false;
+        } catch (rollbackError) {
+          rollbackErrors.push(`${plan.relativePath}: ${rollbackError.message}`);
+        }
+      }
+      if (rollbackErrors.length > 0) {
+        throw new Error(`${error.message} Rollback also failed: ${rollbackErrors.join('; ')}`);
+      }
+      throw error;
+    }
+
+    await cleanupPaths(backupPaths);
+  } finally {
+    await cleanupPaths(temporaryPaths);
+  }
+
+  return {
+    cwd: resolvedCwd,
+    files: plans.map((plan) => ({
+      path: plan.relativePath,
+      beforeRevision: plan.current.revision,
+      revision: plan.nextRevision,
+      bytes: plan.nextData.length,
+      edits: plan.editCount,
+    })),
+  };
+}
+
 
 function directoryEntryType(entry) {
   if (entry.isFile()) return 'file';
@@ -363,11 +614,11 @@ export async function applyUnifiedPatch({ patch, cwd, pathStyle = 'auto' }, requ
     stripComponents,
     signal: undefined,
   });
-  activePatchCommits.add(commit);
+  activeFilesystemMutations.add(commit);
   try {
     await commit;
   } finally {
-    activePatchCommits.delete(commit);
+    activeFilesystemMutations.delete(commit);
   }
 
   return {
@@ -379,5 +630,5 @@ export async function applyUnifiedPatch({ patch, cwd, pathStyle = 'auto' }, requ
 }
 
 export async function waitForFilesystemMutations() {
-  await Promise.allSettled([...activePatchCommits]);
+  await Promise.allSettled([...activeFilesystemMutations]);
 }

@@ -53,7 +53,7 @@ import {
   captureServerRuntimeIdentity,
   serverInfoToolDescription,
 } from './server-info.js';
-import { applyUnifiedPatch, listDirectory, readTextFile, waitForFilesystemMutations } from './filesystem.js';
+import { applyUnifiedPatch, editTextFiles, listDirectory, readTextFile, waitForFilesystemMutations } from './filesystem.js';
 import { resolveBashExecutable } from './shell.js';
 import { workspaceCreate, workspaceDelete, workspaceList, waitForWorkspaceMutations } from './workspaces.js';
 import { collectWorkStatus } from './work-status.js';
@@ -423,6 +423,7 @@ const activeArtifactStores = new Set();
 const BASE_NATIVE_TOOL_NAMES = new Set([
   'exec',
   'read_file',
+  'edit_files',
   'list_directory',
   'apply_patch',
   'workspace_create',
@@ -531,7 +532,7 @@ async function createServer() {
     'read_file',
     {
       description:
-        'Read a bounded UTF-8 text file or 1-based line range with structured line metadata. Use shell tools for binary or very large files.',
+        'Read a bounded UTF-8 text file or 1-based line range with structured line metadata and a whole-file sha256 revision for optimistic edits. Use shell tools for binary or very large files.',
       inputSchema: z.object({
         path: z.string().min(1).describe('File path. Relative paths are resolved against cwd.'),
         cwd: z.string().optional().describe('Base directory. Defaults to the agent user home directory.'),
@@ -540,6 +541,56 @@ async function createServer() {
       }),
     },
     async (args) => jsonResult(await readTextFile(args)),
+  );
+
+  const editOperationSchema = z.discriminatedUnion('type', [
+    z.object({
+      type: z.literal('replace'),
+      oldText: z.string().min(1).describe('Exact text to replace.'),
+      newText: z.string().describe('Replacement text.'),
+      expectedOccurrences: z
+        .number()
+        .int()
+        .min(1)
+        .max(10_000)
+        .default(1)
+        .describe('Required number of exact non-overlapping oldText matches. Defaults to 1.'),
+    }),
+    z.object({
+      type: z.literal('insert_before'),
+      anchor: z.string().min(1).describe('Exact anchor text, which must occur exactly once.'),
+      text: z.string().describe('Text to insert immediately before the anchor.'),
+    }),
+    z.object({
+      type: z.literal('insert_after'),
+      anchor: z.string().min(1).describe('Exact anchor text, which must occur exactly once.'),
+      text: z.string().describe('Text to insert immediately after the anchor.'),
+    }),
+  ]);
+
+  server.registerTool(
+    'edit_files',
+    {
+      description:
+        'Apply exact ordered text edits to existing UTF-8 files relative to cwd. All files and operations are validated before mutation; ambiguous or missing matches, stale ifMatch revisions, traversal, and symlink paths fail closed. Files are replaced via same-directory temporary files with rollback backups. Use read_file revision as ifMatch when guarding against concurrent changes.',
+      inputSchema: z.object({
+        cwd: z.string().optional().describe('Base directory. Defaults to the agent user home directory.'),
+        files: z
+          .array(z.object({
+            path: z.string().min(1).describe('Existing file path relative to cwd.'),
+            ifMatch: z
+              .string()
+              .regex(/^sha256:[0-9a-f]{64}$/)
+              .optional()
+              .describe('Optional whole-file revision from read_file. A mismatch rejects the entire edit.'),
+            edits: z.array(editOperationSchema).min(1).max(128).describe('Ordered exact text edits for this file.'),
+          }))
+          .min(1)
+          .max(64)
+          .describe('Files to edit transactionally after all validation succeeds.'),
+      }),
+    },
+    async (args, ctx) => jsonResult(await editTextFiles(args, ctx.mcpReq.signal)),
   );
 
   server.registerTool(

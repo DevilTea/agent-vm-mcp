@@ -287,6 +287,7 @@ exec /usr/bin/git "$@"
   const required = [
     'exec',
     'read_file',
+    'edit_files',
     'list_directory',
     'apply_patch',
     'workspace_create',
@@ -737,9 +738,10 @@ exec /usr/bin/git "$@"
     rangedRead.startLine !== 2 ||
     rangedRead.endLine !== 3 ||
     rangedRead.totalLines !== 3 ||
-    rangedRead.truncated
+    rangedRead.truncated ||
+    rangedRead.revision !== `sha256:${createHash('sha256').update('one\ntwo\nthree\n').digest('hex')}`
   ) {
-    throw new Error('read_file ranged read metadata/content failed');
+    throw new Error('read_file ranged read metadata/content/revision failed');
   }
 
   const largeRead = parseJsonToolResult(
@@ -774,6 +776,134 @@ exec /usr/bin/git "$@"
     JSON.stringify(expectedDirectoryEntries)
   ) {
     throw new Error('list_directory deterministic structured listing failed');
+  }
+
+  await fs.writeFile(`${filesystemRoot}/edit-a.txt`, 'alpha\nmiddle\nomega\n', 'utf8');
+  await fs.writeFile(`${filesystemRoot}/edit-b.txt`, 'dup\ndup\n', 'utf8');
+
+  const editARead = parseJsonToolResult(
+    await client.callTool({
+      name: 'read_file',
+      arguments: { path: 'edit-a.txt', cwd: filesystemRoot },
+    }),
+  );
+  const editResult = parseJsonToolResult(
+    await client.callTool({
+      name: 'edit_files',
+      arguments: {
+        cwd: filesystemRoot,
+        files: [{
+          path: 'edit-a.txt',
+          ifMatch: editARead.revision,
+          edits: [
+            { type: 'replace', oldText: 'alpha', newText: 'ALPHA' },
+            { type: 'insert_before', anchor: 'middle\n', text: 'before\n' },
+            { type: 'insert_after', anchor: 'omega\n', text: 'after\n' },
+          ],
+        }],
+      },
+    }),
+  );
+  const editedA = 'ALPHA\nbefore\nmiddle\nomega\nafter\n';
+  if (
+    (await fs.readFile(`${filesystemRoot}/edit-a.txt`, 'utf8')) !== editedA ||
+    editResult.files.length !== 1 ||
+    editResult.files[0]?.path !== 'edit-a.txt' ||
+    editResult.files[0]?.beforeRevision !== editARead.revision ||
+    editResult.files[0]?.revision !== `sha256:${createHash('sha256').update(editedA).digest('hex')}` ||
+    editResult.files[0]?.edits !== 3
+  ) {
+    throw new Error('edit_files ordered exact edits or revision metadata failed');
+  }
+
+  const editAAfter = parseJsonToolResult(
+    await client.callTool({
+      name: 'read_file',
+      arguments: { path: 'edit-a.txt', cwd: filesystemRoot },
+    }),
+  );
+  if (editAAfter.revision !== editResult.files[0].revision) {
+    throw new Error('edit_files result revision did not match subsequent read_file revision');
+  }
+
+  await expectToolFailure('edit_files', {
+    cwd: filesystemRoot,
+    files: [{
+      path: 'edit-a.txt',
+      ifMatch: editARead.revision,
+      edits: [{ type: 'replace', oldText: 'ALPHA', newText: 'STALE-WRITE' }],
+    }],
+  });
+  if ((await fs.readFile(`${filesystemRoot}/edit-a.txt`, 'utf8')) !== editedA) {
+    throw new Error('edit_files stale ifMatch modified target');
+  }
+
+  const editBBefore = await fs.readFile(`${filesystemRoot}/edit-b.txt`, 'utf8');
+  await expectToolFailure('edit_files', {
+    cwd: filesystemRoot,
+    files: [
+      {
+        path: 'edit-a.txt',
+        edits: [{ type: 'replace', oldText: 'ALPHA', newText: 'SHOULD-NOT-COMMIT' }],
+      },
+      {
+        path: 'edit-b.txt',
+        edits: [{ type: 'replace', oldText: 'dup', newText: 'ambiguous' }],
+      },
+    ],
+  });
+  if (
+    (await fs.readFile(`${filesystemRoot}/edit-a.txt`, 'utf8')) !== editedA ||
+    (await fs.readFile(`${filesystemRoot}/edit-b.txt`, 'utf8')) !== editBBefore
+  ) {
+    throw new Error('edit_files multi-file validation failure was not zero-write');
+  }
+
+  const multiReplace = parseJsonToolResult(
+    await client.callTool({
+      name: 'edit_files',
+      arguments: {
+        cwd: filesystemRoot,
+        files: [{
+          path: 'edit-b.txt',
+          edits: [{ type: 'replace', oldText: 'dup', newText: 'DUP', expectedOccurrences: 2 }],
+        }],
+      },
+    }),
+  );
+  if (
+    (await fs.readFile(`${filesystemRoot}/edit-b.txt`, 'utf8')) !== 'DUP\nDUP\n' ||
+    multiReplace.files[0]?.edits !== 1
+  ) {
+    throw new Error('edit_files explicit multiple replacement failed');
+  }
+
+  await expectToolFailure('edit_files', {
+    cwd: filesystemRoot,
+    files: [{
+      path: '../escape.txt',
+      edits: [{ type: 'replace', oldText: 'x', newText: 'y' }],
+    }],
+  });
+  await expectToolFailure('edit_files', {
+    cwd: filesystemRoot,
+    files: [{
+      path: 'link.txt',
+      edits: [{ type: 'replace', oldText: 'one', newText: 'SYMLINK-WRITE' }],
+    }],
+  });
+  await expectToolFailure('edit_files', {
+    cwd: filesystemRoot,
+    files: [{
+      path: 'outside-link/outside.txt',
+      edits: [{ type: 'replace', oldText: 'outside', newText: 'ESCAPED' }],
+    }],
+  });
+  if (
+    (await fs.readFile(`${filesystemRoot}/a.txt`, 'utf8')) !== 'one\ntwo\nthree\n' ||
+    (await fs.readFile(`${filesystemOutsideRoot}/outside.txt`, 'utf8')) !== 'outside\n'
+  ) {
+    throw new Error('edit_files symlink protection failed');
   }
 
   const cwdRelativePatch = `--- subdir/direct.txt
