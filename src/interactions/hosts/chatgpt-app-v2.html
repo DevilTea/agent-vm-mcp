@@ -182,6 +182,43 @@
     button:disabled { opacity: 0.55; cursor: default; }
     .status { font-size: 0.82rem; }
 
+    .submission-summary {
+      display: grid;
+      gap: 10px;
+      margin: 0 12px 12px;
+      padding: 12px;
+      border: 1px solid var(--color-border-default, color-mix(in srgb, CanvasText 18%, transparent));
+      border-radius: 10px;
+      background: var(--color-background-secondary, color-mix(in srgb, Canvas 96%, CanvasText 4%));
+    }
+
+    .submission-summary-header {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 12px;
+    }
+
+    .submission-summary-title {
+      font-size: 0.94rem;
+      font-weight: 650;
+    }
+
+    .submission-summary-status {
+      color: var(--color-text-secondary, GrayText);
+      font-size: 0.8rem;
+      text-align: right;
+    }
+
+    .submission-summary-body {
+      margin: 0;
+      font: inherit;
+      font-size: 0.88rem;
+      line-height: 1.5;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }
+
     .fatal {
       margin: 12px;
       padding: 10px;
@@ -879,6 +916,20 @@
         return lines.join('\n').trimEnd();
       }
 
+      function renderSubmittedSummary(payload, answers, statusText = 'Submitted.') {
+        const summary = make('section', 'submission-summary');
+        summary.dataset.submittedSummary = 'true';
+
+        const header = make('div', 'submission-summary-header');
+        header.append(
+          make('div', 'submission-summary-title', 'Submitted response'),
+          make('div', 'submission-summary-status', statusText),
+        );
+        summary.append(header);
+        summary.append(make('pre', 'submission-summary-body', responseText(payload, answers)));
+        return summary;
+      }
+
       async function submitForm(payload, form, submitButton, status, controls) {
         if (
           controls.submitted ||
@@ -976,6 +1027,17 @@
         root.append(make('h1', '', payload.request.title));
         if (payload.request.description) root.append(make('p', 'description', payload.request.description));
 
+        const submittedAnswers = locallySentAnswers?.answers ?? knownState?.answers ?? null;
+        if (controls.submitted && submittedAnswers) {
+          root.append(renderSubmittedSummary(
+            payload,
+            submittedAnswers,
+            locallySentAnswers?.status ?? 'Submitted.',
+          ));
+          requestAnimationFrame(sendSize);
+          return;
+        }
+
         const form = document.createElement('form');
         form.className = 'card';
         payload.request.questions.forEach((question, index) => form.append(renderQuestion(question, index)));
@@ -1027,9 +1089,7 @@
               authoritativeState = state;
               if (state.status === 'submitted') {
                 controls.submitted = true;
-                restoreAuthoritativeAnswers(payload, form, state.answers);
-                for (const input of form.querySelectorAll('input, textarea, button')) input.disabled = true;
-                status.textContent = 'Submitted.';
+                render();
                 return;
               }
               submitButton.disabled = false;
