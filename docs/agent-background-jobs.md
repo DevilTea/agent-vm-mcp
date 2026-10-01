@@ -52,7 +52,7 @@ Start individual work in independent read-only Git worktrees pinned to the same 
 }
 ```
 
-`agent_start` returns `accepted` plus a persistent `runId`. `status` is `queued` or `running`; neither implies that the work is finished. Use `agent_list({cwd})` to recover IDs later, `agent_poll({runId, ...returnedOffsets})` for bounded incremental output, `agent_result({runId})` for terminal status and log paths, or `agent_cancel({runId})` when needed. A completed process still needs actual review of its output.
+`agent_start` returns `accepted` plus a persistent `runId`. `status` is `queued` or `running`; neither implies that the work is finished. Queued summaries include capacity/position diagnostics. Use `agent_list({cwd})` to recover IDs later, and call `agent_poll({runId})` once to obtain an opaque `cursor`; pass that cursor back on later polls for bounded incremental stdout/stderr/JSONL output. The older per-stream offsets remain supported for compatibility but cannot be combined with `cursor`. Use `agent_result({runId})` for terminal status and log paths, or `agent_cancel({runId})` when needed. A completed process still needs actual review of its output.
 
 A caller can submit separate reviewer jobs without waiting for each to finish. The manager enforces aggregate VM concurrency. V1 deliberately leaves coordination and cross-review synthesis to the caller.
 

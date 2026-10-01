@@ -323,8 +323,35 @@ async function readEvents(filename, offset = 0, max = 256 * 1024, tail = false) 
   }
 }
 
+function queueDiagnostics(job) {
+  if (job.status !== 'queued') return null;
+  const queuedJobs = store.queued();
+  const index = queuedJobs.findIndex((candidate) => candidate.id === job.id);
+  const runningJobs = store.running().length;
+  const launchingJobs = launching.size;
+  const occupied = runningJobs + launchingJobs;
+  const reason = launching.has(job.id)
+    ? 'worker_starting'
+    : occupied >= maxConcurrent
+      ? 'capacity'
+      : 'scheduler_pending';
+
+  return {
+    position: index >= 0 ? index + 1 : null,
+    ahead: index >= 0 ? index : null,
+    runningJobs,
+    launchingJobs,
+    maxConcurrent,
+    reason,
+  };
+}
+
+function managedSummary(job) {
+  return { ...summary(job), queue: queueDiagnostics(job) };
+}
+
 async function snapshot(job, offsets = {}, mode = 'poll') {
-  const base = summary(job);
+  const base = managedSummary(job);
   const files = base.outputFiles;
   if (mode === 'result') {
     const [stdout, stderr, events, invalid] = await Promise.all([
@@ -401,7 +428,7 @@ async function serve(req, res) {
       const input = validateStart(await body(req));
       const result = store.create(input);
       schedule();
-      return json(res, 200, { ...summary(store.get(result.job.id)),
+      return json(res, 200, { ...managedSummary(store.get(result.job.id)),
         duplicate: result.duplicate });
     }
     if (req.method === 'GET' && url.pathname === '/jobs') {
@@ -409,7 +436,7 @@ async function serve(req, res) {
       if (!Number.isSafeInteger(limit) || limit < 1 || limit > 128) fail('invalid_limit', 'limit must be 1-128');
       return json(res, 200, { jobs: store.list({
         cwd: url.searchParams.get('cwd') || undefined, limit,
-      }).map(summary) });
+      }).map(managedSummary) });
     }
     const match = url.pathname.match(/^\/jobs\/([0-9a-fA-F-]{36})(?:\/(poll|result|cancel))?$/);
     if (!match) fail('not_found', 'Unknown endpoint', 404);
@@ -447,15 +474,15 @@ async function serve(req, res) {
           hasEvidence(current, offsets) ? 'activity' : 'timeout' };
       return json(res, 200, current);
     }
-    if (req.method === 'GET' && !operation) return json(res, 200, summary(jobOr404(id)));
+    if (req.method === 'GET' && !operation) return json(res, 200, managedSummary(jobOr404(id)));
     if (req.method === 'POST' && operation === 'cancel') {
       const job = jobOr404(id);
       if (TERMINAL.has(job.status)) return json(res, 200, {
-        ...summary(job), cancellationRequested: false });
+        ...managedSummary(job), cancellationRequested: false });
       store.requestCancel(id);
       if (job.status === 'queued') store.finish(id, 'cancelled', { reason: 'cancel' });
       else signalJob(store.get(id), 'cancel');
-      return json(res, 200, { ...summary(store.get(id)), cancellationRequested: true });
+      return json(res, 200, { ...managedSummary(store.get(id)), cancellationRequested: true });
     }
     fail('not_found', 'Unknown endpoint', 404);
   } catch (error) {

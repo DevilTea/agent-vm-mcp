@@ -165,28 +165,52 @@ try {
   assert.match(await fs.readFile(result.outputFiles.events, 'utf8'), /turn.completed/);
   const snapshot = await jobPoll({ runId: first.runId, waitMs: 0 });
   assert.equal(snapshot.structured.events.items.length, 2);
-  const resumed = await jobPoll({
+  assert.equal(typeof snapshot.cursor, 'string');
+  const resumed = await jobPoll({ runId: first.runId, waitMs: 0, cursor: snapshot.cursor });
+  assert.deepEqual(resumed.structured.events.items, []);
+  assert.equal(resumed.stdout.text, '');
+  assert.equal(resumed.stderr.text, '');
+  const resumedLegacy = await jobPoll({
     runId: first.runId, waitMs: 0,
     stdoutOffset: snapshot.stdout.nextOffset,
     stderrOffset: snapshot.stderr.nextOffset,
     eventOffset: snapshot.structured.events.nextOffset,
     invalidLineOffset: snapshot.structured.invalidLines.nextOffset,
   });
-  assert.deepEqual(resumed.structured.events.items, []);
+  assert.deepEqual(resumedLegacy.structured.events.items, []);
+  await assert.rejects(
+    () => jobPoll({ runId: first.runId, waitMs: 0, cursor: snapshot.cursor, stdoutOffset: 0 }),
+    (error) => error.code === 'CURSOR_OFFSET_CONFLICT',
+  );
 
   const restartJob = await jobStart({
     harness: 'codex', cwd: workspace, task: 'restart-sentinel',
     timeoutMs: 5000, idempotencyKey: 'test-restart',
   });
   assert.equal((await waitFor(restartJob.runId, false)).status, 'running');
+  await assert.rejects(
+    () => jobPoll({ runId: restartJob.runId, waitMs: 0, cursor: snapshot.cursor }),
+    (error) => error.code === 'CURSOR_TARGET_MISMATCH',
+  );
   const queued = await jobStart({
     harness: 'codex', cwd: workspace, task: 'queued-sentinel',
     timeoutMs: 5000, idempotencyKey: 'test-queued',
   });
   assert.equal(queued.status, 'queued');
+  assert.deepEqual(queued.queue, {
+    position: 1,
+    ahead: 0,
+    runningJobs: 1,
+    launchingJobs: 0,
+    maxConcurrent: 1,
+    reason: 'capacity',
+  });
   const waitQueuedStarted = Date.now();
   const queuedWait = await jobPoll({ runId: queued.runId, waitMs: 250 });
   assert.equal(queuedWait.status, 'queued');
+  assert.equal(queuedWait.queue?.reason, 'capacity');
+  assert.equal(queuedWait.queue?.runningJobs, 1);
+  assert.equal(queuedWait.queue?.maxConcurrent, 1);
   assert.ok(Date.now() - waitQueuedStarted >= 175, 'Queued jobs should long-poll instead of spin');
   assert.equal((await jobCancel({ runId: queued.runId })).status, 'cancelled');
   // Simulate an unexpected manager crash, not just graceful shutdown:
