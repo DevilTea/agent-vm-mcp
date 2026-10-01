@@ -1,4 +1,5 @@
 import { execFile } from 'node:child_process';
+import { watch } from 'node:fs';
 import { createHash } from 'node:crypto';
 import http from 'node:http';
 import fs from 'node:fs/promises';
@@ -45,6 +46,14 @@ const workspaceCancelOrigin = `/tmp/agent-mcp-workspace-cancel-origin-${process.
 const workspaceConcurrencyTriggerPath = `/tmp/agent-mcp-workspace-concurrency-${process.pid}`;
 const workspaceConcurrencyLockDir = `/tmp/agent-mcp-workspace-concurrency-lock-${process.pid}`;
 const workspaceConcurrencyOverlapPath = `/tmp/agent-mcp-workspace-concurrency-overlap-${process.pid}`;
+const workspaceCrossProcessTriggerPath = `/tmp/agent-mcp-workspace-cross-process-${process.pid}`;
+const workspaceCrossProcessAddLogPath = `/tmp/agent-mcp-workspace-cross-process-adds-${process.pid}`;
+const workspaceBranchRaceTriggerPath = `/tmp/agent-mcp-workspace-branch-race-${process.pid}`;
+const workspaceBranchRaceReleasePath = `/tmp/agent-mcp-workspace-branch-race-release-${process.pid}`;
+const workspaceBranchRacePidPath = `/tmp/agent-mcp-workspace-branch-race-pid-${process.pid}`;
+const workspaceOwnedBranchTriggerPath = `/tmp/agent-mcp-workspace-owned-branch-${process.pid}`;
+const workspaceOwnedBranchReadyPath = `/tmp/agent-mcp-workspace-owned-branch-ready-${process.pid}`;
+const workspaceOwnedBranchReleasePath = `/tmp/agent-mcp-workspace-owned-branch-release-${process.pid}`;
 const workspaceWorktreeAddTriggerPath = `/tmp/agent-mcp-workspace-add-trigger-${process.pid}`;
 const workspaceWorktreeAddPidPath = `/tmp/agent-mcp-workspace-add-pid-${process.pid}`;
 const workspaceWorktreeRemoveTriggerPath = `/tmp/agent-mcp-workspace-remove-trigger-${process.pid}`;
@@ -155,6 +164,14 @@ try {
   await fs.rm(workspaceConcurrencyTriggerPath, { force: true });
   await fs.rm(workspaceConcurrencyLockDir, { recursive: true, force: true });
   await fs.rm(workspaceConcurrencyOverlapPath, { force: true });
+  await fs.rm(workspaceCrossProcessTriggerPath, { force: true });
+  await fs.rm(workspaceCrossProcessAddLogPath, { force: true });
+  await fs.rm(workspaceBranchRaceTriggerPath, { force: true });
+  await fs.rm(workspaceBranchRaceReleasePath, { force: true });
+  await fs.rm(workspaceBranchRacePidPath, { force: true });
+  await fs.rm(workspaceOwnedBranchTriggerPath, { force: true });
+  await fs.rm(workspaceOwnedBranchReadyPath, { force: true });
+  await fs.rm(workspaceOwnedBranchReleasePath, { force: true });
   await fs.rm(workspaceWorktreeAddTriggerPath, { force: true });
   await fs.rm(workspaceWorktreeAddPidPath, { force: true });
   await fs.rm(workspaceWorktreeRemoveTriggerPath, { force: true });
@@ -233,6 +250,25 @@ if [[ -f "${workspaceConcurrencyTriggerPath}" && "$args" == *" fetch "* ]]; then
   status=$?
   set -e
   rmdir "${workspaceConcurrencyLockDir}" 2>/dev/null || true
+  exit $status
+fi
+if [[ -f "${workspaceCrossProcessTriggerPath}" && "$args" == *" worktree add "* ]]; then
+  echo $$ >> "${workspaceCrossProcessAddLogPath}"
+  sleep 0.3
+fi
+if [[ -f "${workspaceBranchRaceTriggerPath}" && "$args" == *" update-ref refs/heads/feat/workspace-race "* ]]; then
+  echo $$ > "${workspaceBranchRacePidPath}"
+  while [[ ! -f "${workspaceBranchRaceReleasePath}" ]]; do sleep 0.02; done
+fi
+if [[ -f "${workspaceOwnedBranchTriggerPath}" && "$args" == *" update-ref refs/heads/feat/workspace-owned-cleanup "* ]]; then
+  set +e
+  /usr/bin/git "$@"
+  status=$?
+  set -e
+  if [[ "$status" == "0" ]]; then
+    echo $$ > "${workspaceOwnedBranchReadyPath}"
+    while [[ ! -f "${workspaceOwnedBranchReleasePath}" ]]; do sleep 0.02; done
+  fi
   exit $status
 fi
 if [[ -f "${workspaceWorktreeAddTriggerPath}" && "$args" == *" worktree add "* ]]; then
@@ -490,7 +526,267 @@ exec /usr/bin/git "$@"
     throw new Error('workspace_create tag checkout resolved the wrong content');
   }
 
+  const branchWorkspaceArgs = {
+    repository: workspaceOrigin,
+    revision: 'origin/main',
+    createBranch: 'feat/workspace-smoke',
+    idempotencyKey: 'workspace-smoke-branch',
+    timeoutMs: 30_000,
+  };
+  const branchWorkspace = parseJsonToolResult(await client.callTool({
+    name: 'workspace_create',
+    arguments: branchWorkspaceArgs,
+  }));
+  if (branchWorkspace.branch !== 'feat/workspace-smoke' || branchWorkspace.duplicate !== false) {
+    throw new Error('workspace_create createBranch did not create the requested new branch');
+  }
+  const concurrentIdempotencyArgs = {
+    repository: workspaceOrigin,
+    revision: 'v1',
+    idempotencyKey: 'workspace-smoke-concurrent',
+    timeoutMs: 30_000,
+  };
+  const [concurrentIdempotentA, concurrentIdempotentB] = await Promise.all([
+    client.callTool({ name: 'workspace_create', arguments: concurrentIdempotencyArgs }),
+    client.callTool({ name: 'workspace_create', arguments: concurrentIdempotencyArgs }),
+  ]).then((results) => results.map(parseJsonToolResult));
+  if (
+    concurrentIdempotentA.id !== concurrentIdempotentB.id ||
+    [concurrentIdempotentA.duplicate, concurrentIdempotentB.duplicate].filter(Boolean).length !== 1
+  ) {
+    throw new Error('workspace_create concurrent idempotent retry created duplicate workspaces');
+  }
+  const crossProcessClient = new Client({ name: 'agent-mcp-cross-process', version: '1.0.0' });
+  const crossProcessTransport = new StdioClientTransport({
+    command: node,
+    args: [serverEntry],
+    cwd: projectRoot,
+    env: {
+      ...process.env,
+      PATH: `${gitShimDir}:${process.env.PATH}`,
+      MCP_BRIDGES_CONFIG: smokeBridgeConfig,
+      AGENT_MCP_CAPABILITIES_CONFIG: path.join(projectRoot, 'config/capabilities.json'),
+      AGENT_WORKSPACE_ROOT: workspaceRoot,
+      AGENT_REPOSITORY_ROOT: repositoryRoot,
+      AGENT_MCP_HOST: hostKind,
+    },
+    stderr: 'inherit',
+  });
+  let crossProcessWorkspace;
+  try {
+    await crossProcessClient.connect(crossProcessTransport);
+    await fs.writeFile(workspaceCrossProcessTriggerPath, '1\n', 'utf8');
+    const crossProcessArgs = {
+      repository: workspaceOrigin,
+      revision: 'v1',
+      idempotencyKey: 'workspace-smoke-cross-process',
+      timeoutMs: 30_000,
+    };
+    const [crossA, crossB] = await Promise.all([
+      client.callTool({ name: 'workspace_create', arguments: crossProcessArgs }),
+      crossProcessClient.callTool({ name: 'workspace_create', arguments: crossProcessArgs }),
+    ]).then((results) => results.map(parseJsonToolResult));
+    if (
+      crossA.id !== crossB.id ||
+      [crossA.duplicate, crossB.duplicate].filter(Boolean).length !== 1
+    ) {
+      throw new Error('workspace_create cross-process idempotency did not converge on one workspace');
+    }
+    const addLog = (await fs.readFile(workspaceCrossProcessAddLogPath, 'utf8')).trim().split(/\n+/).filter(Boolean);
+    if (addLog.length !== 1) {
+      throw new Error(`workspace_create cross-process idempotency executed ${addLog.length} worktree adds`);
+    }
+    crossProcessWorkspace = crossA;
+  } finally {
+    await fs.rm(workspaceCrossProcessTriggerPath, { force: true });
+    await crossProcessClient.close();
+  }
+  parseJsonToolResult(await client.callTool({
+    name: 'workspace_delete',
+    arguments: { workspaceId: crossProcessWorkspace.id },
+  }));
+  const staleLockKey = 'workspace-smoke-stale-lock';
+  const staleLockHash = createHash('sha256').update(staleLockKey).digest('hex');
+  const staleLockPath = path.join(workspaceRoot, '.idempotency', '.locks', `${staleLockHash}.lock`);
+  await fs.mkdir(path.dirname(staleLockPath), { recursive: true, mode: 0o700 });
+  await fs.writeFile(
+    staleLockPath,
+    `${JSON.stringify({
+      version: 1,
+      token: 'dead-owner',
+      pid: 2_147_483_647,
+      startTicks: '0',
+      createdAt: Date.now() - 60_000,
+      deadline: Date.now() + 60_000,
+    })}\n`,
+    { flag: 'wx', mode: 0o600 },
+  );
+  const staleLockWorkspace = parseJsonToolResult(await client.callTool({
+    name: 'workspace_create',
+    arguments: {
+      repository: workspaceOrigin,
+      revision: 'v1',
+      idempotencyKey: staleLockKey,
+      timeoutMs: 30_000,
+    },
+  }));
+  if (staleLockWorkspace.duplicate !== false) {
+    throw new Error('workspace_create stale idempotency lock recovery returned an unexpected duplicate');
+  }
+  if (await fs.access(staleLockPath).then(() => true, () => false)) {
+    throw new Error('workspace_create left the recovered idempotency lock behind');
+  }
+  parseJsonToolResult(await client.callTool({
+    name: 'workspace_delete',
+    arguments: { workspaceId: staleLockWorkspace.id },
+  }));
+  const duplicateBranchWorkspace = parseJsonToolResult(await client.callTool({
+    name: 'workspace_create',
+    arguments: branchWorkspaceArgs,
+  }));
+  if (duplicateBranchWorkspace.id !== branchWorkspace.id || duplicateBranchWorkspace.duplicate !== true) {
+    throw new Error('workspace_create idempotencyKey did not return the original workspace');
+  }
+  const branchIdempotencyRecordPath = path.join(
+    workspaceRoot,
+    '.idempotency',
+    `${createHash('sha256').update(branchWorkspaceArgs.idempotencyKey).digest('hex')}.json`,
+  );
+  const readyIdempotencyRecord = JSON.parse(await fs.readFile(branchIdempotencyRecordPath, 'utf8'));
+  if (readyIdempotencyRecord.version !== 2 || readyIdempotencyRecord.state !== 'ready') {
+    throw new Error('workspace_create did not persist v2 ready idempotency state');
+  }
+  const { result: _discardedReadyResult, ...pendingIdempotencyRecord } = readyIdempotencyRecord;
+  await fs.writeFile(
+    branchIdempotencyRecordPath,
+    `${JSON.stringify({ ...pendingIdempotencyRecord, state: 'pending' })}\n`,
+    { mode: 0o600 },
+  );
+  const recoveredBranchWorkspace = parseJsonToolResult(await client.callTool({
+    name: 'workspace_create',
+    arguments: branchWorkspaceArgs,
+  }));
+  if (recoveredBranchWorkspace.id !== branchWorkspace.id || recoveredBranchWorkspace.duplicate !== true) {
+    throw new Error('workspace_create did not recover a committed workspace from pending idempotency state');
+  }
+  const recoveredIdempotencyRecord = JSON.parse(await fs.readFile(branchIdempotencyRecordPath, 'utf8'));
+  if (
+    recoveredIdempotencyRecord.state !== 'ready' ||
+    recoveredIdempotencyRecord.result?.id !== branchWorkspace.id
+  ) {
+    throw new Error('workspace_create did not finalize recovered idempotency state');
+  }
+  const idempotencyConflict = await client.callTool({
+    name: 'workspace_create',
+    arguments: { ...branchWorkspaceArgs, revision: 'v1' },
+  });
+  if (!idempotencyConflict.isError || parseJsonToolResult(idempotencyConflict).error?.code !== 'IDEMPOTENCY_CONFLICT') {
+    throw new Error('workspace_create idempotency conflict was not a structured failure');
+  }
+  const branchExists = await client.callTool({
+    name: 'workspace_create',
+    arguments: {
+      repository: workspaceOrigin,
+      revision: 'origin/main',
+      createBranch: 'feat/workspace-smoke',
+      timeoutMs: 30_000,
+    },
+  });
+  if (!branchExists.isError || parseJsonToolResult(branchExists).error?.code !== 'BRANCH_EXISTS') {
+    throw new Error('workspace_create existing branch was not rejected');
+  }
+
   const sharedRepositoryPath = `${repositoryRoot}/${defaultWorkspace.repositoryKey}.git`;
+  await fs.writeFile(workspaceBranchRaceTriggerPath, '1\n', 'utf8');
+  const branchRaceCreate = client.callTool({
+    name: 'workspace_create',
+    arguments: {
+      repository: workspaceOrigin,
+      revision: 'origin/main',
+      createBranch: 'feat/workspace-race',
+      timeoutMs: 30_000,
+    },
+  });
+  let branchRacePid;
+  for (let attempt = 0; attempt < 120; attempt += 1) {
+    try {
+      branchRacePid = Number((await fs.readFile(workspaceBranchRacePidPath, 'utf8')).trim());
+      break;
+    } catch {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+  }
+  if (!Number.isSafeInteger(branchRacePid)) throw new Error('workspace createBranch race did not reach worktree add');
+  await execFileAsync('/usr/bin/git', [
+    '-C', sharedRepositoryPath, 'branch', 'feat/workspace-race', defaultWorkspace.head,
+  ]);
+  await fs.writeFile(workspaceBranchRaceReleasePath, '1\n', 'utf8');
+  const branchRaceResult = await branchRaceCreate;
+  if (!branchRaceResult.isError) throw new Error('workspace createBranch race unexpectedly succeeded');
+  const preservedBranch = (await execFileAsync('/usr/bin/git', [
+    '-C', sharedRepositoryPath, 'rev-parse', '--verify', 'refs/heads/feat/workspace-race',
+  ])).stdout.trim();
+  if (preservedBranch !== defaultWorkspace.head) {
+    throw new Error('workspace createBranch failure did not preserve the concurrently-created branch');
+  }
+  await execFileAsync('/usr/bin/git', ['-C', sharedRepositoryPath, 'branch', '-D', 'feat/workspace-race']);
+  await fs.rm(workspaceBranchRaceTriggerPath, { force: true });
+  await fs.rm(workspaceBranchRaceReleasePath, { force: true });
+  await fs.rm(workspaceBranchRacePidPath, { force: true });
+  await fs.rm(workspaceOwnedBranchTriggerPath, { force: true });
+  await fs.rm(workspaceOwnedBranchReadyPath, { force: true });
+  await fs.rm(workspaceOwnedBranchReleasePath, { force: true });
+  const ownedCleanupKey = 'workspace-smoke-owned-branch-cleanup';
+  const ownedCleanupHash = createHash('sha256').update(ownedCleanupKey).digest('hex');
+  const ownedCleanupRecordPath = path.join(workspaceRoot, '.idempotency', `${ownedCleanupHash}.json`);
+  await fs.writeFile(workspaceOwnedBranchTriggerPath, '1\n', 'utf8');
+  const ownedCleanupCreate = client.callTool({
+    name: 'workspace_create',
+    arguments: {
+      repository: workspaceOrigin,
+      revision: 'origin/main',
+      createBranch: 'feat/workspace-owned-cleanup',
+      idempotencyKey: ownedCleanupKey,
+      timeoutMs: 30_000,
+    },
+  });
+  let ownedBranchReady = false;
+  for (let attempt = 0; attempt < 120; attempt += 1) {
+    try {
+      await fs.access(workspaceOwnedBranchReadyPath);
+      ownedBranchReady = true;
+      break;
+    } catch {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+  }
+  if (!ownedBranchReady) throw new Error('workspace owned-branch cleanup fixture did not create the branch ref');
+  const ownedCleanupRecord = JSON.parse(await fs.readFile(ownedCleanupRecordPath, 'utf8'));
+  const ownedCleanupWorkspacePath = ownedCleanupRecord.intent?.path;
+  if (typeof ownedCleanupWorkspacePath !== 'string') {
+    throw new Error('workspace owned-branch cleanup fixture could not recover pending workspace path');
+  }
+  await execFileAsync('/usr/bin/git', [
+    '-C', sharedRepositoryPath, 'update-ref', 'refs/heads/feat/workspace-owned-cleanup', tagWorkspace.head, defaultWorkspace.head,
+  ]);
+  await fs.mkdir(ownedCleanupWorkspacePath, { recursive: true });
+  await fs.writeFile(path.join(ownedCleanupWorkspacePath, 'block-worktree-add'), 'occupied\n', 'utf8');
+  await fs.writeFile(workspaceOwnedBranchReleasePath, '1\n', 'utf8');
+  const ownedCleanupResult = await ownedCleanupCreate;
+  if (!ownedCleanupResult.isError) {
+    throw new Error('workspace owned-branch cleanup fixture unexpectedly created a worktree');
+  }
+  const movedOwnedBranch = (await execFileAsync('/usr/bin/git', [
+    '-C', sharedRepositoryPath, 'rev-parse', '--verify', 'refs/heads/feat/workspace-owned-cleanup',
+  ])).stdout.trim();
+  if (movedOwnedBranch !== tagWorkspace.head) {
+    throw new Error('workspace failure cleanup deleted or changed a branch whose OID was moved by another actor');
+  }
+  await execFileAsync('/usr/bin/git', ['-C', sharedRepositoryPath, 'branch', '-D', 'feat/workspace-owned-cleanup']);
+  await fs.rm(ownedCleanupRecordPath, { force: true });
+  await fs.rm(workspaceOwnedBranchTriggerPath, { force: true });
+  await fs.rm(workspaceOwnedBranchReadyPath, { force: true });
+  await fs.rm(workspaceOwnedBranchReleasePath, { force: true });
   await execFileAsync('/usr/bin/git', ['-C', sharedRepositoryPath, 'update-ref', 'refs/heads/main', defaultWorkspace.head]);
   await fs.writeFile(`${workspaceSeedRoot}/fixture.txt`, 'remote-main\n', 'utf8');
   await execFileAsync('/usr/bin/git', ['-C', workspaceSeedRoot, 'commit', '-am', 'remote main']);
@@ -657,15 +953,28 @@ exec /usr/bin/git "$@"
     const rediscovered = parseJsonToolResult(
       await rediscoveryClient.callTool({ name: 'workspace_list', arguments: {} }),
     ).workspaces.filter((workspace) => workspace.state === 'ready');
-    if (rediscovered.length !== 5 || rediscovered.some((workspace) => workspace.repositoryKey !== defaultWorkspace.repositoryKey)) {
+    if (rediscovered.length !== 7 || rediscovered.some((workspace) => workspace.repositoryKey !== defaultWorkspace.repositoryKey)) {
       throw new Error('workspace_list did not reconstruct durable state in a fresh MCP process');
+    }
+    const rediscoveredIdempotent = parseJsonToolResult(await rediscoveryClient.callTool({
+      name: 'workspace_create',
+      arguments: branchWorkspaceArgs,
+    }));
+    if (rediscoveredIdempotent.id !== branchWorkspace.id || rediscoveredIdempotent.duplicate !== true) {
+      throw new Error('workspace_create idempotency state did not survive MCP restart');
     }
   } finally {
     await rediscoveryClient.close();
   }
 
   await fs.writeFile(`${defaultWorkspace.path}/dirty.txt`, 'dirty\n', 'utf8');
-  await expectToolFailure('workspace_delete', { workspaceId: defaultWorkspace.id });
+  const dirtyDelete = await client.callTool({
+    name: 'workspace_delete',
+    arguments: { workspaceId: defaultWorkspace.id },
+  });
+  if (!dirtyDelete.isError || parseJsonToolResult(dirtyDelete).error?.code !== 'WORKSPACE_DIRTY') {
+    throw new Error('workspace_delete dirty workspace was not a structured failure');
+  }
   if (!(await fs.stat(defaultWorkspace.path)).isDirectory()) {
     throw new Error('workspace_delete removed a dirty workspace without force');
   }
@@ -717,7 +1026,7 @@ exec /usr/bin/git "$@"
   }
   if (!tagWorkspaceRemoved) throw new Error('workspace_delete cancellation interrupted committed removal');
 
-  for (const workspace of [remoteBranchWorkspace, concurrentWorkspaceA, concurrentWorkspaceB]) {
+  for (const workspace of [branchWorkspace, concurrentIdempotentA, remoteBranchWorkspace, concurrentWorkspaceA, concurrentWorkspaceB]) {
     parseJsonToolResult(
       await client.callTool({ name: 'workspace_delete', arguments: { workspaceId: workspace.id } }),
     );
@@ -739,6 +1048,8 @@ exec /usr/bin/git "$@"
     rangedRead.endLine !== 3 ||
     rangedRead.totalLines !== 3 ||
     rangedRead.truncated ||
+    rangedRead.locator?.cwd !== filesystemRoot ||
+    rangedRead.locator?.path !== 'a.txt' ||
     rangedRead.revision !== `sha256:${createHash('sha256').update('one\ntwo\nthree\n').digest('hex')}`
   ) {
     throw new Error('read_file ranged read metadata/content/revision failed');
@@ -826,14 +1137,27 @@ exec /usr/bin/git "$@"
     throw new Error('edit_files result revision did not match subsequent read_file revision');
   }
 
-  await expectToolFailure('edit_files', {
-    cwd: filesystemRoot,
-    files: [{
-      path: 'edit-a.txt',
-      ifMatch: editARead.revision,
-      edits: [{ type: 'replace', oldText: 'ALPHA', newText: 'STALE-WRITE' }],
-    }],
+  const staleEdit = await client.callTool({
+    name: 'edit_files',
+    arguments: {
+      cwd: filesystemRoot,
+      files: [{
+        path: 'edit-a.txt',
+        ifMatch: editARead.revision,
+        edits: [{ type: 'replace', oldText: 'ALPHA', newText: 'STALE-WRITE' }],
+      }],
+    },
   });
+  if (!staleEdit.isError) throw new Error('edit_files stale ifMatch unexpectedly succeeded');
+  const staleEditError = parseJsonToolResult(staleEdit).error;
+  if (
+    staleEditError?.code !== 'FILE_CHANGED' ||
+    staleEditError?.details?.path !== 'edit-a.txt' ||
+    staleEditError?.details?.expectedRevision !== editARead.revision ||
+    staleEditError?.details?.actualRevision !== editResult.files[0].revision
+  ) {
+    throw new Error(`edit_files structured FILE_CHANGED error failed: ${JSON.stringify(staleEditError)}`);
+  }
   if ((await fs.readFile(`${filesystemRoot}/edit-a.txt`, 'utf8')) !== editedA) {
     throw new Error('edit_files stale ifMatch modified target');
   }
@@ -905,6 +1229,346 @@ exec /usr/bin/git "$@"
   ) {
     throw new Error('edit_files symlink protection failed');
   }
+
+  const createResult = parseJsonToolResult(await client.callTool({
+    name: 'edit_files',
+    arguments: {
+      cwd: filesystemRoot,
+      files: [{ action: 'create', path: 'created-by-edit.txt', content: 'created\n' }],
+    },
+  }));
+  const createdRevision = `sha256:${createHash('sha256').update('created\n').digest('hex')}`;
+  if (
+    (await fs.readFile(`${filesystemRoot}/created-by-edit.txt`, 'utf8')) !== 'created\n' ||
+    createResult.files[0]?.action !== 'create' ||
+    createResult.files[0]?.beforeRevision !== null ||
+    createResult.files[0]?.revision !== createdRevision ||
+    createResult.files[0]?.bytesBefore !== 0 ||
+    createResult.files[0]?.bytesAfter !== 8
+  ) {
+    throw new Error('edit_files create action failed');
+  }
+  const createExisting = await client.callTool({
+    name: 'edit_files',
+    arguments: {
+      cwd: filesystemRoot,
+      files: [{ action: 'create', path: 'created-by-edit.txt', content: 'overwrite\n' }],
+    },
+  });
+  if (!createExisting.isError || parseJsonToolResult(createExisting).error?.code !== 'FILE_EXISTS') {
+    throw new Error('edit_files create unexpectedly overwrote an existing file');
+  }
+
+  const deleteResult = parseJsonToolResult(await client.callTool({
+    name: 'edit_files',
+    arguments: {
+      cwd: filesystemRoot,
+      files: [{ action: 'delete', path: 'created-by-edit.txt', ifMatch: createdRevision }],
+    },
+  }));
+  if (
+    await fs.access(`${filesystemRoot}/created-by-edit.txt`).then(() => true, () => false) ||
+    deleteResult.files[0]?.action !== 'delete' ||
+    deleteResult.files[0]?.beforeRevision !== createdRevision ||
+    deleteResult.files[0]?.revision !== null ||
+    deleteResult.files[0]?.bytesAfter !== 0
+  ) {
+    throw new Error('edit_files delete action failed');
+  }
+  const deleteSymlink = await client.callTool({
+    name: 'edit_files',
+    arguments: {
+      cwd: filesystemRoot,
+      files: [{ action: 'delete', path: 'link.txt', ifMatch: rangedRead.revision }],
+    },
+  });
+  if (!deleteSymlink.isError || parseJsonToolResult(deleteSymlink).error?.code !== 'SYMLINK_PATH') {
+    throw new Error('edit_files delete followed a symlink target');
+  }
+  if ((await fs.readFile(`${filesystemRoot}/a.txt`, 'utf8')) !== 'one\ntwo\nthree\n') {
+    throw new Error('edit_files symlink delete modified the linked target');
+  }
+
+  await fs.writeFile(`${filesystemRoot}/mixed-edit.txt`, 'before\n', 'utf8');
+  await fs.writeFile(`${filesystemRoot}/mixed-delete.txt`, 'delete\n', 'utf8');
+  const mixedDeleteRead = parseJsonToolResult(await client.callTool({
+    name: 'read_file',
+    arguments: { path: 'mixed-delete.txt', cwd: filesystemRoot },
+  }));
+  const mixedFailure = await client.callTool({
+    name: 'edit_files',
+    arguments: {
+      cwd: filesystemRoot,
+      files: [
+        { path: 'mixed-edit.txt', edits: [{ type: 'replace', oldText: 'before', newText: 'after' }] },
+        { action: 'create', path: 'mixed-create.txt', content: 'new\n' },
+        { action: 'delete', path: 'mixed-delete.txt', ifMatch: `sha256:${'0'.repeat(64)}` },
+      ],
+    },
+  });
+  if (!mixedFailure.isError || parseJsonToolResult(mixedFailure).error?.code !== 'FILE_CHANGED') {
+    throw new Error('edit_files mixed preflight failure did not report FILE_CHANGED');
+  }
+  if (
+    (await fs.readFile(`${filesystemRoot}/mixed-edit.txt`, 'utf8')) !== 'before\n' ||
+    (await fs.readFile(`${filesystemRoot}/mixed-delete.txt`, 'utf8')) !== 'delete\n' ||
+    await fs.access(`${filesystemRoot}/mixed-create.txt`).then(() => true, () => false)
+  ) {
+    throw new Error('edit_files mixed preflight failure was not zero-write');
+  }
+  const mixedSuccess = parseJsonToolResult(await client.callTool({
+    name: 'edit_files',
+    arguments: {
+      cwd: filesystemRoot,
+      files: [
+        { path: 'mixed-edit.txt', edits: [{ type: 'replace', oldText: 'before', newText: 'after' }] },
+        { action: 'create', path: 'mixed-create.txt', content: 'new\n' },
+        { action: 'delete', path: 'mixed-delete.txt', ifMatch: mixedDeleteRead.revision },
+      ],
+    },
+  }));
+  if (
+    (await fs.readFile(`${filesystemRoot}/mixed-edit.txt`, 'utf8')) !== 'after\n' ||
+    (await fs.readFile(`${filesystemRoot}/mixed-create.txt`, 'utf8')) !== 'new\n' ||
+    await fs.access(`${filesystemRoot}/mixed-delete.txt`).then(() => true, () => false) ||
+    mixedSuccess.files.map((file) => file.action).join(',') !== 'edit,create,delete'
+  ) {
+    throw new Error('edit_files mixed edit/create/delete commit failed');
+  }
+  const createThroughSymlink = await client.callTool({
+    name: 'edit_files',
+    arguments: {
+      cwd: filesystemRoot,
+      files: [{ action: 'create', path: 'outside-link/created.txt', content: 'escape\n' }],
+    },
+  });
+  if (!createThroughSymlink.isError || parseJsonToolResult(createThroughSymlink).error?.code !== 'SYMLINK_PATH') {
+    throw new Error('edit_files create followed a symlink parent');
+  }
+  if (await fs.access(`${filesystemOutsideRoot}/created.txt`).then(() => true, () => false)) {
+    throw new Error('edit_files create escaped cwd through a symlink parent');
+  }
+
+  const raceParent = `${filesystemRoot}/race-parent`;
+  const raceMovedParent = `${filesystemOutsideRoot}/race-parent-moved`;
+  const raceRedirect = `${filesystemOutsideRoot}/race-redirect`;
+  await fs.rm(raceParent, { recursive: true, force: true });
+  await fs.rm(raceMovedParent, { recursive: true, force: true });
+  await fs.rm(raceRedirect, { recursive: true, force: true });
+  await fs.mkdir(raceParent);
+  await fs.mkdir(raceRedirect);
+  let raceWatcher;
+  let raceTimer;
+  const parentSwap = new Promise((resolve, reject) => {
+    const finish = (callback) => {
+      if (raceTimer !== undefined) clearTimeout(raceTimer);
+      raceWatcher?.close();
+      callback();
+    };
+    raceWatcher = watch(raceParent, (_event, filename) => {
+      if (typeof filename !== 'string' || !filename.includes('.edit-') || !filename.endsWith('.tmp')) return;
+      raceWatcher.close();
+      raceWatcher = undefined;
+      (async () => {
+        await fs.rename(raceParent, raceMovedParent);
+        await fs.symlink(raceRedirect, raceParent);
+      })().then(() => finish(resolve), (error) => finish(() => reject(error)));
+    });
+    raceTimer = setTimeout(() => finish(() => reject(new Error('edit_files parent-swap fixture did not observe a temp file'))), 5_000);
+  });
+  const parentSwapCall = client.callTool({
+    name: 'edit_files',
+    arguments: {
+      cwd: filesystemRoot,
+      files: Array.from({ length: 64 }, (_, index) => ({
+        action: 'create',
+        path: `race-parent/file-${index}.txt`,
+        content: `${'x'.repeat(128 * 1024)}\n`,
+      })),
+    },
+  });
+  const [parentSwapResult] = await Promise.all([parentSwapCall, parentSwap]);
+  const parentSwapError = parseJsonToolResult(parentSwapResult).error;
+  if (
+    !parentSwapResult.isError ||
+    !['SYMLINK_PATH', 'PARENT_NOT_FOUND'].includes(parentSwapError?.code)
+  ) {
+    throw new Error(`edit_files parent-swap race was not rejected safely: ${JSON.stringify(parseJsonToolResult(parentSwapResult))}`);
+  }
+  const redirectedEntries = await fs.readdir(raceRedirect);
+  if (redirectedEntries.length !== 0) {
+    throw new Error(`edit_files parent-swap race touched redirect tree: ${redirectedEntries.join(',')}`);
+  }
+  const movedEntries = await fs.readdir(raceMovedParent);
+  if (movedEntries.some((name) => name.includes('.edit-') || name.startsWith('file-'))) {
+    throw new Error(`edit_files parent-swap race left mutation artifacts: ${movedEntries.join(',')}`);
+  }
+  await fs.rm(raceParent, { force: true });
+  await fs.rm(raceMovedParent, { recursive: true, force: true });
+  await fs.rm(raceRedirect, { recursive: true, force: true });
+
+  const singleRaceParent = `${filesystemRoot}/single-race-parent`;
+  const singleRaceMovedParent = `${filesystemOutsideRoot}/single-race-parent-moved`;
+  const singleRaceRedirect = `${filesystemOutsideRoot}/single-race-redirect`;
+  await fs.rm(singleRaceParent, { recursive: true, force: true });
+  await fs.rm(singleRaceMovedParent, { recursive: true, force: true });
+  await fs.rm(singleRaceRedirect, { recursive: true, force: true });
+  await fs.mkdir(singleRaceParent);
+  await fs.mkdir(singleRaceRedirect);
+  let singleRaceWatcher;
+  let singleRaceTimer;
+  const singleParentSwap = new Promise((resolve, reject) => {
+    const finish = (callback) => {
+      if (singleRaceTimer !== undefined) clearTimeout(singleRaceTimer);
+      singleRaceWatcher?.close();
+      callback();
+    };
+    singleRaceWatcher = watch(singleRaceParent, (_event, filename) => {
+      if (typeof filename !== 'string' || !filename.includes('.edit-') || !filename.endsWith('.tmp')) return;
+      singleRaceWatcher.close();
+      singleRaceWatcher = undefined;
+      (async () => {
+        await fs.rename(singleRaceParent, singleRaceMovedParent);
+        await fs.symlink(singleRaceRedirect, singleRaceParent);
+      })().then(() => finish(resolve), (error) => finish(() => reject(error)));
+    });
+    singleRaceTimer = setTimeout(
+      () => finish(() => reject(new Error('single edit_files parent-swap fixture did not observe a temp file'))),
+      5_000,
+    );
+  });
+  const singleParentSwapCall = client.callTool({
+    name: 'edit_files',
+    arguments: {
+      cwd: filesystemRoot,
+      files: [{
+        action: 'create',
+        path: 'single-race-parent/file.txt',
+        content: `${'s'.repeat(4 * 1024 * 1024)}\n`,
+      }],
+    },
+  });
+  const [singleParentSwapResult] = await Promise.all([singleParentSwapCall, singleParentSwap]);
+  const singleParentSwapError = parseJsonToolResult(singleParentSwapResult).error;
+  if (
+    !singleParentSwapResult.isError ||
+    !['PARENT_MOVED', 'CWD_MOVED', 'SYMLINK_PATH', 'PARENT_NOT_FOUND'].includes(singleParentSwapError?.code)
+  ) {
+    throw new Error(`single edit_files parent-swap race was not rejected safely: ${JSON.stringify(parseJsonToolResult(singleParentSwapResult))}`);
+  }
+  const singleRedirectEntries = await fs.readdir(singleRaceRedirect);
+  if (singleRedirectEntries.length !== 0) {
+    throw new Error(`single edit_files parent-swap race touched redirect tree: ${singleRedirectEntries.join(',')}`);
+  }
+  const singleMovedEntries = await fs.readdir(singleRaceMovedParent);
+  if (singleMovedEntries.some((name) => name.includes('.edit-') || name === 'file.txt')) {
+    throw new Error(`single edit_files parent-swap race left mutation artifacts: ${singleMovedEntries.join(',')}`);
+  }
+  await fs.rm(singleRaceParent, { force: true });
+  await fs.rm(singleRaceMovedParent, { recursive: true, force: true });
+  await fs.rm(singleRaceRedirect, { recursive: true, force: true });
+
+  const modeRaceParent = `${filesystemRoot}/mode-race-parent`;
+  await fs.rm(modeRaceParent, { recursive: true, force: true });
+  await fs.mkdir(modeRaceParent);
+  const modeRacePath = `${modeRaceParent}/mode.txt`;
+  const modeRaceOriginal = `before\n${'m'.repeat(4 * 1024 * 1024)}\n`;
+  await fs.writeFile(modeRacePath, modeRaceOriginal, { mode: 0o644 });
+  await fs.chmod(modeRacePath, 0o644);
+  let modeRaceWatcher;
+  let modeRaceTimer;
+  const modeChanged = new Promise((resolve, reject) => {
+    const finish = (callback) => {
+      if (modeRaceTimer !== undefined) clearTimeout(modeRaceTimer);
+      modeRaceWatcher?.close();
+      callback();
+    };
+    modeRaceWatcher = watch(modeRaceParent, (_event, filename) => {
+      if (typeof filename !== 'string' || !filename.includes('.edit-') || !filename.endsWith('.tmp')) return;
+      modeRaceWatcher.close();
+      modeRaceWatcher = undefined;
+      fs.chmod(modeRacePath, 0o600).then(() => finish(resolve), (error) => finish(() => reject(error)));
+    });
+    modeRaceTimer = setTimeout(
+      () => finish(() => reject(new Error('edit_files mode-race fixture did not observe a temp file'))),
+      5_000,
+    );
+  });
+  const modeRaceCall = client.callTool({
+    name: 'edit_files',
+    arguments: {
+      cwd: filesystemRoot,
+      files: [{
+        path: 'mode-race-parent/mode.txt',
+        edits: [{ type: 'replace', oldText: 'before', newText: 'after' }],
+      }],
+    },
+  });
+  const [modeRaceResult] = await Promise.all([modeRaceCall, modeChanged]);
+  if (modeRaceResult.isError) {
+    throw new Error(`edit_files mode race unexpectedly failed: ${JSON.stringify(parseJsonToolResult(modeRaceResult))}`);
+  }
+  if (((await fs.stat(modeRacePath)).mode & 0o777) !== 0o600) {
+    throw new Error('edit_files restored stale preflight permissions over a concurrent chmod');
+  }
+  await fs.rm(modeRaceParent, { recursive: true, force: true });
+
+  const cleanupRaceParent = `${filesystemRoot}/cleanup-race-parent`;
+  await fs.rm(cleanupRaceParent, { recursive: true, force: true });
+  await fs.mkdir(cleanupRaceParent);
+  const cleanupRaceCount = 32;
+  const cleanupRaceFiles = [];
+  for (let index = 0; index < cleanupRaceCount; index += 1) {
+    const content = `delete-${index}\n`;
+    const relativePath = `cleanup-race-parent/delete-${index}.txt`;
+    await fs.writeFile(path.join(filesystemRoot, relativePath), content, 'utf8');
+    cleanupRaceFiles.push({
+      action: 'delete',
+      path: relativePath,
+      ifMatch: `sha256:${createHash('sha256').update(content).digest('hex')}`,
+    });
+  }
+  const cleanupWriteRemoved = (async () => {
+    const deadline = Date.now() + 5_000;
+    while (Date.now() < deadline) {
+      const entries = await fs.readdir(cleanupRaceParent);
+      const backups = entries.filter((name) => name.includes('.edit-') && name.endsWith('.bak'));
+      if (backups.length === cleanupRaceCount) {
+        await fs.chmod(cleanupRaceParent, 0o555);
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+    throw new Error('edit_files cleanup-race fixture did not observe all backup files');
+  })();
+  const cleanupRaceCall = client.callTool({
+    name: 'edit_files',
+    arguments: { cwd: filesystemRoot, files: cleanupRaceFiles },
+  });
+  const [cleanupRaceResult] = await Promise.all([cleanupRaceCall, cleanupWriteRemoved]);
+  await fs.chmod(cleanupRaceParent, 0o755);
+  const cleanupRaceError = parseJsonToolResult(cleanupRaceResult).error;
+  if (!cleanupRaceResult.isError || cleanupRaceError?.code !== 'CLEANUP_FAILED') {
+    throw new Error(`edit_files backup cleanup failure was not observable: ${JSON.stringify(parseJsonToolResult(cleanupRaceResult))}`);
+  }
+  const cleanupBackups = cleanupRaceError?.details?.backups;
+  if (!Array.isArray(cleanupBackups) || cleanupBackups.length !== cleanupRaceCount) {
+    throw new Error(`edit_files CLEANUP_FAILED did not report all recovery paths: ${JSON.stringify(cleanupRaceError)}`);
+  }
+  for (const backup of cleanupBackups) {
+    if (typeof backup.backupPath !== 'string' || !backup.backupPath.startsWith('cleanup-race-parent/')) {
+      throw new Error(`edit_files CLEANUP_FAILED reported an invalid recovery path: ${JSON.stringify(backup)}`);
+    }
+    if (!(await fs.stat(path.join(filesystemRoot, backup.backupPath))).isFile()) {
+      throw new Error(`edit_files cleanup failure did not preserve reported backup: ${backup.backupPath}`);
+    }
+  }
+  for (let index = 0; index < cleanupRaceCount; index += 1) {
+    if (await fs.access(`${cleanupRaceParent}/delete-${index}.txt`).then(() => true, () => false)) {
+      throw new Error('edit_files cleanup failure unexpectedly restored a deleted target');
+    }
+  }
+  await fs.rm(cleanupRaceParent, { recursive: true, force: true });
 
   const cwdRelativePatch = `--- subdir/direct.txt
 +++ subdir/direct.txt
@@ -1960,6 +2624,57 @@ new mode 100755
     throw new Error('exec guard rejected a harmless non-command harness mention');
   }
 
+  const argvExec = parseJsonToolResult(await client.callTool({
+    name: 'exec',
+    arguments: { argv: ['/usr/bin/printf', '%s|%s\\n', 'hello world', '$HOME'] },
+  }));
+  if (argvExec.stdout !== 'hello world|$HOME\n' || argvExec.exitCode !== 0) {
+    throw new Error('exec argv mode did not preserve literal arguments');
+  }
+  await expectToolFailure('exec', { command: 'true', argv: ['/usr/bin/true'] });
+  const blockedRawArgvExec = await client.callTool({
+    name: 'exec',
+    arguments: { argv: ['codex', 'exec', '--ephemeral', 'do work'] },
+  });
+  const blockedRawArgvText = blockedRawArgvExec.content?.find((item) => item.type === 'text')?.text ?? '';
+  if (!blockedRawArgvExec.isError || !blockedRawArgvText.includes('agent_start')) {
+    throw new Error('exec argv mode bypassed the raw coding-harness guard');
+  }
+  const blockedWrappedRawArgvExec = await client.callTool({
+    name: 'exec',
+    arguments: { argv: ['/usr/bin/env', 'REVIEW=1', 'codex', 'exec', '--ephemeral', 'do work'] },
+  });
+  const blockedWrappedRawArgvText = blockedWrappedRawArgvExec.content?.find((item) => item.type === 'text')?.text ?? '';
+  if (!blockedWrappedRawArgvExec.isError || !blockedWrappedRawArgvText.includes('agent_start')) {
+    throw new Error('exec argv env wrapper bypassed the raw coding-harness guard');
+  }
+  const blockedEnvChdirArgvExec = await client.callTool({
+    name: 'exec',
+    arguments: { argv: ['/usr/bin/env', '-C', '/tmp', 'codex', 'exec', '--ephemeral', 'do work'] },
+  });
+  const blockedEnvChdirText = blockedEnvChdirArgvExec.content?.find((item) => item.type === 'text')?.text ?? '';
+  if (!blockedEnvChdirArgvExec.isError || !blockedEnvChdirText.includes('agent_start')) {
+    throw new Error('exec argv env -C wrapper bypassed the raw coding-harness guard');
+  }
+  const blockedEnvSplitArgvExec = await client.callTool({
+    name: 'exec',
+    arguments: { argv: ['/usr/bin/env', '-S', 'codex exec --ephemeral do-work'] },
+  });
+  if (
+    !blockedEnvSplitArgvExec.isError ||
+    parseJsonToolResult(blockedEnvSplitArgvExec).error?.code !== 'UNSAFE_COMMAND_WRAPPER'
+  ) {
+    throw new Error('exec argv env -S wrapper was not rejected fail-closed');
+  }
+  const blockedNestedRawArgvExec = await client.callTool({
+    name: 'exec',
+    arguments: { argv: ['/bin/bash', '-lc', 'codex exec --ephemeral do-work'] },
+  });
+  const blockedNestedRawArgvText = blockedNestedRawArgvExec.content?.find((item) => item.type === 'text')?.text ?? '';
+  if (!blockedNestedRawArgvExec.isError || !blockedNestedRawArgvText.includes('agent_start')) {
+    throw new Error('exec argv nested-shell mode bypassed the raw coding-harness guard');
+  }
+
   const started = await client.callTool({
     name: 'process_start',
     arguments: { command: "read line; echo got:$line; sleep 30" },
@@ -1980,10 +2695,39 @@ new mode 100755
     name: 'process_read',
     arguments: { processId },
   });
-  const readText = read.content?.find((item) => item.type === 'text')?.text ?? '';
-  if (!JSON.parse(readText).stdout.text.includes('got:hello')) {
-    throw new Error('persistent process smoke failed');
+  const readData = parseJsonToolResult(read);
+  if (!readData.stdout.text.includes('got:hello') || typeof readData.cursor !== 'string') {
+    throw new Error('persistent process smoke or cursor creation failed');
   }
+  const resumedRead = parseJsonToolResult(await client.callTool({
+    name: 'process_read',
+    arguments: { processId, cursor: readData.cursor },
+  }));
+  if (resumedRead.stdout.text !== '' || resumedRead.stderr.text !== '') {
+    throw new Error('process_read cursor replayed already-consumed output');
+  }
+  const cursorConflict = await client.callTool({
+    name: 'process_read',
+    arguments: { processId, cursor: readData.cursor, stdoutOffset: 0 },
+  });
+  if (!cursorConflict.isError || parseJsonToolResult(cursorConflict).error?.code !== 'CURSOR_OFFSET_CONFLICT') {
+    throw new Error('process_read cursor/offset conflict was not a structured failure');
+  }
+  const secondStarted = parseJsonToolResult(await client.callTool({
+    name: 'process_start',
+    arguments: { command: 'sleep 30' },
+  }));
+  const cursorMismatch = await client.callTool({
+    name: 'process_read',
+    arguments: { processId: secondStarted.processId, cursor: readData.cursor },
+  });
+  if (!cursorMismatch.isError || parseJsonToolResult(cursorMismatch).error?.code !== 'CURSOR_TARGET_MISMATCH') {
+    throw new Error('process_read cursor target mismatch was not rejected');
+  }
+  await client.callTool({
+    name: 'process_kill',
+    arguments: { processId: secondStarted.processId, signal: 'SIGTERM' },
+  });
   await client.callTool({
     name: 'process_kill',
     arguments: { processId, signal: 'SIGTERM' },
@@ -2106,6 +2850,14 @@ new mode 100755
   await fs.rm(workspaceConcurrencyTriggerPath, { force: true });
   await fs.rm(workspaceConcurrencyLockDir, { recursive: true, force: true });
   await fs.rm(workspaceConcurrencyOverlapPath, { force: true });
+  await fs.rm(workspaceCrossProcessTriggerPath, { force: true });
+  await fs.rm(workspaceCrossProcessAddLogPath, { force: true });
+  await fs.rm(workspaceBranchRaceTriggerPath, { force: true });
+  await fs.rm(workspaceBranchRaceReleasePath, { force: true });
+  await fs.rm(workspaceBranchRacePidPath, { force: true });
+  await fs.rm(workspaceOwnedBranchTriggerPath, { force: true });
+  await fs.rm(workspaceOwnedBranchReadyPath, { force: true });
+  await fs.rm(workspaceOwnedBranchReleasePath, { force: true });
   await fs.rm(workspaceWorktreeAddTriggerPath, { force: true });
   await fs.rm(workspaceWorktreeAddPidPath, { force: true });
   await fs.rm(workspaceWorktreeRemoveTriggerPath, { force: true });

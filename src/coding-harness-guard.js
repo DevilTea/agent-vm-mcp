@@ -2,6 +2,25 @@ const CODING_HARNESS_COMMANDS = new Set(['codex', 'agy', 'claude']);
 const SAFE_HARNESS_PROBES = new Set(['--help', '-h', '--version', '-V', 'help', 'version']);
 const SHELL_COMMANDS = new Set(['bash', 'dash', 'fish', 'ksh', 'sh', 'zsh']);
 const INTERACTIVE_TERMINAL_COMMANDS = new Set(['tmux', 'screen', 'script']);
+const SUDO_OPTIONS_WITH_VALUE = new Set([
+  '-C', '-D', '-g', '-h', '-p', '-R', '-T', '-U', '-u', '-a', '-c', '-r', '-t',
+  '--auth-type', '--chdir', '--chroot', '--close-from', '--command-timeout', '--group', '--host',
+  '--login-class', '--other-user', '--prompt', '--role', '--type', '--user',
+]);
+const SUDO_OPTIONS_WITHOUT_VALUE = new Set([
+  '-A', '-b', '-B', '-e', '-E', '-H', '-i', '-K', '-k', '-l', '-n', '-S', '-s', '-V', '-v',
+  '--askpass', '--background', '--bell', '--edit', '--help', '--login', '--non-interactive',
+  '--preserve-env', '--remove-timestamp', '--reset-timestamp', '--shell', '--stdin', '--validate', '--version',
+]);
+const ENV_OPTIONS_WITH_VALUE = new Set(['-C', '-u', '--chdir', '--unset', '--argv0']);
+const ENV_OPTIONS_WITHOUT_VALUE = new Set([
+  '-i', '-0', '-v', '--ignore-environment', '--null', '--debug', '--list-signal-handling',
+  '--help', '--version',
+]);
+
+function commandBasename(value) {
+  return typeof value === 'string' ? value.split('/').at(-1) : null;
+}
 
 function splitShellCommandSegments(command) {
   const segments = [];
@@ -126,26 +145,138 @@ function advancePastCommandWrapper(words, index) {
   return index;
 }
 
+function unsafeCommandWrapper(message) {
+  const error = new Error(message);
+  error.code = 'unsafe_command_wrapper';
+  throw error;
+}
+
+function advancePastExecWrapper(words, index) {
+  index += 1;
+  while (index < words.length) {
+    const value = words[index];
+    if (value === '--') return index + 1;
+    if (!value?.startsWith('-') || value === '-') return index;
+    if (value === '-a') {
+      if (index + 1 >= words.length) unsafeCommandWrapper('exec -a requires an argv[0] value.');
+      index += 2;
+      continue;
+    }
+    if (/^-[cl]+$/.test(value)) {
+      index += 1;
+      continue;
+    }
+    unsafeCommandWrapper(`Unsupported exec wrapper option on guarded execution surface: ${value}`);
+  }
+  return index;
+}
+
+function advancePastSudoWrapper(words, index) {
+  index += 1;
+  while (index < words.length) {
+    const value = words[index];
+    if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(value ?? '')) {
+      index += 1;
+      continue;
+    }
+    if (value === '--') return index + 1;
+    if (!value?.startsWith('-') || value === '-') return index;
+
+    const optionName = value.includes('=') ? value.slice(0, value.indexOf('=')) : value;
+    if (SUDO_OPTIONS_WITH_VALUE.has(optionName)) {
+      if (value.includes('=')) {
+        index += 1;
+        continue;
+      }
+      if (index + 1 >= words.length) unsafeCommandWrapper(`sudo option ${value} requires a value.`);
+      index += 2;
+      continue;
+    }
+    if (
+      SUDO_OPTIONS_WITHOUT_VALUE.has(value) ||
+      value.startsWith('--preserve-env=') ||
+      /^-[ABbeEHikKlnSsVv]+$/.test(value)
+    ) {
+      index += 1;
+      continue;
+    }
+    unsafeCommandWrapper(`Unsupported sudo wrapper option on guarded execution surface: ${value}`);
+  }
+  return index;
+}
+
+function unsafeEnvWrapper(message) {
+  unsafeCommandWrapper(message);
+}
+
+function advancePastEnvWrapper(words, index) {
+  index += 1;
+  while (index < words.length) {
+    const value = words[index];
+    if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(value ?? '')) {
+      index += 1;
+      continue;
+    }
+    if (value === '--') return index + 1;
+    if (!value?.startsWith('-') || value === '-') return index;
+
+    const optionName = value.includes('=') ? value.slice(0, value.indexOf('=')) : value;
+    if (optionName === '-S' || optionName === '--split-string') {
+      unsafeEnvWrapper('env -S/--split-string is not allowed on guarded execution surfaces because it reparses a command string.');
+    }
+    if (ENV_OPTIONS_WITH_VALUE.has(optionName)) {
+      if (value.includes('=')) {
+        index += 1;
+        continue;
+      }
+      if (index + 1 >= words.length) unsafeEnvWrapper(`env option ${value} requires a value.`);
+      index += 2;
+      continue;
+    }
+    if (ENV_OPTIONS_WITHOUT_VALUE.has(value)) {
+      index += 1;
+      continue;
+    }
+    if (
+      value.startsWith('--block-signal') ||
+      value.startsWith('--default-signal') ||
+      value.startsWith('--ignore-signal')
+    ) {
+      index += 1;
+      continue;
+    }
+    unsafeEnvWrapper(`Unsupported env wrapper option on guarded execution surface: ${value}`);
+  }
+  return index;
+}
+
 function unwrapHarnessCommand(words) {
   let index = 0;
   while (index < words.length && (words[index] === '!' || /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[index]))) index += 1;
 
   while (index < words.length) {
-    const wrapper = words[index];
+    const wrapper = commandBasename(words[index]);
     if (wrapper === 'command') {
       const nextIndex = advancePastCommandWrapper(words, index);
       if (nextIndex === null) return null;
       index = nextIndex;
       continue;
     }
-    if (wrapper === 'exec' || wrapper === 'nohup' || wrapper === 'setsid') {
+    if (wrapper === 'exec') {
+      index = advancePastExecWrapper(words, index);
+      continue;
+    }
+    if (wrapper === 'nohup' || wrapper === 'setsid') {
       index += 1;
       while (words[index]?.startsWith('-')) index += 1;
       continue;
     }
     if (wrapper === 'env') {
-      index += 1;
-      while (words[index]?.startsWith('-') || /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[index] ?? '')) index += 1;
+      index = advancePastEnvWrapper(words, index);
+      continue;
+    }
+    if (wrapper === 'sudo') {
+      index = advancePastSudoWrapper(words, index);
       continue;
     }
     break;
@@ -153,7 +284,7 @@ function unwrapHarnessCommand(words) {
 
   const executable = words[index];
   if (!executable) return null;
-  const name = executable.split('/').at(-1);
+  const name = commandBasename(executable);
   if (!CODING_HARNESS_COMMANDS.has(name)) return null;
   return { name, args: words.slice(index + 1) };
 }
@@ -163,21 +294,28 @@ function executableName(words) {
   while (index < words.length && (words[index] === '!' || /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[index]))) index += 1;
 
   while (index < words.length) {
-    const wrapper = words[index];
+    const wrapper = commandBasename(words[index]);
     if (wrapper === 'command') {
       const nextIndex = advancePastCommandWrapper(words, index);
       if (nextIndex === null) return { name: null, args: [] };
       index = nextIndex;
       continue;
     }
-    if (wrapper === 'exec' || wrapper === 'nohup' || wrapper === 'setsid') {
+    if (wrapper === 'exec') {
+      index = advancePastExecWrapper(words, index);
+      continue;
+    }
+    if (wrapper === 'nohup' || wrapper === 'setsid') {
       index += 1;
       while (words[index]?.startsWith('-')) index += 1;
       continue;
     }
     if (wrapper === 'env') {
-      index += 1;
-      while (words[index]?.startsWith('-') || /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[index] ?? '')) index += 1;
+      index = advancePastEnvWrapper(words, index);
+      continue;
+    }
+    if (wrapper === 'sudo') {
+      index = advancePastSudoWrapper(words, index);
       continue;
     }
     break;
@@ -185,50 +323,68 @@ function executableName(words) {
 
   const executable = words[index];
   if (!executable) return { name: null, args: [] };
-  return { name: executable.split('/').at(-1), args: words.slice(index + 1) };
+  return { name: commandBasename(executable), args: words.slice(index + 1) };
 }
 
-function shellCommandArgument(name, args) {
-  if (!SHELL_COMMANDS.has(name)) return null;
+function shellCommandArguments(name, args) {
+  if (!SHELL_COMMANDS.has(name)) return [];
+  const commands = [];
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index];
-    if (arg === '--command') return args[index + 1] ?? null;
-    if (/^-[^-]*c/.test(arg)) return args[index + 1] ?? null;
+    if (arg === '--command') {
+      if (args[index + 1] !== undefined) commands.push(args[index + 1]);
+      continue;
+    }
+    if (arg.startsWith('--command=')) {
+      commands.push(arg.slice('--command='.length));
+      continue;
+    }
+    if (/^-[^-]*c/.test(arg)) {
+      if (args[index + 1] !== undefined) commands.push(args[index + 1]);
+      if (arg.startsWith('-c') && arg.length > 2) commands.push(arg.slice(2));
+    }
   }
-  return null;
+  return [...new Set(commands)];
 }
 
-export function assertNoRawCodingHarnessLaunch(
-  command,
-  surface,
-  { forbidInteractiveTerminalCommands = false } = {},
-) {
-  for (const segment of splitShellCommandSegments(command)) {
-    const words = shellWords(segment);
-    const executable = executableName(words);
-    if (forbidInteractiveTerminalCommands && INTERACTIVE_TERMINAL_COMMANDS.has(executable.name)) {
-      const error = new Error(
-        `${surface} must not launch interactive terminal sessions through ${executable.name} on this host. ` +
-          'Use process_start for generic long-running processes and agent_start/agent_poll for coding-agent work.',
-      );
-      error.code = 'interactive_terminal_launch_forbidden';
-      throw error;
-    }
-
-    const nestedShellCommand = shellCommandArgument(executable.name, executable.args);
-    if (nestedShellCommand !== null) {
-      assertNoRawCodingHarnessLaunch(nestedShellCommand, surface, { forbidInteractiveTerminalCommands });
-    }
-
-    const harness = unwrapHarnessCommand(words);
-    if (!harness) continue;
-    if (harness.args.length > 0 && SAFE_HARNESS_PROBES.has(harness.args[0])) continue;
+function assertCommandWords(words, surface, { forbidInteractiveTerminalCommands = false } = {}) {
+  const executable = executableName(words);
+  if (forbidInteractiveTerminalCommands && INTERACTIVE_TERMINAL_COMMANDS.has(executable.name)) {
     const error = new Error(
-      `${surface} must not launch the ${harness.name} coding harness for agent work. ` +
-        'Use agent_start for normal bounded coding-agent work and agent_run only for short blocking tasks. Raw harness TUI execution is not a supported fallback.',
+      `${surface} must not launch interactive terminal sessions through ${executable.name} on this host. ` +
+        'Use process_start for generic long-running processes and agent_start/agent_poll for coding-agent work.',
     );
-    error.code = 'raw_coding_harness_launch_forbidden';
+    error.code = 'interactive_terminal_launch_forbidden';
     throw error;
+  }
+
+  for (const nestedShellCommand of shellCommandArguments(executable.name, executable.args)) {
+    assertNoRawCodingHarnessLaunch(nestedShellCommand, surface, { forbidInteractiveTerminalCommands });
+  }
+
+  const harness = unwrapHarnessCommand(words);
+  if (!harness) return;
+  if (harness.args.length > 0 && SAFE_HARNESS_PROBES.has(harness.args[0])) return;
+  const error = new Error(
+    `${surface} must not launch the ${harness.name} coding harness for agent work. ` +
+      'Use agent_start for normal bounded coding-agent work and agent_run only for short blocking tasks. Raw harness TUI execution is not a supported fallback.',
+  );
+  error.code = 'raw_coding_harness_launch_forbidden';
+  throw error;
+}
+
+export function assertNoRawCodingHarnessArgv(argv, surface, options = {}) {
+  if (!Array.isArray(argv) || argv.length === 0 || typeof argv[0] !== 'string' || argv[0].length === 0) {
+    const error = new Error(`${surface} argv must contain a non-empty executable.`);
+    error.code = 'invalid_argv';
+    throw error;
+  }
+  assertCommandWords(argv, surface, options);
+}
+
+export function assertNoRawCodingHarnessLaunch(command, surface, options = {}) {
+  for (const segment of splitShellCommandSegments(command)) {
+    assertCommandWords(shellWords(segment), surface, options);
   }
 }
 

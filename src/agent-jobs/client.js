@@ -1,5 +1,10 @@
 import http from 'node:http';
 import { socketPath } from './store.js';
+import { decodeOpaqueCursor, encodeOpaqueCursor, nonNegativeCursorOffset } from '../opaque-cursor.js';
+import { toolError } from '../tool-errors.js';
+
+const POLL_CURSOR_KIND = 'agent_poll';
+const POLL_OFFSET_FIELDS = ['stdoutOffset', 'stderrOffset', 'eventOffset', 'invalidLineOffset'];
 
 function request(method, endpoint, payload, signal, timeoutMs = 20_000) {
   return new Promise((resolve, reject) => {
@@ -69,10 +74,53 @@ export function jobList({ cwd, limit = 64 } = {}, signal) {
   return request('GET', '/jobs?' + query({ cwd, limit }), null, signal);
 }
 
-export function jobPoll({ runId, ...options }, signal) {
+export async function jobPoll({ runId, cursor, ...options }, signal) {
+  const hasExplicitOffsets = POLL_OFFSET_FIELDS.some((field) => options[field] !== undefined);
+  if (cursor !== undefined && hasExplicitOffsets) {
+    throw toolError(
+      'CURSOR_OFFSET_CONFLICT',
+      'agent_poll cursor cannot be combined with explicit stream offsets.',
+      { fields: POLL_OFFSET_FIELDS.filter((field) => options[field] !== undefined) },
+    );
+  }
+
+  let offsets = {};
+  if (cursor !== undefined) {
+    const decoded = decodeOpaqueCursor(cursor, POLL_CURSOR_KIND);
+    if (decoded.runId !== runId) {
+      throw toolError('CURSOR_TARGET_MISMATCH', 'agent_poll cursor belongs to a different run.', {
+        expectedRunId: runId,
+        cursorRunId: decoded.runId ?? null,
+      });
+    }
+    offsets = Object.fromEntries(POLL_OFFSET_FIELDS.map((field) => [
+      field,
+      nonNegativeCursorOffset(decoded[field], field, POLL_CURSOR_KIND),
+    ]));
+  } else {
+    offsets = Object.fromEntries(POLL_OFFSET_FIELDS
+      .filter((field) => options[field] !== undefined)
+      .map((field) => [field, options[field]]));
+  }
+
   // Long polling is capped at 15 seconds; leave a small transport margin.
-  return request('GET', '/jobs/' + runId + '/poll?' + query(options),
-    null, signal, Math.min(20_000, (options.waitMs ?? 10_000) + 5000));
+  const result = await request(
+    'GET',
+    '/jobs/' + runId + '/poll?' + query({ ...offsets, waitMs: options.waitMs }),
+    null,
+    signal,
+    Math.min(20_000, (options.waitMs ?? 10_000) + 5000),
+  );
+  return {
+    ...result,
+    cursor: encodeOpaqueCursor(POLL_CURSOR_KIND, {
+      runId,
+      stdoutOffset: result.stdout.nextOffset,
+      stderrOffset: result.stderr.nextOffset,
+      eventOffset: result.structured.events.nextOffset,
+      invalidLineOffset: result.structured.invalidLines.nextOffset,
+    }),
+  };
 }
 
 export function jobResult({ runId }, signal) {

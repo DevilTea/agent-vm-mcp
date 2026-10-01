@@ -37,7 +37,7 @@ import {
 } from './artifacts/constants.js';
 import { registerArtifactSystem } from './artifacts/register.js';
 import { ExecOutputCapture } from './exec-output.js';
-import { assertNoRawCodingHarnessLaunch } from './coding-harness-guard.js';
+import { assertNoRawCodingHarnessArgv, assertNoRawCodingHarnessLaunch } from './coding-harness-guard.js';
 import { resolveHostProfile } from './host-profile.js';
 import { interactionToolNamesForHost, registerInteractionsForHost } from './interactions/index.js';
 import {
@@ -57,6 +57,8 @@ import { applyUnifiedPatch, editTextFiles, listDirectory, readTextFile, waitForF
 import { resolveBashExecutable } from './shell.js';
 import { workspaceCreate, workspaceDelete, workspaceList, waitForWorkspaceMutations } from './workspaces.js';
 import { collectWorkStatus } from './work-status.js';
+import { decodeOpaqueCursor, encodeOpaqueCursor, nonNegativeCursorOffset } from './opaque-cursor.js';
+import { toolError, withStructuredErrors } from './tool-errors.js';
 
 const MAX_PROCESS_STREAM_BYTES = 4 * 1024 * 1024;
 const MAX_PROCESS_SESSIONS = 32;
@@ -131,13 +133,18 @@ function killProcessGroup(child, signal) {
   }
 }
 
-async function executeCommand({ command, cwd, env, timeoutMs }, requestSignal, artifactStore, hostProfile) {
-  assertNoRawCodingHarnessLaunch(command, 'exec', {
+async function executeCommand({ command, argv, cwd, env, timeoutMs }, requestSignal, artifactStore, hostProfile) {
+  const guardOptions = {
     forbidInteractiveTerminalCommands: !hostProfile.allowInteractiveTerminalCommands,
-  });
+  };
+  if (argv !== undefined) assertNoRawCodingHarnessArgv(argv, 'exec', guardOptions);
+  else assertNoRawCodingHarnessLaunch(command, 'exec', guardOptions);
+
   const startedAt = Date.now();
   const executionArtifactId = randomUUID();
-  const child = spawn(EXECUTION_SHELL, ['-lc', command], {
+  const executable = argv?.[0] ?? EXECUTION_SHELL;
+  const spawnArgs = argv === undefined ? ['-lc', command] : argv.slice(1);
+  const child = spawn(executable, spawnArgs, {
     cwd: cwd ?? process.env.HOME,
     env: {
       ...process.env,
@@ -269,9 +276,36 @@ function pruneFinishedProcesses() {
 function getProcessSession(processId) {
   const session = processes.get(processId);
   if (!session) {
-    throw new Error(`Unknown processId: ${processId}`);
+    throw toolError('PROCESS_NOT_FOUND', `Unknown processId: ${processId}`, { processId });
   }
   return session;
+}
+
+const PROCESS_READ_CURSOR_KIND = 'process_read';
+
+function processReadOffsets({ processId, cursor, stdoutOffset, stderrOffset }) {
+  const explicit = { stdoutOffset, stderrOffset };
+  const hasExplicitOffsets = Object.values(explicit).some((value) => value !== undefined);
+  if (cursor !== undefined && hasExplicitOffsets) {
+    throw toolError(
+      'CURSOR_OFFSET_CONFLICT',
+      'process_read cursor cannot be combined with explicit stream offsets.',
+      { fields: Object.entries(explicit).filter(([, value]) => value !== undefined).map(([key]) => key) },
+    );
+  }
+  if (cursor === undefined) return explicit;
+
+  const decoded = decodeOpaqueCursor(cursor, PROCESS_READ_CURSOR_KIND);
+  if (decoded.processId !== processId) {
+    throw toolError('CURSOR_TARGET_MISMATCH', 'process_read cursor belongs to a different process.', {
+      expectedProcessId: processId,
+      cursorProcessId: decoded.processId ?? null,
+    });
+  }
+  return {
+    stdoutOffset: nonNegativeCursorOffset(decoded.stdoutOffset, 'stdoutOffset', PROCESS_READ_CURSOR_KIND),
+    stderrOffset: nonNegativeCursorOffset(decoded.stderrOffset, 'stderrOffset', PROCESS_READ_CURSOR_KIND),
+  };
 }
 
 function startPersistentProcess({ command, cwd, env }, requestSignal, hostProfile) {
@@ -508,12 +542,18 @@ async function createServer() {
     'exec',
     {
       description:
-        'Execute an arbitrary shell command on the dedicated disposable Linux agent VM. ' +
+        'Execute either an arbitrary shell command or an argv vector on the dedicated disposable Linux agent VM. Exactly one of command or argv is required. ' +
         'Oversized stdout/stderr use bounded head/tail previews plus opaque model-only artifacts readable with read_artifact. ' +
         'Use this for commands that complete on their own. For servers, watchers, REPLs, or other long-running/interactive commands, use process_start instead. ' +
         'Do not launch coding harness work directly through exec; use agent_start for normal bounded agent work and agent_run only for short blocking tasks. Harmless --help/--version probes remain allowed. On the ChatGPT host, interactive terminal session launchers such as tmux/screen/script are also forbidden.',
       inputSchema: z.object({
-        command: z.string().min(1).describe('Shell command to execute with bash -lc.'),
+        command: z.string().min(1).optional().describe('Shell command to execute with bash -lc. Mutually exclusive with argv.'),
+        argv: z
+          .array(z.string())
+          .min(1)
+          .max(1024)
+          .optional()
+          .describe('Executable plus literal arguments, without shell parsing. Mutually exclusive with command.'),
         cwd: z.string().optional().describe('Working directory. Defaults to the agent user home directory.'),
         env: z.record(z.string(), z.string()).optional().describe('Additional environment variables.'),
         timeoutMs: z
@@ -523,16 +563,22 @@ async function createServer() {
           .max(600_000)
           .default(120_000)
           .describe('Maximum execution time in milliseconds.'),
-      }),
+      }).refine(
+        (value) => (value.command === undefined) !== (value.argv === undefined) && (value.argv === undefined || value.argv[0]?.length > 0),
+        { message: 'Provide exactly one of command or argv, and argv[0] must be a non-empty executable.' },
+      ),
     },
-    async (args, ctx) => execResult(await executeCommand(args, ctx.mcpReq.signal, artifactStore, hostProfile)),
+    withStructuredErrors(
+      async (args, ctx) => execResult(await executeCommand(args, ctx.mcpReq.signal, artifactStore, hostProfile)),
+      'EXEC_FAILED',
+    ),
   );
 
   server.registerTool(
     'read_file',
     {
       description:
-        'Read a bounded UTF-8 text file or 1-based line range with structured line metadata and a whole-file sha256 revision for optimistic edits. Use shell tools for binary or very large files.',
+        'Read a bounded UTF-8 text file or 1-based line range with structured line metadata, a whole-file sha256 revision for optimistic edits, and a reusable cwd-relative locator when the target is inside cwd. Use shell tools for binary or very large files.',
       inputSchema: z.object({
         path: z.string().min(1).describe('File path. Relative paths are resolved against cwd.'),
         cwd: z.string().optional().describe('Base directory. Defaults to the agent user home directory.'),
@@ -540,7 +586,7 @@ async function createServer() {
         endLine: z.number().int().min(1).optional().describe('Inclusive last line to return.'),
       }),
     },
-    async (args) => jsonResult(await readTextFile(args)),
+    withStructuredErrors(async (args) => jsonResult(await readTextFile(args)), 'READ_FILE_FAILED'),
   );
 
   const editOperationSchema = z.discriminatedUnion('type', [
@@ -568,29 +614,42 @@ async function createServer() {
     }),
   ]);
 
+  const fileRevisionSchema = z.string().regex(/^sha256:[0-9a-f]{64}$/);
+  const editFileSchema = z.object({
+    action: z.literal('edit').optional().describe('Edit an existing UTF-8 file. This is the default action.'),
+    path: z.string().min(1).describe('Existing file path relative to cwd.'),
+    ifMatch: fileRevisionSchema.optional().describe('Optional whole-file revision from read_file.'),
+    edits: z.array(editOperationSchema).min(1).max(128).describe('Ordered exact text edits for this file.'),
+  });
+  const createFileSchema = z.object({
+    action: z.literal('create'),
+    path: z.string().min(1).describe('New file path relative to cwd. The target must not already exist.'),
+    content: z.string().describe('Complete UTF-8 contents for the new file.'),
+  });
+  const deleteFileSchema = z.object({
+    action: z.literal('delete'),
+    path: z.string().min(1).describe('Existing file path relative to cwd.'),
+    ifMatch: fileRevisionSchema.describe('Required whole-file revision from read_file.'),
+  });
+
   server.registerTool(
     'edit_files',
     {
       description:
-        'Apply exact ordered text edits to existing UTF-8 files relative to cwd. All files and operations are validated before mutation; ambiguous or missing matches, stale ifMatch revisions, traversal, and symlink paths fail closed. Files are replaced via same-directory temporary files with rollback backups. Use read_file revision as ifMatch when guarding against concurrent changes.',
+        'Edit, create, or delete UTF-8 files relative to cwd. Edit uses exact ordered matches; create never overwrites an existing path; delete requires read_file revision via ifMatch. All operations are fully prevalidated before mutation, so preflight failures are zero-write. After the commit boundary, cancellation does not interrupt mutation; commit failures trigger rollback and preserve backups when rollback itself fails.',
       inputSchema: z.object({
         cwd: z.string().optional().describe('Base directory. Defaults to the agent user home directory.'),
         files: z
-          .array(z.object({
-            path: z.string().min(1).describe('Existing file path relative to cwd.'),
-            ifMatch: z
-              .string()
-              .regex(/^sha256:[0-9a-f]{64}$/)
-              .optional()
-              .describe('Optional whole-file revision from read_file. A mismatch rejects the entire edit.'),
-            edits: z.array(editOperationSchema).min(1).max(128).describe('Ordered exact text edits for this file.'),
-          }))
+          .array(z.union([editFileSchema, createFileSchema, deleteFileSchema]))
           .min(1)
           .max(64)
-          .describe('Files to edit transactionally after all validation succeeds.'),
+          .describe('File operations to prevalidate as a batch before mutation.'),
       }),
     },
-    async (args, ctx) => jsonResult(await editTextFiles(args, ctx.mcpReq.signal)),
+    withStructuredErrors(
+      async (args, ctx) => jsonResult(await editTextFiles(args, ctx.mcpReq.signal)),
+      'EDIT_FILES_FAILED',
+    ),
   );
 
   server.registerTool(
@@ -620,17 +679,22 @@ async function createServer() {
           .describe('Path interpretation: auto infers git only from diff --git metadata, cwd uses -p0, and git uses -p1.'),
       }),
     },
-    async (args, ctx) => jsonResult(await applyUnifiedPatch(args, ctx.mcpReq.signal)),
+    withStructuredErrors(
+      async (args, ctx) => jsonResult(await applyUnifiedPatch(args, ctx.mcpReq.signal)),
+      'APPLY_PATCH_FAILED',
+    ),
   );
 
   server.registerTool(
     'workspace_create',
     {
       description:
-        'Create an isolated managed Git worktree backed by shared repository storage. Returns an immutable workspace ID and path for use as cwd with existing tools.',
+        'Create an isolated managed Git worktree backed by shared repository storage. Optionally create a new local branch that must not already exist locally or on origin, and use idempotencyKey for safe retries after a lost response. Returns an immutable workspace ID and path for use as cwd with existing tools.',
       inputSchema: z.object({
         repository: z.string().min(1).describe('Git clone source. HTTP(S) URLs must not contain embedded userinfo, query parameters, or fragments; use Git credential helpers instead.'),
         revision: z.string().min(1).optional().describe('Optional Git commit-ish. Defaults to the remote default branch.'),
+        createBranch: z.string().min(1).max(255).optional().describe('Optional new local branch name. Creation fails if the branch already exists locally or on origin.'),
+        idempotencyKey: z.string().min(1).max(128).optional().describe('Stable key for safe retries. Reusing the key with different repository/revision/createBranch inputs fails.'),
         timeoutMs: z
           .number()
           .int()
@@ -640,7 +704,10 @@ async function createServer() {
           .describe('Maximum time for repository bootstrap/fetch and worktree creation.'),
       }),
     },
-    async (args, ctx) => jsonResult(await workspaceCreate(args, ctx.mcpReq.signal)),
+    withStructuredErrors(
+      async (args, ctx) => jsonResult(await workspaceCreate(args, ctx.mcpReq.signal)),
+      'WORKSPACE_CREATE_FAILED',
+    ),
   );
 
   server.registerTool(
@@ -649,7 +716,7 @@ async function createServer() {
       description:
         'Rediscover managed Git workspaces from durable filesystem and Git worktree state, including repository, HEAD/branch, and dirty status.',
     },
-    async () => jsonResult(await workspaceList()),
+    withStructuredErrors(async () => jsonResult(await workspaceList()), 'WORKSPACE_LIST_FAILED'),
   );
 
   server.registerTool(
@@ -664,7 +731,10 @@ async function createServer() {
         force: z.boolean().default(false).describe('Discard dirty workspace content when true.'),
       }),
     },
-    async (args, ctx) => jsonResult(await workspaceDelete(args, ctx.mcpReq.signal)),
+    withStructuredErrors(
+      async (args, ctx) => jsonResult(await workspaceDelete(args, ctx.mcpReq.signal)),
+      'WORKSPACE_DELETE_FAILED',
+    ),
   );
 
   const agentTaskInput = {
@@ -717,7 +787,10 @@ async function createServer() {
         idempotencyKey: z.string().min(1).max(128).optional(),
       }),
     },
-    async (args, ctx) => jsonResult(await jobStart(args, ctx.mcpReq.signal)),
+    withStructuredErrors(
+      async (args, ctx) => jsonResult(await jobStart(args, ctx.mcpReq.signal)),
+      'AGENT_START_FAILED',
+    ),
   );
 
   server.registerTool(
@@ -725,17 +798,21 @@ async function createServer() {
     {
       description:
         'Poll a persistent background job for incremental stdout/stderr and JSONL events, including across MCP restarts. ' +
-        'Offsets are byte positions for all four streams; pass returned nextOffset values. Each poll waits at most 15 seconds.',
+        'Prefer the opaque cursor returned by the previous poll; explicit stream offsets remain available for compatibility but cannot be combined with cursor. Each poll waits at most 15 seconds.',
       inputSchema: z.object({
         runId: z.string().uuid(),
         stdoutOffset: z.number().int().min(0).optional(),
+        cursor: z.string().min(1).max(1024).optional(),
         stderrOffset: z.number().int().min(0).optional(),
         eventOffset: z.number().int().min(0).optional(),
         invalidLineOffset: z.number().int().min(0).optional(),
         waitMs: z.number().int().min(0).max(MAX_AGENT_POLL_WAIT_MS).default(DEFAULT_AGENT_POLL_WAIT_MS),
       }),
     },
-    async (args, ctx) => jsonResult(await jobPoll(args, ctx.mcpReq.signal)),
+    withStructuredErrors(
+      async (args, ctx) => jsonResult(await jobPoll(args, ctx.mcpReq.signal)),
+      'AGENT_POLL_FAILED',
+    ),
   );
 
   server.registerTool(
@@ -748,7 +825,10 @@ async function createServer() {
         runId: z.string().uuid(),
       }),
     },
-    async (args, ctx) => jsonResult(await jobResult(args, ctx.mcpReq.signal)),
+    withStructuredErrors(
+      async (args, ctx) => jsonResult(await jobResult(args, ctx.mcpReq.signal)),
+      'AGENT_RESULT_FAILED',
+    ),
   );
 
   server.registerTool(
@@ -760,7 +840,10 @@ async function createServer() {
         runId: z.string().uuid(),
       }),
     },
-    async (args, ctx) => jsonResult(await jobCancel(args, ctx.mcpReq.signal)),
+    withStructuredErrors(
+      async (args, ctx) => jsonResult(await jobCancel(args, ctx.mcpReq.signal)),
+      'AGENT_CANCEL_FAILED',
+    ),
   );
 
   server.registerTool(
@@ -778,7 +861,10 @@ async function createServer() {
         openWorldHint: false,
       },
     },
-    async (args, ctx) => jsonResult(await jobList(args, ctx.mcpReq.signal)),
+    withStructuredErrors(
+      async (args, ctx) => jsonResult(await jobList(args, ctx.mcpReq.signal)),
+      'AGENT_LIST_FAILED',
+    ),
   );
 
   server.registerTool(
@@ -791,7 +877,10 @@ async function createServer() {
         timeoutMs: z.number().int().min(1_000).max(30_000).default(15_000),
       }),
     },
-    async (args, ctx) => jsonResult(await agentRun(args, ctx.mcpReq.signal)),
+    withStructuredErrors(
+      async (args, ctx) => jsonResult(await agentRun(args, ctx.mcpReq.signal)),
+      'AGENT_RUN_FAILED',
+    ),
   );
 
   server.registerTool(
@@ -812,7 +901,7 @@ async function createServer() {
       }),
       ...(hostProfile.importFileToolMeta ? { _meta: hostProfile.importFileToolMeta } : {}),
     },
-    async ({ file, destination, cwd, overwrite }, ctx) => {
+    withStructuredErrors(async ({ file, destination, cwd, overwrite }, ctx) => {
       const requestSignal = ctx.mcpReq.signal;
       const response = await fetch(file.download_url, {
         redirect: 'follow',
@@ -879,7 +968,7 @@ async function createServer() {
         sha256: hash.digest('hex'),
         path: resolvedPath,
       });
-    },
+    }, 'IMPORT_FILE_FAILED'),
   );
 
   server.registerTool(
@@ -909,10 +998,10 @@ async function createServer() {
         env: z.record(z.string(), z.string()).optional().describe('Additional environment variables.'),
       }),
     },
-    async (args, ctx) => {
+    withStructuredErrors(async (args, ctx) => {
       const session = await startPersistentProcess(args, ctx.mcpReq.signal, hostProfile);
       return jsonResult(processSummary(session));
-    },
+    }, 'PROCESS_START_FAILED'),
   );
 
   server.registerTool(
@@ -933,21 +1022,30 @@ async function createServer() {
     'process_read',
     {
       description:
-        'Read incremental stdout/stderr and status from a process started by process_start. Pass the returned next offsets on later reads to receive only new output.',
+        'Read incremental stdout/stderr and status from a process started by process_start. Prefer the opaque cursor returned by the previous read; explicit stdout/stderr offsets remain available for compatibility but cannot be combined with cursor.',
       inputSchema: z.object({
         processId: z.string().uuid(),
         stdoutOffset: z.number().int().min(0).optional(),
+        cursor: z.string().min(1).max(1024).optional(),
         stderrOffset: z.number().int().min(0).optional(),
       }),
     },
-    async ({ processId, stdoutOffset, stderrOffset }) => {
+    withStructuredErrors(async ({ processId, cursor, stdoutOffset, stderrOffset }) => {
       const session = getProcessSession(processId);
+      const offsets = processReadOffsets({ processId, cursor, stdoutOffset, stderrOffset });
+      const stdout = session.stdout.read(offsets.stdoutOffset);
+      const stderr = session.stderr.read(offsets.stderrOffset);
       return jsonResult({
         ...processSummary(session),
-        stdout: session.stdout.read(stdoutOffset),
-        stderr: session.stderr.read(stderrOffset),
+        cursor: encodeOpaqueCursor(PROCESS_READ_CURSOR_KIND, {
+          processId,
+          stdoutOffset: stdout.nextOffset,
+          stderrOffset: stderr.nextOffset,
+        }),
+        stdout,
+        stderr,
       });
-    },
+    }, 'PROCESS_READ_FAILED'),
   );
 
   server.registerTool(
@@ -960,7 +1058,7 @@ async function createServer() {
         appendNewline: z.boolean().default(false),
       }),
     },
-    async ({ processId, input, appendNewline }) => {
+    withStructuredErrors(async ({ processId, input, appendNewline }) => {
       const session = getProcessSession(processId);
       if (session.exitedAt !== null || !session.child.stdin.writable) {
         throw new Error(`Process ${processId} is not running or stdin is closed.`);
@@ -973,7 +1071,7 @@ async function createServer() {
       session.lastActivityAt = Date.now();
 
       return jsonResult({ processId, bytesWritten: Buffer.byteLength(data) });
-    },
+    }, 'PROCESS_WRITE_FAILED'),
   );
 
   server.registerTool(
@@ -985,13 +1083,13 @@ async function createServer() {
         signal: z.enum(['SIGTERM', 'SIGINT', 'SIGKILL']).default('SIGTERM'),
       }),
     },
-    async ({ processId, signal }) => {
+    withStructuredErrors(async ({ processId, signal }) => {
       const session = getProcessSession(processId);
       if (session.exitedAt === null) {
         killProcessGroup(session.child, signal);
       }
       return jsonResult({ ...processSummary(session), requestedSignal: signal });
-    },
+    }, 'PROCESS_KILL_FAILED'),
   );
 
   server.registerTool(

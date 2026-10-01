@@ -119,6 +119,16 @@ The historical v1 view and its App-only `request_user_input_state` / `request_us
 
 The generic host does not expose `request_user_input` yet. Future hosts can register their own adapter against the same interaction model without adding host-specific fields to the public schema.
 
+## Native file and execution tools
+
+`read_file` returns bounded UTF-8 content plus a whole-file SHA-256 `revision`. When the resolved target is inside the supplied `cwd`, it also returns a reusable `{ cwd, path }` locator so a later `edit_files` call does not need to reconstruct the relative path.
+
+`edit_files` is the model-oriented filesystem mutation surface. It supports exact ordered edits to existing UTF-8 files, non-overwriting file creation, and revision-guarded file deletion. The whole batch is prevalidated before mutation; preflight failures are zero-write. On Linux, mutation paths are anchored to opened `O_DIRECTORY|O_NOFOLLOW` parent handles, so replacing a validated parent path with a symlink cannot redirect commit or rollback into another directory tree. Once commit begins, cancellation does not interrupt it. Ordinary commit failures trigger rollback, while rollback refuses to overwrite a target that was independently changed and preserves recovery evidence instead. Multi-file edits are not claimed to be process-crash-atomic.
+
+`exec` accepts exactly one of a shell `command` or literal `argv`. Prefer `argv` when shell syntax is unnecessary so quoting and argument boundaries stay explicit; use `command` for pipes, redirects, and compound shell expressions. Raw coding-harness execution remains blocked in both modes.
+
+Core mutating tools return machine-readable error envelopes with stable `error.code`, human-readable `message`, and tool-specific `details` when available. Schema-validation errors remain protocol-level input errors.
+
 ## Artifacts and host presentation
 
 Artifacts use opaque process-local URIs such as:
@@ -153,7 +163,7 @@ The `server_info` tool description embeds the catalog marker that ChatGPT saw wh
 
 ## Workspaces and Git
 
-`workspace_create` manages a shared bare repository store plus isolated Git worktrees. A workspace has its own working tree, index, and `HEAD`; objects, refs, tags, remotes, repository-level config, and stash remain shared within that repository store.
+`workspace_create` manages a shared bare repository store plus isolated Git worktrees. A workspace has its own working tree, index, and `HEAD`; objects, refs, tags, remotes, repository-level config, and stash remain shared within that repository store. `createBranch` atomically compare-and-creates the local branch ref and uses expected-OID cleanup, so a failed request does not delete a branch that another actor created or subsequently moved. It also fails closed when the requested name is already present locally or on the refreshed `origin` tracking refs. `idempotencyKey` persists a pending workspace intent before worktree creation and uses a cross-process owner lock based on Linux PID/start-time identity, so a retry after a lost response or MCP restart reuses or recovers the same workspace identity instead of intentionally creating a second one; reusing the key for different inputs is rejected.
 
 Defaults:
 
@@ -162,13 +172,13 @@ Defaults:
 
 Override them with `AGENT_REPOSITORY_ROOT` and `AGENT_WORKSPACE_ROOT`.
 
-Workspace lifecycle does not install dependencies, trust repository toolchains, create task branches, commit/stash changes, start processes, or manage containers. Repository authentication stays with normal Git credential mechanisms. HTTP(S) clone URLs with embedded userinfo, query parameters, or fragments are rejected to reduce accidental credential persistence.
+Workspace lifecycle does not install dependencies, trust repository toolchains, commit/stash changes, start processes, or manage containers. It creates a task branch only when `createBranch` is explicitly supplied. Repository authentication stays with normal Git credential mechanisms. HTTP(S) clone URLs with embedded userinfo, query parameters, or fragments are rejected to reduce accidental credential persistence.
 
 ## Processes and coding agents
 
-`process_*` tools manage generic processes owned by the running MCP server. On graceful shutdown, managed process groups receive `SIGTERM` and are escalated to `SIGKILL` after a bounded grace period. These process sessions are not persisted across server restarts.
+`process_*` tools manage generic processes owned by the running MCP server. `process_read` returns an opaque cursor; pass it back on the next read instead of manually carrying stdout/stderr offsets. Explicit offsets remain available for compatibility and cannot be mixed with a cursor. On graceful shutdown, managed process groups receive `SIGTERM` and are escalated to `SIGKILL` after a bounded grace period. These process sessions are not persisted across server restarts.
 
-Normal coding-agent work uses **durable background jobs**. `agent_start` writes a job to a separate VM-owned `agent-jobd` service and returns an immutable `runId` once SQLite has accepted it. Jobs queue when the configured worker limit is reached; no ChatGPT/MCP connection must remain open. `agent_poll` reads incrementally with at most a 15-second wait. `agent_result` returns a bounded output preview **plus absolute paths to complete stdout/stderr and structured JSONL logs**. `agent_list` rediscovers jobs across ChatGPT turns, MCP restarts, and background-manager restarts. `agent_cancel` can cancel queued or running jobs.
+Normal coding-agent work uses **durable background jobs**. `agent_start` writes a job to a separate VM-owned `agent-jobd` service and returns an immutable `runId` once SQLite has accepted it. Jobs queue when the configured worker limit is reached; queued results expose position/capacity diagnostics instead of requiring callers to infer why they have not started. No ChatGPT/MCP connection must remain open. `agent_poll` reads incrementally with at most a 15-second wait and returns one opaque cursor covering stdout, stderr, structured events, and invalid lines; explicit per-stream offsets remain available for compatibility. `agent_result` returns a bounded output preview **plus absolute paths to complete stdout/stderr and structured JSONL logs**. `agent_list` rediscovers jobs across ChatGPT turns, MCP restarts, and background-manager restarts. `agent_cancel` can cancel queued or running jobs.
 
 - **Defaults:** two concurrent jobs per VM, two-hour per-job timeout, eight-hour maximum. A job timeout is *not* the lifetime of an MCP request. Worker health comes from Linux PID/start-time identity and database state, never from guessing that a quiet model is stalled.
 - **Safe retry:** send an `idempotencyKey` unique to a logical job. A repeated identical request returns the same `runId`; reusing the key with different inputs is rejected. Without the key, a request whose response was lost may be duplicated by retrying.
