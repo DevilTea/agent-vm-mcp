@@ -4,6 +4,7 @@ import { decodeOpaqueCursor, encodeOpaqueCursor, nonNegativeCursorOffset } from 
 import { toolError } from '../tool-errors.js';
 
 const POLL_CURSOR_KIND = 'agent_poll';
+const OPERATION_POLL_CURSOR_KIND = 'operation_poll';
 const POLL_OFFSET_FIELDS = ['stdoutOffset', 'stderrOffset', 'eventOffset', 'invalidLineOffset'];
 
 function request(method, endpoint, payload, signal, timeoutMs = 20_000) {
@@ -43,8 +44,8 @@ function request(method, endpoint, payload, signal, timeoutMs = 20_000) {
     req.on('error', (error) => {
       if (['ENOENT','ECONNREFUSED'].includes(error.code)) {
         const wrapped = new Error(
-          'Agent background job service is unavailable. Verify agent-jobd.service before retrying. ' +
-          'If this was an agent_start request whose response was lost, use the same idempotencyKey.'
+          'Durable background job service is unavailable. Verify agent-jobd.service before retrying. ' +
+          'If this was a start request whose response was lost, retry with the same idempotencyKey.'
         );
         wrapped.code = 'agent_job_service_unavailable';
         reject(wrapped);
@@ -129,4 +130,68 @@ export function jobResult({ runId }, signal) {
 
 export function jobCancel({ runId }, signal) {
   return request('POST', '/jobs/' + runId + '/cancel', {}, signal);
+}
+
+export function operationStart(args, signal) {
+  return request('POST', '/operations', args, signal);
+}
+
+export function operationList({ cwd, limit = 64 } = {}, signal) {
+  return request('GET', '/operations?' + query({ cwd, limit }), null, signal);
+}
+
+export async function operationPoll({ operationId, cursor, stdoutOffset, stderrOffset, waitMs }, signal) {
+  const hasExplicitOffsets = stdoutOffset !== undefined || stderrOffset !== undefined;
+  if (cursor !== undefined && hasExplicitOffsets) {
+    throw toolError(
+      'CURSOR_OFFSET_CONFLICT',
+      'operation_poll cursor cannot be combined with explicit stream offsets.',
+      { fields: [
+        ...(stdoutOffset !== undefined ? ['stdoutOffset'] : []),
+        ...(stderrOffset !== undefined ? ['stderrOffset'] : []),
+      ] },
+    );
+  }
+
+  let offsets = {};
+  if (cursor !== undefined) {
+    const decoded = decodeOpaqueCursor(cursor, OPERATION_POLL_CURSOR_KIND);
+    if (decoded.operationId !== operationId) {
+      throw toolError('CURSOR_TARGET_MISMATCH', 'operation_poll cursor belongs to a different operation.', {
+        expectedOperationId: operationId,
+        cursorOperationId: decoded.operationId ?? null,
+      });
+    }
+    offsets = {
+      stdoutOffset: nonNegativeCursorOffset(decoded.stdoutOffset, 'stdoutOffset', OPERATION_POLL_CURSOR_KIND),
+      stderrOffset: nonNegativeCursorOffset(decoded.stderrOffset, 'stderrOffset', OPERATION_POLL_CURSOR_KIND),
+    };
+  } else {
+    if (stdoutOffset !== undefined) offsets.stdoutOffset = stdoutOffset;
+    if (stderrOffset !== undefined) offsets.stderrOffset = stderrOffset;
+  }
+
+  const result = await request(
+    'GET',
+    '/operations/' + operationId + '/poll?' + query({ ...offsets, waitMs }),
+    null,
+    signal,
+    Math.min(20_000, (waitMs ?? 10_000) + 5000),
+  );
+  return {
+    ...result,
+    cursor: encodeOpaqueCursor(OPERATION_POLL_CURSOR_KIND, {
+      operationId,
+      stdoutOffset: result.stdout.nextOffset,
+      stderrOffset: result.stderr.nextOffset,
+    }),
+  };
+}
+
+export function operationResult({ operationId }, signal) {
+  return request('GET', '/operations/' + operationId + '/result', null, signal);
+}
+
+export function operationCancel({ operationId }, signal) {
+  return request('POST', '/operations/' + operationId + '/cancel', {}, signal);
 }

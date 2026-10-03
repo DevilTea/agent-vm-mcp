@@ -5,9 +5,9 @@ import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
-  DEFAULT_JOB_TIMEOUT_MS, DEFAULT_POLL_WAIT_MS, MAX_JOB_TIMEOUT_MS,
-  MAX_POLL_WAIT_MS, TERMINAL, openStore, processStartTicks,
-  sameProcess, socketPath, stateRoot, summary,
+  DEFAULT_JOB_TIMEOUT_MS, DEFAULT_POLL_WAIT_MS, JOB_KIND_AGENT, JOB_KIND_OPERATION,
+  MAX_JOB_TIMEOUT_MS, MAX_POLL_WAIT_MS, TERMINAL, openStore, operationSummary,
+  processStartTicks, sameProcess, socketPath, stateRoot, summary,
 } from './store.js';
 
 const root = stateRoot();
@@ -29,9 +29,23 @@ function fail(code, message, status = 400) {
   throw error;
 }
 
-function validateStart(input) {
-  if (!input || typeof input !== 'object') fail('invalid_input', 'Expected a job request');
-  if (!['codex', 'agy'].includes(input.harness)) fail('invalid_harness', 'Unsupported harness');
+function validateIdempotencyKey(input) {
+  if (input.idempotencyKey !== undefined &&
+      (typeof input.idempotencyKey !== 'string' ||
+       input.idempotencyKey.length < 1 || input.idempotencyKey.length > 128)) {
+    fail('invalid_idempotency_key', 'idempotencyKey must have 1-128 characters');
+  }
+}
+
+function validateTimeout(input) {
+  const timeoutMs = input.timeoutMs ?? DEFAULT_JOB_TIMEOUT_MS;
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1000 || timeoutMs > MAX_JOB_TIMEOUT_MS) {
+    fail('invalid_timeout', 'timeoutMs must be within 1000 and ' + MAX_JOB_TIMEOUT_MS);
+  }
+  return timeoutMs;
+}
+
+function validateCwd(input) {
   if (typeof input.cwd !== 'string' || !path.isAbsolute(input.cwd)) {
     fail('invalid_cwd', 'cwd must be an absolute directory');
   }
@@ -39,6 +53,13 @@ function validateStart(input) {
   if (!fs.statSync(directory, { throwIfNoEntry: false })?.isDirectory()) {
     fail('invalid_cwd', 'Working directory does not exist: ' + directory);
   }
+  return directory;
+}
+
+function validateStart(input) {
+  if (!input || typeof input !== 'object') fail('invalid_input', 'Expected a job request');
+  if (!['codex', 'agy'].includes(input.harness)) fail('invalid_harness', 'Unsupported harness');
+  const directory = validateCwd(input);
   if (typeof input.task !== 'string' || input.task.length < 1 || input.task.length > 100_000) {
     fail('invalid_task', 'task must have 1-100000 characters');
   }
@@ -47,19 +68,73 @@ function validateStart(input) {
         /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(name))) {
     fail('invalid_skills', 'skills must contain at most 16 valid names');
   }
-  const timeoutMs = input.timeoutMs ?? DEFAULT_JOB_TIMEOUT_MS;
-  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1000 || timeoutMs > MAX_JOB_TIMEOUT_MS) {
-    fail('invalid_timeout', 'timeoutMs must be within 1000 and ' + MAX_JOB_TIMEOUT_MS);
-  }
-  if (input.idempotencyKey !== undefined &&
-      (typeof input.idempotencyKey !== 'string' ||
-       input.idempotencyKey.length < 1 || input.idempotencyKey.length > 128)) {
-    fail('invalid_idempotency_key', 'idempotencyKey must have 1-128 characters');
-  }
+  const timeoutMs = validateTimeout(input);
+  validateIdempotencyKey(input);
   return {
     harness: input.harness, cwd: directory, task: input.task,
     skills: input.skills || [], timeoutMs,
     idempotencyKey: input.idempotencyKey,
+  };
+}
+
+function validateOperationStart(input) {
+  if (!input || typeof input !== 'object') fail('invalid_input', 'Expected an operation request');
+  const directory = validateCwd(input);
+  const timeoutMs = validateTimeout(input);
+  validateIdempotencyKey(input);
+
+  const hasShell = typeof input.command === 'string';
+  const hasArgv = Array.isArray(input.argv);
+  if (hasShell === hasArgv) fail('invalid_command', 'Exactly one of command or argv is required');
+
+  let command;
+  if (hasShell) {
+    if (input.command.length < 1 || input.command.length > 100_000 || input.command.includes('\0')) {
+      fail('invalid_command', 'command must have 1-100000 characters and no NUL bytes');
+    }
+    command = { mode: 'shell', command: input.command };
+  } else {
+    if (input.argv.length < 1 || input.argv.length > 1024 ||
+        !input.argv.every((part) => typeof part === 'string' && !part.includes('\0'))) {
+      fail('invalid_command', 'argv must contain 1-1024 NUL-free strings');
+    }
+    const argvBytes = input.argv.reduce((total, part) => total + Buffer.byteLength(part), 0);
+    if (argvBytes > 256 * 1024) fail('invalid_command', 'argv exceeds 256 KiB');
+    command = { mode: 'argv', argv: input.argv };
+  }
+
+  const environment = input.env ?? {};
+  if (!environment || typeof environment !== 'object' || Array.isArray(environment)) {
+    fail('invalid_env', 'env must be an object of string values');
+  }
+  const entries = Object.entries(environment);
+  if (entries.length > 128 || !entries.every(([key, value]) =>
+      typeof value === 'string' && key.length > 0 && !key.includes('=') &&
+      !key.includes('\0') && !key.startsWith('AGENT_JOB_') && !value.includes('\0'))) {
+    fail('invalid_env', 'env must contain at most 128 NUL-free string entries with valid names; AGENT_JOB_* is reserved');
+  }
+  if (Buffer.byteLength(JSON.stringify(environment)) > 256 * 1024) {
+    fail('invalid_env', 'env exceeds 256 KiB');
+  }
+
+  if (input.category !== undefined &&
+      (typeof input.category !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$/.test(input.category))) {
+    fail('invalid_category', 'category must be a compact stable identifier');
+  }
+  if (input.label !== undefined &&
+      (typeof input.label !== 'string' || input.label.length < 1 ||
+       input.label.length > 200 || input.label.includes('\0'))) {
+    fail('invalid_label', 'label must have 1-200 characters and no NUL bytes');
+  }
+
+  return {
+    cwd: directory,
+    command,
+    env: environment,
+    timeoutMs,
+    idempotencyKey: input.idempotencyKey,
+    category: input.category,
+    label: input.label,
   };
 }
 
@@ -347,16 +422,34 @@ function queueDiagnostics(job) {
 }
 
 function managedSummary(job) {
-  return { ...summary(job), queue: queueDiagnostics(job) };
+  const base = job.job_kind === JOB_KIND_OPERATION ? operationSummary(job) : summary(job);
+  return { ...base, queue: queueDiagnostics(job) };
 }
 
 async function snapshot(job, offsets = {}, mode = 'poll') {
   const base = managedSummary(job);
   const files = base.outputFiles;
+  const isOperation = job.job_kind === JOB_KIND_OPERATION;
+
   if (mode === 'result') {
-    const [stdout, stderr, events, invalid] = await Promise.all([
+    const [stdout, stderr] = await Promise.all([
       readBytes(files.stdout, 0, 256 * 1024, true),
       readBytes(files.stderr, 0, 128 * 1024, true),
+    ]);
+    if (isOperation) {
+      return {
+        ...base,
+        stdout: stdout.text,
+        stderr: stderr.text,
+        outputTruncated: stdout.truncatedBeforeOffset || stderr.truncatedBeforeOffset,
+        output: {
+          stdout: { observedBytes: stdout.observedBytes },
+          stderr: { observedBytes: stderr.observedBytes },
+        },
+      };
+    }
+
+    const [events, invalid] = await Promise.all([
       readEvents(files.events, 0, 256 * 1024, true),
       readEvents(files.invalidLines, 0, 64 * 1024, true),
     ]);
@@ -371,9 +464,20 @@ async function snapshot(job, offsets = {}, mode = 'poll') {
         invalidLines: { retainedFromOffset: invalid.startOffset } },
     };
   }
-  const [stdout, stderr, events, invalid] = await Promise.all([
+
+  const [stdout, stderr] = await Promise.all([
     readBytes(files.stdout, offsets.stdoutOffset || 0),
     readBytes(files.stderr, offsets.stderrOffset || 0),
+  ]);
+  if (isOperation) {
+    return {
+      ...base,
+      stdout: { ...stdout, requestedOffset: offsets.stdoutOffset || 0 },
+      stderr: { ...stderr, requestedOffset: offsets.stderrOffset || 0 },
+    };
+  }
+
+  const [events, invalid] = await Promise.all([
     readEvents(files.events, offsets.eventOffset || 0),
     readEvents(files.invalidLines, offsets.invalidLineOffset || 0),
   ]);
@@ -411,9 +515,11 @@ async function body(req) {
   catch { fail('invalid_json', 'Invalid JSON'); }
 }
 
-function jobOr404(id) {
+function jobOr404(id, expectedKind = null) {
   const job = store.get(id);
-  if (!job) fail('not_found', 'Unknown job ID', 404);
+  if (!job || (expectedKind !== null && job.job_kind !== expectedKind)) {
+    fail('not_found', 'Unknown job ID', 404);
+  }
   return job;
 }
 
@@ -435,15 +541,80 @@ async function serve(req, res) {
       const limit = Number(url.searchParams.get('limit') || 64);
       if (!Number.isSafeInteger(limit) || limit < 1 || limit > 128) fail('invalid_limit', 'limit must be 1-128');
       return json(res, 200, { jobs: store.list({
-        cwd: url.searchParams.get('cwd') || undefined, limit,
+        cwd: url.searchParams.get('cwd') || undefined, limit, kind: JOB_KIND_AGENT,
       }).map(managedSummary) });
     }
+    if (req.method === 'POST' && url.pathname === '/operations') {
+      const input = validateOperationStart(await body(req));
+      const result = store.createOperation(input);
+      schedule();
+      return json(res, 200, { ...managedSummary(store.get(result.job.id)),
+        duplicate: result.duplicate });
+    }
+    if (req.method === 'GET' && url.pathname === '/operations') {
+      const limit = Number(url.searchParams.get('limit') || 64);
+      if (!Number.isSafeInteger(limit) || limit < 1 || limit > 128) fail('invalid_limit', 'limit must be 1-128');
+      return json(res, 200, { operations: store.list({
+        cwd: url.searchParams.get('cwd') || undefined, limit, kind: JOB_KIND_OPERATION,
+      }).map(managedSummary) });
+    }
+
+    const operationMatch = url.pathname.match(/^\/operations\/([0-9a-fA-F-]{36})(?:\/(poll|result|cancel))?$/);
+    if (operationMatch) {
+      const id = operationMatch[1];
+      const action = operationMatch[2];
+      if (req.method === 'GET' && action === 'result') {
+        return json(res, 200, await snapshot(jobOr404(id, JOB_KIND_OPERATION), {}, 'result'));
+      }
+      if (req.method === 'GET' && action === 'poll') {
+        const offsets = {};
+        for (const key of ['stdoutOffset','stderrOffset']) {
+          const value = Number(url.searchParams.get(key) || 0);
+          if (!Number.isSafeInteger(value) || value < 0) fail('invalid_offset', 'Invalid ' + key);
+          offsets[key] = value;
+        }
+        const waitMs = Number(url.searchParams.get('waitMs') || DEFAULT_POLL_WAIT_MS);
+        if (!Number.isSafeInteger(waitMs) || waitMs < 0 || waitMs > MAX_POLL_WAIT_MS) {
+          fail('invalid_wait', 'waitMs must be 0-15000');
+        }
+        const started = Date.now();
+        let job = jobOr404(id, JOB_KIND_OPERATION);
+        let current = await snapshot(job, offsets);
+        const hasOperationEvidence = () =>
+          current.stdout.nextOffset > (offsets.stdoutOffset || 0) ||
+          current.stderr.nextOffset > (offsets.stderrOffset || 0);
+        while (waitMs > 0 && (job.status === 'queued' || job.status === 'running') &&
+            !hasOperationEvidence() && Date.now() - started < waitMs && !res.destroyed) {
+          await new Promise((resolve) => setTimeout(resolve, Math.min(250, waitMs - (Date.now() - started))));
+          job = jobOr404(id, JOB_KIND_OPERATION);
+          current = await snapshot(job, offsets);
+        }
+        current.poll = { requestedWaitMs: waitMs, waitedMs: Date.now() - started,
+          wakeReason: TERMINAL.has(job.status) ? 'terminal' :
+            hasOperationEvidence() ? 'activity' : 'timeout' };
+        return json(res, 200, current);
+      }
+      if (req.method === 'GET' && !action) {
+        return json(res, 200, managedSummary(jobOr404(id, JOB_KIND_OPERATION)));
+      }
+      if (req.method === 'POST' && action === 'cancel') {
+        const job = jobOr404(id, JOB_KIND_OPERATION);
+        if (TERMINAL.has(job.status)) return json(res, 200, {
+          ...managedSummary(job), cancellationRequested: false });
+        store.requestCancel(id);
+        if (job.status === 'queued') store.finish(id, 'cancelled', { reason: 'cancel' });
+        else signalJob(store.get(id), 'cancel');
+        return json(res, 200, { ...managedSummary(store.get(id)), cancellationRequested: true });
+      }
+      fail('not_found', 'Unknown endpoint', 404);
+    }
+
     const match = url.pathname.match(/^\/jobs\/([0-9a-fA-F-]{36})(?:\/(poll|result|cancel))?$/);
     if (!match) fail('not_found', 'Unknown endpoint', 404);
     const id = match[1];
     const operation = match[2];
     if (req.method === 'GET' && operation === 'result') {
-      return json(res, 200, await snapshot(jobOr404(id), {}, 'result'));
+      return json(res, 200, await snapshot(jobOr404(id, JOB_KIND_AGENT), {}, 'result'));
     }
     if (req.method === 'GET' && operation === 'poll') {
       const offsets = {};
@@ -460,13 +631,13 @@ async function serve(req, res) {
         fail('invalid_wait', 'waitMs must be 0-15000');
       }
       const started = Date.now();
-      let job = jobOr404(id);
+      let job = jobOr404(id, JOB_KIND_AGENT);
       let current = await snapshot(job, offsets);
       while (waitMs > 0 && (job.status === 'queued' || job.status === 'running') &&
           !hasEvidence(current, offsets) &&
           Date.now() - started < waitMs && !res.destroyed) {
         await new Promise((resolve) => setTimeout(resolve, Math.min(250, waitMs - (Date.now() - started))));
-        job = jobOr404(id);
+        job = jobOr404(id, JOB_KIND_AGENT);
         current = await snapshot(job, offsets);
       }
       current.poll = { requestedWaitMs: waitMs, waitedMs: Date.now() - started,
@@ -474,9 +645,11 @@ async function serve(req, res) {
           hasEvidence(current, offsets) ? 'activity' : 'timeout' };
       return json(res, 200, current);
     }
-    if (req.method === 'GET' && !operation) return json(res, 200, managedSummary(jobOr404(id)));
+    if (req.method === 'GET' && !operation) {
+      return json(res, 200, managedSummary(jobOr404(id, JOB_KIND_AGENT)));
+    }
     if (req.method === 'POST' && operation === 'cancel') {
-      const job = jobOr404(id);
+      const job = jobOr404(id, JOB_KIND_AGENT);
       if (TERMINAL.has(job.status)) return json(res, 200, {
         ...managedSummary(job), cancellationRequested: false });
       store.requestCancel(id);

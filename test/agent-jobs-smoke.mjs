@@ -77,6 +77,8 @@ const env = {
   AGENT_JOB_AGY_BIN: fakeAgy,
   AGENT_JOB_AGY_ARGS_LOG: agyArgsLog,
 };
+delete env.AGENT_CODEX_ENFORCED_MODEL;
+delete env.AGENT_CODEX_ENFORCED_EFFORT;
 process.env.AGENT_JOB_STATE_DIR = state;
 const { jobHealth, jobStart, jobList, jobPoll, jobResult, jobCancel } =
   await import('../src/agent-jobs/client.js');

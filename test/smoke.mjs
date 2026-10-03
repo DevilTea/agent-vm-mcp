@@ -39,6 +39,7 @@ const gitShimDir = `/tmp/agent-mcp-git-shim-${process.pid}`;
 const gitValidationTriggerPath = `/tmp/agent-mcp-git-validation-trigger-${process.pid}`;
 const gitValidationPidPath = `/tmp/agent-mcp-git-validation-pid-${process.pid}`;
 const workspaceRoot = `/tmp/agent-mcp-workspaces-${process.pid}`;
+const checkpointStateRoot = `/tmp/agent-mcp-checkpoints-${process.pid}`;
 const repositoryRoot = `/tmp/agent-mcp-repositories-${process.pid}`;
 const workspaceSeedRoot = `/tmp/agent-mcp-workspace-seed-${process.pid}`;
 const workspaceOrigin = `/tmp/agent-mcp-workspace-origin-${process.pid}.git`;
@@ -83,6 +84,7 @@ const transport = new StdioClientTransport({
     AGENT_ARTIFACT_MAX_BYTES: String(smokeArtifactMaxBytes),
     AGENT_WORKSPACE_ROOT: workspaceRoot,
     AGENT_REPOSITORY_ROOT: repositoryRoot,
+    AGENT_WORK_CHECKPOINT_STATE_DIR: checkpointStateRoot,
     AGENT_MCP_HOST: hostKind,
   },
   stderr: 'inherit',
@@ -158,6 +160,7 @@ try {
   await fs.rm(gitValidationPidPath, { force: true });
   await fs.rm(workspaceRoot, { recursive: true, force: true });
   await fs.rm(repositoryRoot, { recursive: true, force: true });
+  await fs.rm(checkpointStateRoot, { recursive: true, force: true });
   await fs.rm(workspaceSeedRoot, { recursive: true, force: true });
   await fs.rm(workspaceOrigin, { recursive: true, force: true });
   await fs.rm(workspaceCancelOrigin, { recursive: true, force: true });
@@ -336,6 +339,15 @@ exec /usr/bin/git "$@"
     'agent_cancel',
     'agent_list',
     'agent_run',
+    'operation_start',
+    'operation_poll',
+    'operation_result',
+    'operation_cancel',
+    'operation_list',
+    'work_checkpoint_get',
+    'work_checkpoint_put',
+    'work_checkpoint_list',
+    'work_checkpoint_delete',
     'work_status',
     'import_file',
     'process_start',
@@ -402,13 +414,39 @@ exec /usr/bin/git "$@"
     throw new Error('agent_run description must prefer agent_start');
   }
 
+  const operationStartTool = toolByName.get('operation_start');
+  if (!operationStartTool) throw new Error('operation_start schema missing');
+  const operationStartProperties = operationStartTool.inputSchema?.properties ?? {};
+  for (const property of ['command', 'argv', 'cwd', 'env', 'timeoutMs', 'idempotencyKey', 'category', 'label']) {
+    if (!(property in operationStartProperties)) {
+      throw new Error(`operation_start schema missing property: ${property}`);
+    }
+  }
+  if (!operationStartTool.description?.includes('idempotencyKey')) {
+    throw new Error('operation_start must document safe retry with idempotencyKey');
+  }
+
+  const operationPollTool = toolByName.get('operation_poll');
+  if (operationPollTool?.inputSchema?.properties?.waitMs?.maximum !== 15_000) {
+    throw new Error('operation_poll waitMs maximum must be 15000');
+  }
+  if (!toolByName.get('work_checkpoint_put')?.description?.includes('expectedRevision')) {
+    throw new Error('work_checkpoint_put must document optimistic revision guarding');
+  }
+
   const execTool = toolByName.get('exec');
   if (!execTool?.description?.includes('agent_start')) {
     throw new Error('exec description does not redirect coding-harness work to agent_start');
   }
+  if (!execTool?.description?.includes('operation_start')) {
+    throw new Error('exec description must redirect recoverable finite work to operation_start');
+  }
   const processStartTool = toolByName.get('process_start');
   if (!processStartTool?.description?.includes('agent_start')) {
     throw new Error('process_start description does not prefer agent_start');
+  }
+  if (!processStartTool?.description?.includes('operation_start')) {
+    throw new Error('process_start must distinguish durable finite operations from process sessions');
   }
 
   const workStatus = await client.callTool({
@@ -424,8 +462,87 @@ exec /usr/bin/git "$@"
   if (!workStatusValue.filesystem?.latestMtimeAt) {
     throw new Error('work_status did not report filesystem activity');
   }
-  if (!Array.isArray(workStatusValue.agentRuns) || !Array.isArray(workStatusValue.managedProcesses)) {
-    throw new Error('work_status did not report managed runtime collections');
+  if (!Array.isArray(workStatusValue.agentRuns) ||
+      !Array.isArray(workStatusValue.durableOperations) ||
+      !Array.isArray(workStatusValue.managedProcesses) ||
+      !Array.isArray(workStatusValue.checkpoints)) {
+    throw new Error('work_status did not report managed recovery collections');
+  }
+
+  const checkpointCreatedResult = await client.callTool({
+    name: 'work_checkpoint_put',
+    arguments: {
+      cwd: workspaceSeedRoot,
+      key: 'smoke',
+      value: { currentStep: 'verify', next: 'finish' },
+      expectedRevision: null,
+    },
+  });
+  if (checkpointCreatedResult.isError) throw new Error('work_checkpoint_put create failed');
+  const checkpointCreated = JSON.parse(
+    checkpointCreatedResult.content?.find((item) => item.type === 'text')?.text ?? '{}',
+  ).checkpoint;
+  if (!/^sha256:[0-9a-f]{64}$/.test(checkpointCreated?.revision ?? '')) {
+    throw new Error('work_checkpoint_put did not return a content revision');
+  }
+
+  const checkpointReadResult = await client.callTool({
+    name: 'work_checkpoint_get',
+    arguments: { cwd: workspaceSeedRoot, key: 'smoke' },
+  });
+  if (checkpointReadResult.isError) throw new Error('work_checkpoint_get failed');
+  const checkpointRead = JSON.parse(
+    checkpointReadResult.content?.find((item) => item.type === 'text')?.text ?? '{}',
+  ).checkpoint;
+  if (checkpointRead?.value?.next !== 'finish') {
+    throw new Error('work_checkpoint_get did not round-trip checkpoint value');
+  }
+
+  const staleCheckpoint = await client.callTool({
+    name: 'work_checkpoint_put',
+    arguments: {
+      cwd: workspaceSeedRoot,
+      key: 'smoke',
+      value: { currentStep: 'stale' },
+      expectedRevision: null,
+    },
+  });
+  if (!staleCheckpoint.isError) {
+    throw new Error('work_checkpoint_put must reject stale create-only writes');
+  }
+  const staleCheckpointError = JSON.parse(
+    staleCheckpoint.content?.find((item) => item.type === 'text')?.text ?? '{}',
+  ).error;
+  if (staleCheckpointError?.code !== 'CHECKPOINT_CONFLICT' ||
+      staleCheckpointError?.details?.actualRevision !== checkpointCreated.revision) {
+    throw new Error('work_checkpoint_put conflict must expose current revision');
+  }
+
+  const checkpointStatusResult = await client.callTool({
+    name: 'work_status',
+    arguments: { cwd: workspaceSeedRoot },
+  });
+  if (checkpointStatusResult.isError) throw new Error('work_status failed after checkpoint creation');
+  const checkpointStatusValue = JSON.parse(
+    checkpointStatusResult.content?.find((item) => item.type === 'text')?.text ?? '{}',
+  );
+  if (!checkpointStatusValue.checkpoints.some((item) => item.key === 'smoke')) {
+    throw new Error('work_status did not surface durable workflow checkpoints');
+  }
+
+  await fs.writeFile(path.join(checkpointStateRoot, 'checkpoints.sqlite'), 'not-a-sqlite-database');
+  const degradedStatusResult = await client.callTool({
+    name: 'work_status',
+    arguments: { cwd: workspaceSeedRoot },
+  });
+  if (degradedStatusResult.isError) {
+    throw new Error('work_status must fail soft when checkpoint storage is unreadable');
+  }
+  const degradedStatusValue = JSON.parse(
+    degradedStatusResult.content?.find((item) => item.type === 'text')?.text ?? '{}',
+  );
+  if (!degradedStatusValue.git?.available || degradedStatusValue.checkpointStore?.available !== false) {
+    throw new Error('work_status did not preserve Git evidence while surfacing checkpoint-store failure');
   }
 
   const expectedLspTools = [
@@ -2844,6 +2961,7 @@ new mode 100755
   await fs.rm(gitValidationPidPath, { force: true });
   await fs.rm(workspaceRoot, { recursive: true, force: true });
   await fs.rm(repositoryRoot, { recursive: true, force: true });
+  await fs.rm(checkpointStateRoot, { recursive: true, force: true });
   await fs.rm(workspaceSeedRoot, { recursive: true, force: true });
   await fs.rm(workspaceOrigin, { recursive: true, force: true });
   await fs.rm(workspaceCancelOrigin, { recursive: true, force: true });

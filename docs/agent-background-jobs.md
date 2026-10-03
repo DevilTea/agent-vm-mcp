@@ -2,6 +2,8 @@
 
 V1 moves long Codex and agy work into `agent-jobd`, a separate systemd-managed VM service. The chat-facing MCP process is only a control plane. Neither a long-lived tool request nor ChatGPT continuing to generate is required for a job to finish.
 
+The same durable scheduler and SQLite store also back generic finite `operation_*` commands. This guide remains focused on coding-agent policy; see [`durable-recovery.md`](durable-recovery.md) for generic lost-response recovery, operation semantics, and workflow checkpoints.
+
 ## Architecture and acceptance
 
 - The manager listens on a private mode-0600 Unix socket at `~/.local/state/agent-vm-mcp/jobs/jobd.sock`; its parent is mode 0700.

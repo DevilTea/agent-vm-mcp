@@ -9,6 +9,8 @@ export const MAX_JOB_TIMEOUT_MS = 8 * 60 * 60 * 1000;
 export const MAX_POLL_WAIT_MS = 15_000;
 export const DEFAULT_POLL_WAIT_MS = 10_000;
 export const TERMINAL = new Set(['completed', 'failed', 'ambiguous', 'cancelled', 'timed_out', 'interrupted']);
+export const JOB_KIND_AGENT = 'agent';
+export const JOB_KIND_OPERATION = 'operation';
 
 export function stateRoot(env = process.env) {
   return path.resolve(env.AGENT_JOB_STATE_DIR || path.join(
@@ -41,6 +43,7 @@ export function sameProcess(job) {
 export function summary(job) {
   return {
     runId: job.id,
+    kind: job.job_kind || JOB_KIND_AGENT,
     harness: job.harness,
     cwd: job.cwd,
     status: job.status,
@@ -70,6 +73,56 @@ export function summary(job) {
   };
 }
 
+function operationOutcome(job) {
+  if (job.status === 'queued') {
+    return { command: 'pending', certainty: 'known', sideEffectsMayHaveOccurred: false };
+  }
+  if (job.status === 'running') {
+    return { command: 'pending', certainty: 'known', sideEffectsMayHaveOccurred: true };
+  }
+  if (job.status === 'completed') {
+    return { command: 'succeeded', certainty: 'known', sideEffectsMayHaveOccurred: true };
+  }
+  if (job.status === 'interrupted') {
+    return { command: 'unknown', certainty: 'unknown', sideEffectsMayHaveOccurred: true };
+  }
+  return { command: 'not_succeeded', certainty: 'known', sideEffectsMayHaveOccurred: true };
+}
+
+export function operationSummary(job) {
+  const command = job.command_json ? JSON.parse(job.command_json) : null;
+  return {
+    operationId: job.id,
+    kind: JOB_KIND_OPERATION,
+    category: job.category || null,
+    label: job.label || null,
+    cwd: job.cwd,
+    status: job.status,
+    accepted: true,
+    processAlive: job.status === 'running' && sameProcess(job),
+    pid: job.pid,
+    childPid: job.child_pid,
+    exitCode: job.exit_code,
+    signal: job.signal,
+    startedAt: job.started_at,
+    createdAt: job.created_at,
+    finishedAt: job.finished_at,
+    lastActivityAt: job.last_output_at || job.started_at || job.created_at,
+    lastOutputAt: job.last_output_at,
+    timeoutMs: job.timeout_ms,
+    terminationReason: job.termination_reason,
+    cancellationRequested: Boolean(job.cancel_requested),
+    cleanupPending: Boolean(job.cleanup_pending),
+    command,
+    outcome: operationOutcome(job),
+    idempotencyKeyPresent: job.idempotency_key !== null,
+    outputFiles: {
+      stdout: path.join(job.output_dir, 'stdout.log'),
+      stderr: path.join(job.output_dir, 'stderr.log'),
+    },
+  };
+}
+
 export function openStore(root = stateRoot()) {
   fs.mkdirSync(root, { recursive: true, mode: 0o700 });
   fs.chmodSync(root, 0o700);
@@ -88,6 +141,17 @@ export function openStore(root = stateRoot()) {
     'cancel_requested INTEGER NOT NULL DEFAULT 0, cleanup_pending INTEGER NOT NULL DEFAULT 0, output_dir TEXT NOT NULL' +
     '); CREATE INDEX IF NOT EXISTS jobs_by_status ON jobs(status,created_at);'
   );
+  const columns = new Set(db.prepare('PRAGMA table_info(jobs)').all().map((column) => column.name));
+  for (const [name, definition] of [
+    ['job_kind', "TEXT NOT NULL DEFAULT 'agent'"],
+    ['command_json', 'TEXT'],
+    ['env_json', 'TEXT'],
+    ['category', 'TEXT'],
+    ['label', 'TEXT'],
+  ]) {
+    if (!columns.has(name)) db.exec('ALTER TABLE jobs ADD COLUMN ' + name + ' ' + definition);
+  }
+  db.exec('CREATE INDEX IF NOT EXISTS jobs_by_kind_status ON jobs(job_kind,status,created_at);');
   fs.chmodSync(filename, 0o600);
   return {
     root,
@@ -95,10 +159,16 @@ export function openStore(root = stateRoot()) {
     get(id) {
       return db.prepare('SELECT * FROM jobs WHERE id=?').get(id) || null;
     },
-    list({ cwd, limit = 64 } = {}) {
+    list({ cwd, limit = 64, kind } = {}) {
+      if (cwd && kind) return db.prepare(
+        'SELECT * FROM jobs WHERE cwd=? AND job_kind=? ORDER BY created_at DESC LIMIT ?'
+      ).all(path.resolve(cwd), kind, limit);
       if (cwd) return db.prepare(
         'SELECT * FROM jobs WHERE cwd=? ORDER BY created_at DESC LIMIT ?'
       ).all(path.resolve(cwd), limit);
+      if (kind) return db.prepare(
+        'SELECT * FROM jobs WHERE job_kind=? ORDER BY created_at DESC LIMIT ?'
+      ).all(kind, limit);
       return db.prepare('SELECT * FROM jobs ORDER BY created_at DESC LIMIT ?').all(limit);
     },
     queued() {
@@ -129,7 +199,7 @@ export function openStore(root = stateRoot()) {
       if (key !== null) {
         const existing = db.prepare('SELECT * FROM jobs WHERE idempotency_key=?').get(key);
         if (existing) {
-          if (existing.request_hash !== digest) {
+          if (existing.job_kind !== JOB_KIND_AGENT || existing.request_hash !== digest) {
             const error = new Error('idempotencyKey already belongs to a different request');
             error.code = 'idempotency_conflict';
             throw error;
@@ -147,11 +217,54 @@ export function openStore(root = stateRoot()) {
       const createdAt = new Date().toISOString();
       try {
         db.prepare(
-          'INSERT INTO jobs (id,idempotency_key,request_hash,harness,cwd,task,skills,policy_json,timeout_ms,status,created_at,output_dir) ' +
-          'VALUES (?,?,?,?,?,?,?,?,?,?,?,?)'
-        ).run(id,key,digest,canonical.harness,canonical.cwd,canonical.task,
+          'INSERT INTO jobs (id,idempotency_key,request_hash,job_kind,harness,cwd,task,skills,policy_json,timeout_ms,status,created_at,output_dir) ' +
+          'VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)'
+        ).run(id,key,digest,JOB_KIND_AGENT,canonical.harness,canonical.cwd,canonical.task,
           JSON.stringify(canonical.skills),policy === null ? null : JSON.stringify(policy),
           canonical.timeoutMs,'queued',createdAt,directory);
+      } catch (error) {
+        fs.rmSync(directory, { recursive: true, force: true });
+        throw error;
+      }
+      return { job: this.get(id), duplicate: false };
+    },
+    createOperation(input) {
+      const canonicalEnv = Object.fromEntries(
+        Object.entries(input.env || {}).sort(([left], [right]) => left.localeCompare(right)),
+      );
+      const canonical = {
+        kind: JOB_KIND_OPERATION,
+        cwd: path.resolve(input.cwd),
+        command: input.command,
+        env: canonicalEnv,
+        timeoutMs: input.timeoutMs ?? DEFAULT_JOB_TIMEOUT_MS,
+        category: input.category || null,
+        label: input.label || null,
+      };
+      const digest = createHash('sha256').update(JSON.stringify(canonical)).digest('hex');
+      const key = input.idempotencyKey || null;
+      if (key !== null) {
+        const existing = db.prepare('SELECT * FROM jobs WHERE idempotency_key=?').get(key);
+        if (existing) {
+          if (existing.job_kind !== JOB_KIND_OPERATION || existing.request_hash !== digest) {
+            const error = new Error('idempotencyKey already belongs to a different request');
+            error.code = 'idempotency_conflict';
+            throw error;
+          }
+          return { job: existing, duplicate: true };
+        }
+      }
+      const id = randomUUID();
+      const directory = path.join(root, id);
+      fs.mkdirSync(directory, { mode: 0o700 });
+      const createdAt = new Date().toISOString();
+      try {
+        db.prepare(
+          'INSERT INTO jobs (id,idempotency_key,request_hash,job_kind,harness,cwd,task,skills,policy_json,timeout_ms,status,created_at,output_dir,command_json,env_json,category,label) ' +
+          'VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)'
+        ).run(id,key,digest,JOB_KIND_OPERATION,'command',canonical.cwd,'','[]',null,
+          canonical.timeoutMs,'queued',createdAt,directory,JSON.stringify(canonical.command),
+          JSON.stringify(canonical.env),canonical.category,canonical.label);
       } catch (error) {
         fs.rmSync(directory, { recursive: true, force: true });
         throw error;

@@ -147,7 +147,13 @@ async function filesystemSummary(cwd) {
   };
 }
 
-export async function collectWorkStatus({ cwd, agentRuns, managedProcesses }) {
+export async function collectWorkStatus({
+  cwd,
+  agentRuns,
+  durableOperations = [],
+  managedProcesses,
+  checkpoints = [],
+}) {
   const resolvedCwd = cwd ? path.resolve(cwd) : null;
   const [git, filesystem] = resolvedCwd
     ? await Promise.all([gitSummary(resolvedCwd), filesystemSummary(resolvedCwd)])
@@ -157,7 +163,9 @@ export async function collectWorkStatus({ cwd, agentRuns, managedProcesses }) {
     observedAt: new Date().toISOString(),
     cwd: resolvedCwd,
     agentRuns,
+    durableOperations,
     managedProcesses,
+    checkpoints,
     git,
     filesystem,
   };

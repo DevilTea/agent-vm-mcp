@@ -1,7 +1,8 @@
 import { spawn } from 'node:child_process';
 import fs from 'node:fs/promises';
 import { StringDecoder } from 'node:string_decoder';
-import { openStore, processStartTicks } from './store.js';
+import { JOB_KIND_OPERATION, openStore, processStartTicks } from './store.js';
+import { resolveBashExecutable } from '../shell.js';
 
 function continuationId(value) {
   if (!value || typeof value !== 'object') return null;
@@ -14,7 +15,27 @@ function continuationId(value) {
   return null;
 }
 
-function invocation(job) {
+async function invocation(job) {
+  if (job.job_kind === JOB_KIND_OPERATION) {
+    const command = JSON.parse(job.command_json);
+    const environment = job.env_json ? JSON.parse(job.env_json) : {};
+    if (command.mode === 'argv') {
+      return {
+        command: command.argv[0],
+        args: command.argv.slice(1),
+        env: environment,
+      };
+    }
+    if (command.mode === 'shell') {
+      return {
+        command: await resolveBashExecutable(),
+        args: ['-lc', command.command],
+        env: environment,
+      };
+    }
+    throw new Error('Unsupported durable operation command mode: ' + command.mode);
+  }
+
   const task = JSON.parse(job.skills).length
     ? 'Use the following installed skills for this task: ' +
       JSON.parse(job.skills).join(', ') +
@@ -147,13 +168,13 @@ async function main() {
   let spawnError = null;
 
   try {
-    const command = invocation(job);
+    const command = await invocation(job);
     if (reason !== null || store.get(id)?.cancel_requested) {
       throw new Error('Worker was cancelled before harness startup');
     }
     child = spawn(command.command, command.args, {
       cwd: job.cwd,
-      env: process.env,
+      env: { ...process.env, ...(command.env || {}), AGENT_JOB_RUN_ID: id },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     child.once('spawn', () => {
@@ -165,10 +186,14 @@ async function main() {
       for await (const chunk of child.stdout) {
         stdoutBytes += chunk.length;
         await stdout.write(chunk);
-        await parseLines(decoder.write(chunk));
+        if (job.job_kind !== JOB_KIND_OPERATION) {
+          await parseLines(decoder.write(chunk));
+        }
         reportOutput();
       }
-      await parseLines(decoder.end(), true);
+      if (job.job_kind !== JOB_KIND_OPERATION) {
+        await parseLines(decoder.end(), true);
+      }
     })();
     const stderrTask = (async () => {
       for await (const chunk of child.stderr) {
@@ -196,15 +221,17 @@ async function main() {
     await Promise.all([stdout.close(), stderr.close(), events.close(), invalid.close()]);
     reportOutput();
     const requestedCancel = Boolean(store.get(id)?.cancel_requested);
-    const agyClassification = job.harness === 'agy' && !spawnError && exitCode === 0
+    const isOperation = job.job_kind === JOB_KIND_OPERATION;
+    const agyClassification = !isOperation && job.harness === 'agy' && !spawnError && exitCode === 0
       ? classifyAgyResult(agyTerminalEvent) : null;
     const status = requestedCancel || reason === 'cancel' ? 'cancelled' :
       reason === 'timeout' ? 'timed_out' :
       reason === 'interrupted' ? 'interrupted' :
       spawnError || exitCode !== 0 ? 'failed' :
+      isOperation ? 'completed' :
       job.harness === 'agy' ? agyClassification.status :
       stdoutBytes === 0 ? 'ambiguous' : 'completed';
-    const agyReason = job.harness !== 'agy' ? null :
+    const agyReason = isOperation || job.harness !== 'agy' ? null :
       spawnError ? 'agy_spawn_error' :
       exitCode === null ? 'agy_exit_signal' :
       exitCode !== 0 ? 'agy_nonzero_exit' :

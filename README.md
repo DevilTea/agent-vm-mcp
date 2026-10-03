@@ -174,9 +174,17 @@ Override them with `AGENT_REPOSITORY_ROOT` and `AGENT_WORKSPACE_ROOT`.
 
 Workspace lifecycle does not install dependencies, trust repository toolchains, commit/stash changes, start processes, or manage containers. It creates a task branch only when `createBranch` is explicitly supplied. Repository authentication stays with normal Git credential mechanisms. HTTP(S) clone URLs with embedded userinfo, query parameters, or fragments are rejected to reduce accidental credential persistence.
 
-## Processes and coding agents
+## Processes, durable operations, and coding agents
 
-`process_*` tools manage generic processes owned by the running MCP server. `process_read` returns an opaque cursor; pass it back on the next read instead of manually carrying stdout/stderr offsets. Explicit offsets remain available for compatibility and cannot be mixed with a cursor. On graceful shutdown, managed process groups receive `SIGTERM` and are escalated to `SIGKILL` after a bounded grace period. These process sessions are not persisted across server restarts.
+There are three execution lifetimes; choose them by recovery semantics rather than command type:
+
+- `exec` is request-scoped finite execution. It is appropriate for short work where cancellation/loss of the MCP request may terminate the command.
+- `operation_*` is durable finite execution. Use `operation_start` for long-running commands, commands with side effects, or any finite operation that must be rediscovered after a lost response. The separate `agent-jobd` service persists identity, state, stdout/stderr, exit status, PID/start-time identity, and cancellation/timeout state. `operation_poll`, `operation_result`, and `operation_list` remain usable across ChatGPT turns, MCP restarts, and job-manager restarts.
+- `process_*` is for interactive/service-like sessions owned by the current MCP server. `process_read` returns an opaque cursor; pass it back on the next read instead of manually carrying stdout/stderr offsets. On graceful shutdown, managed process groups receive `SIGTERM` and are escalated to `SIGKILL` after a bounded grace period. These process sessions are not persisted across server restarts.
+
+For durable operations, supply a stable `idempotencyKey` whenever the start response could be lost. Retrying the identical logical request with the same key returns the same `operationId`; a different request under the same key is rejected. A tool/transport timeout is therefore an **observation failure**, not proof that the operation failed or never started.
+
+Operation status also must not be over-interpreted. `completed` means the command exited zero and the worker persisted that terminal record. `interrupted` means the worker identity was lost without confirmed command completion, so the command outcome is explicitly unknown. `failed`, `cancelled`, and `timed_out` mean the command did not reach confirmed zero-exit completion, but partial/external side effects may still have happened. The returned `outcome` object makes this distinction machine-readable. Never create a fresh operation merely because observation was lost; rediscover with the same idempotency key/operation ID, then reconcile command-specific external state before intentionally reissuing work.
 
 Normal coding-agent work uses **durable background jobs**. `agent_start` writes a job to a separate VM-owned `agent-jobd` service and returns an immutable `runId` once SQLite has accepted it. Jobs queue when the configured worker limit is reached; queued results expose position/capacity diagnostics instead of requiring callers to infer why they have not started. No ChatGPT/MCP connection must remain open. `agent_poll` reads incrementally with at most a 15-second wait and returns one opaque cursor covering stdout, stderr, structured events, and invalid lines; explicit per-stream offsets remain available for compatibility. `agent_result` returns a bounded output preview **plus absolute paths to complete stdout/stderr and structured JSONL logs**. `agent_list` rediscovers jobs across ChatGPT turns, MCP restarts, and background-manager restarts. `agent_cancel` can cancel queued or running jobs.
 
@@ -188,7 +196,7 @@ Normal coding-agent work uses **durable background jobs**. `agent_start` writes 
 
 `agent_run` remains the unchanged **short, synchronous compatibility helper** (15-second default, 30-second maximum) and still uses the preexisting in-MCP bounded runner. It is not a background job and is cancelled if the MCP process terminates. The Codex model for existing MCP-managed invocations is fixed to `gpt-5.6-luna` / `max`, independently of dot-agents user defaults; the background service inherits the same configured deployment policy. Antigravity uses non-interactive print mode and structured output.
 
-`work_status` now includes persistent background jobs plus legacy short-run metadata and managed generic processes. The repository/filesystem evidence is read separately. A successful process exit is not evidence that a review is semantically correct; inspect the saved findings and Git state before claiming completion.
+`work_status` combines persistent agent jobs, durable finite operations, legacy short-run metadata, managed process sessions, workflow checkpoints, and optional Git/filesystem evidence. Checkpoint intent is deliberately separate from execution evidence: a checkpoint can say what should happen next, but never proves that an external effect occurred. `work_checkpoint_get/put/list/delete` provide small cwd-scoped durable orchestration records with optimistic `expectedRevision` guards so an interrupted conversation can resume without overwriting newer state.
 
 Raw coding-harness TUI execution is not a supported fallback. On the ChatGPT host, `exec` and `process_start` reject interactive terminal session launchers (`tmux`, `screen`, and `script`) as well as raw coding-harness execution. Codex and Antigravity work must flow through the managed `agent_*` tools.
 
@@ -224,6 +232,8 @@ The scripts currently provision or configure:
 `/opt/agent-vm-mcp` is the canonical deployment path for the optional systemd/browser takeover deployment. `scripts/provision-browser-takeover.sh` intentionally fails unless it is run from that checkout, because the installed shared-browser proxy launcher executes control-plane source from that stable path.
 
 Tunnel software is **not** part of the core lifecycle. Optional systemd examples may coordinate tunnel and browser services, but the MCP server and provisioners do not require an `agent-tunnel.service`.
+
+For the generic timeout/interruption recovery model, durable finite operations, retry rules, and workflow checkpoints, see [`docs/durable-recovery.md`](docs/durable-recovery.md).
 
 For durable coding-agent background work and the independent systemd service, see [`docs/agent-background-jobs.md`](docs/agent-background-jobs.md).
 

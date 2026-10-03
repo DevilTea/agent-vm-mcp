@@ -21,6 +21,7 @@ import {
 } from './agent-runner.js';
 import {
   jobCancel, jobHealth, jobList, jobPoll, jobResult, jobStart,
+  operationCancel, operationList, operationPoll, operationResult, operationStart,
 } from './agent-jobs/client.js';
 import {
   DEFAULT_JOB_TIMEOUT_MS, MAX_JOB_TIMEOUT_MS,
@@ -57,6 +58,7 @@ import { applyUnifiedPatch, editTextFiles, listDirectory, readTextFile, waitForF
 import { resolveBashExecutable } from './shell.js';
 import { workspaceCreate, workspaceDelete, workspaceList, waitForWorkspaceMutations } from './workspaces.js';
 import { collectWorkStatus } from './work-status.js';
+import { checkpointDelete, checkpointGet, checkpointList, checkpointPut } from './work-checkpoints.js';
 import { decodeOpaqueCursor, encodeOpaqueCursor, nonNegativeCursorOffset } from './opaque-cursor.js';
 import { toolError, withStructuredErrors } from './tool-errors.js';
 
@@ -470,6 +472,15 @@ const BASE_NATIVE_TOOL_NAMES = new Set([
   'agent_cancel',
   'agent_list',
   'agent_run',
+  'operation_start',
+  'operation_poll',
+  'operation_result',
+  'operation_cancel',
+  'operation_list',
+  'work_checkpoint_get',
+  'work_checkpoint_put',
+  'work_checkpoint_list',
+  'work_checkpoint_delete',
   'work_status',
   'process_start',
   'process_list',
@@ -544,7 +555,7 @@ async function createServer() {
       description:
         'Execute either an arbitrary shell command or an argv vector on the dedicated disposable Linux agent VM. Exactly one of command or argv is required. ' +
         'Oversized stdout/stderr use bounded head/tail previews plus opaque model-only artifacts readable with read_artifact. ' +
-        'Use this for commands that complete on their own. For servers, watchers, REPLs, or other long-running/interactive commands, use process_start instead. ' +
+        'Use this for short finite commands where request-scoped cancellation is acceptable. For finite work that is long-running, has side effects, or must be safely rediscovered after a lost response, use operation_start instead. For servers, watchers, REPLs, or other interactive sessions, use process_start instead. ' +
         'Do not launch coding harness work directly through exec; use agent_start for normal bounded agent work and agent_run only for short blocking tasks. Harmless --help/--version probes remain allowed. On the ChatGPT host, interactive terminal session launchers such as tmux/screen/script are also forbidden.',
       inputSchema: z.object({
         command: z.string().min(1).optional().describe('Shell command to execute with bash -lc. Mutually exclusive with argv.'),
@@ -867,6 +878,201 @@ async function createServer() {
     ),
   );
 
+  const absoluteCwdInput = z.string().min(1).refine(path.isAbsolute, {
+    message: 'cwd must be an absolute path',
+  });
+
+  const durableOperationInput = z
+    .object({
+      command: z.string().min(1).max(100_000).optional(),
+      argv: z.array(z.string()).min(1).max(1024).optional(),
+      cwd: absoluteCwdInput.describe('Absolute existing working directory.'),
+      env: z.record(z.string(), z.string()).optional(),
+      timeoutMs: z.number().int().min(1_000).max(MAX_JOB_TIMEOUT_MS).default(DEFAULT_JOB_TIMEOUT_MS),
+      idempotencyKey: z.string().min(1).max(128).optional(),
+      category: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$/).optional(),
+      label: z.string().min(1).max(200).optional(),
+    })
+    .refine((value) => (value.command === undefined) !== (value.argv === undefined), {
+      message: 'Exactly one of command or argv is required.',
+    });
+
+  server.registerTool(
+    'operation_start',
+    {
+      description:
+        'Start one durable finite command operation that survives MCP/client disconnects and can be rediscovered after a lost response. ' +
+        'Use this instead of exec when the command is long-running, has side effects, or unsafe to duplicate. Always provide a stable idempotencyKey when retry after an ambiguous response is possible.',
+      inputSchema: durableOperationInput,
+    },
+    withStructuredErrors(async (args, ctx) => {
+      const guardOptions = {
+        forbidInteractiveTerminalCommands: !hostProfile.allowInteractiveTerminalCommands,
+      };
+      if (args.argv !== undefined) assertNoRawCodingHarnessArgv(args.argv, 'operation_start', guardOptions);
+      else assertNoRawCodingHarnessLaunch(args.command, 'operation_start', guardOptions);
+      return jsonResult(await operationStart(args, ctx.mcpReq.signal));
+    }, 'OPERATION_START_FAILED'),
+  );
+
+  server.registerTool(
+    'operation_poll',
+    {
+      description:
+        'Poll a durable command operation for incremental stdout/stderr and terminal state. Prefer the returned opaque cursor on subsequent polls. Each poll waits at most 15 seconds.',
+      inputSchema: z.object({
+        operationId: z.string().uuid(),
+        stdoutOffset: z.number().int().min(0).optional(),
+        cursor: z.string().min(1).max(1024).optional(),
+        stderrOffset: z.number().int().min(0).optional(),
+        waitMs: z.number().int().min(0).max(MAX_AGENT_POLL_WAIT_MS).default(DEFAULT_AGENT_POLL_WAIT_MS),
+      }),
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+    },
+    withStructuredErrors(
+      async (args, ctx) => jsonResult(await operationPoll(args, ctx.mcpReq.signal)),
+      'OPERATION_POLL_FAILED',
+    ),
+  );
+
+  server.registerTool(
+    'operation_result',
+    {
+      description:
+        'Read the persisted terminal/current result and bounded stdout/stderr tail for a durable command operation. Full log paths remain available in outputFiles.',
+      inputSchema: z.object({ operationId: z.string().uuid() }),
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+    },
+    withStructuredErrors(
+      async (args, ctx) => jsonResult(await operationResult(args, ctx.mcpReq.signal)),
+      'OPERATION_RESULT_FAILED',
+    ),
+  );
+
+  server.registerTool(
+    'operation_cancel',
+    {
+      description:
+        'Cancel a durable command operation by operationId. Running work receives SIGTERM then bounded cleanup escalation.',
+      inputSchema: z.object({ operationId: z.string().uuid() }),
+    },
+    withStructuredErrors(
+      async (args, ctx) => jsonResult(await operationCancel(args, ctx.mcpReq.signal)),
+      'OPERATION_CANCEL_FAILED',
+    ),
+  );
+
+  server.registerTool(
+    'operation_list',
+    {
+      description:
+        'Rediscover durable command operations after an interrupted conversation, lost tool response, or MCP restart. Optionally filter by exact cwd.',
+      inputSchema: z.object({
+        cwd: absoluteCwdInput.optional(),
+        limit: z.number().int().min(1).max(128).default(64),
+      }),
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+    },
+    withStructuredErrors(
+      async (args, ctx) => jsonResult(await operationList(args, ctx.mcpReq.signal)),
+      'OPERATION_LIST_FAILED',
+    ),
+  );
+
+  server.registerTool(
+    'work_checkpoint_get',
+    {
+      description:
+        'Read one durable workflow checkpoint scoped by exact cwd and stable key. Checkpoints preserve orchestration intent across interrupted conversations without claiming that external work actually completed.',
+      inputSchema: z.object({
+        cwd: absoluteCwdInput,
+        key: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/),
+      }),
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+    },
+    withStructuredErrors(
+      async (args) => jsonResult({ checkpoint: checkpointGet(args) }),
+      'WORK_CHECKPOINT_GET_FAILED',
+    ),
+  );
+
+  server.registerTool(
+    'work_checkpoint_put',
+    {
+      description:
+        'Create or update a durable workflow checkpoint scoped by cwd and key. Pass expectedRevision (or null for create-only) to prevent overwriting a concurrently changed checkpoint.',
+      inputSchema: z.object({
+        cwd: absoluteCwdInput,
+        key: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/),
+        value: z.unknown(),
+        expectedRevision: z.union([z.string().regex(/^sha256:[0-9a-f]{64}$/), z.null()]).optional(),
+      }),
+    },
+    withStructuredErrors(
+      async (args) => jsonResult({ checkpoint: checkpointPut(args) }),
+      'WORK_CHECKPOINT_PUT_FAILED',
+    ),
+  );
+
+  server.registerTool(
+    'work_checkpoint_list',
+    {
+      description:
+        'List durable workflow checkpoints for an exact cwd, newest first. Use this to recover high-level goal/current-step/next-step state after a conversation interruption.',
+      inputSchema: z.object({
+        cwd: absoluteCwdInput,
+        limit: z.number().int().min(1).max(128).default(64),
+      }),
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+    },
+    withStructuredErrors(
+      async (args) => jsonResult({ checkpoints: checkpointList(args) }),
+      'WORK_CHECKPOINT_LIST_FAILED',
+    ),
+  );
+
+  server.registerTool(
+    'work_checkpoint_delete',
+    {
+      description:
+        'Delete one durable workflow checkpoint. Pass expectedRevision to avoid deleting a concurrently changed checkpoint.',
+      inputSchema: z.object({
+        cwd: absoluteCwdInput,
+        key: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/),
+        expectedRevision: z.string().regex(/^sha256:[0-9a-f]{64}$/).optional(),
+      }),
+    },
+    withStructuredErrors(
+      async (args) => jsonResult(checkpointDelete(args)),
+      'WORK_CHECKPOINT_DELETE_FAILED',
+    ),
+  );
+
   server.registerTool(
     'agent_run',
     {
@@ -991,7 +1197,7 @@ async function createServer() {
     'process_start',
     {
       description:
-        'Start a long-running shell command and keep it alive across MCP tool calls. Returns a processId for process_read, process_write, and process_kill. Use agent_start for coding-agent work; agent_run is only for short blocking tasks. On the ChatGPT host, interactive terminal session launchers and raw coding-harness execution are forbidden.',
+        'Start an interactive or service-like shell process and keep it alive across MCP tool calls within the current MCP server lifetime. Returns a processId for process_read, process_write, and process_kill. These sessions are not durable across MCP server restarts; use operation_start for finite work that must survive/recover across restarts, and agent_start for coding-agent work. On the ChatGPT host, interactive terminal session launchers and raw coding-harness execution are forbidden.',
       inputSchema: z.object({
         command: z.string().min(1).describe('Shell command to start with bash -lc.'),
         cwd: z.string().optional().describe('Working directory. Defaults to the agent user home directory.'),
@@ -1096,7 +1302,7 @@ async function createServer() {
     'work_status',
     {
       description:
-        'Return a unified read-only snapshot for recovering orchestration after a silent or interrupted turn: recent managed agent runs (including terminal results), managed processes, and when cwd is provided its Git and bounded filesystem activity. This reports observable evidence only and does not claim whether the ChatGPT UI or model turn is stuck.',
+        'Return a unified read-only recovery snapshot after a silent or interrupted turn: durable agent runs, durable finite command operations, managed process sessions, workflow checkpoints, and when cwd is provided its Git and bounded filesystem activity. Execution evidence and checkpoint intent remain distinct; this tool does not claim whether the ChatGPT UI or model turn is stuck.',
       inputSchema: z.object({
         cwd: z.string().min(1).optional(),
       }),
@@ -1114,15 +1320,50 @@ async function createServer() {
         .sort((a, b) => b.startedAt - a.startedAt)
         .map((session) => processSummary(session));
       let backgroundJobs = [];
-      let backgroundJobService = { available: true };
-      try {
-        backgroundJobs = (await jobList({ cwd: resolvedCwd ?? undefined })).jobs;
-      } catch (error) {
-        backgroundJobService = {
-          available: false,
-          error: error.code || 'agent_job_service_unavailable',
-          message: error.message,
+      let durableOperations = [];
+      const serviceErrors = {};
+      const [jobsResult, operationsResult] = await Promise.allSettled([
+        jobList({ cwd: resolvedCwd ?? undefined }),
+        operationList({ cwd: resolvedCwd ?? undefined }),
+      ]);
+      if (jobsResult.status === 'fulfilled') {
+        backgroundJobs = jobsResult.value.jobs;
+      } else {
+        serviceErrors.agentJobs = {
+          error: jobsResult.reason.code || 'agent_job_service_unavailable',
+          message: jobsResult.reason.message,
         };
+      }
+      if (operationsResult.status === 'fulfilled') {
+        durableOperations = operationsResult.value.operations;
+      } else {
+        serviceErrors.operations = {
+          error: operationsResult.reason.code || 'agent_job_service_unavailable',
+          message: operationsResult.reason.message,
+        };
+      }
+      const firstServiceError = serviceErrors.agentJobs || serviceErrors.operations;
+      const backgroundJobService = firstServiceError === undefined
+        ? { available: true }
+        : {
+            available: false,
+            error: firstServiceError.error,
+            message: firstServiceError.message,
+            errors: serviceErrors,
+          };
+
+      let checkpoints = [];
+      let checkpointStore = { available: true };
+      if (resolvedCwd !== null) {
+        try {
+          checkpoints = checkpointList({ cwd: resolvedCwd, limit: 64 });
+        } catch (error) {
+          checkpointStore = {
+            available: false,
+            error: error.code || 'checkpoint_store_unavailable',
+            message: error.message,
+          };
+        }
       }
       return jsonResult({
         ...(await collectWorkStatus({
@@ -1131,9 +1372,12 @@ async function createServer() {
             ...backgroundJobs,
             ...agentRunsSnapshot({ cwd: resolvedCwd ?? undefined }),
           ],
+          durableOperations,
           managedProcesses,
+          checkpoints,
         })),
         backgroundJobService,
+        checkpointStore,
       });
     },
   );
