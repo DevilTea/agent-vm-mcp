@@ -16,11 +16,66 @@ An explicit environment override is authoritative. If it points to a missing or 
 | Purpose | Filename | Environment override |
 | --- | --- | --- |
 | MCP bridges | `bridges.json` | `MCP_BRIDGES_CONFIG` |
+| SSH targets | `ssh.json` | `AGENT_MCP_SSH_CONFIG` |
 | CLI capabilities | `capabilities.json` | `AGENT_MCP_CAPABILITIES_CONFIG` |
 | System audit | `system-audit.json` | `AGENT_MCP_SYSTEM_AUDIT_CONFIG` |
 | Shared Playwright stdio proxy | `playwright-shared-proxy.json` | `PLAYWRIGHT_SHARED_PROXY_CONFIG` |
 
 The built-in `bridges.json` contains an empty bridge list. Machine-specific Playwright/LSP configuration is an optional example under `config/examples/`.
+
+## Native SSH targets
+
+`ssh_targets`, `ssh_exec`, `ssh_upload`, and `ssh_download` are native, config-driven tools. This feature uses the **same VM trust boundary** as the local `exec` tool: a caller already authorized to run local shell commands can independently run the OpenSSH client. SSH target registration is an orchestration affordance, not a security sandbox or per-agent authorization layer.
+
+Use `ssh.json` (override: `AGENT_MCP_SSH_CONFIG`) under the standard configuration resolution rules. The built-in default is `{"version":1,"hosts":{},"identities":{}}`, so no target or secret is configured out of the box.
+
+Example `~/.config/agent-vm-mcp/ssh.json`:
+
+```json
+{
+  "version": 1,
+  "identities": {
+    "homelab-key": {
+      "type": "file",
+      "path": "/home/agent/.ssh/id_ed25519_homelab"
+    },
+    "session": { "type": "agent" }
+  },
+  "hosts": {
+    "nas": {
+      "host": "192.168.50.20",
+      "user": "homelab",
+      "port": 22,
+      "identity": "homelab-key",
+      "knownHostsFile": "/home/agent/.ssh/known_hosts"
+    }
+  }
+}
+```
+
+- Only targets declared in `hosts` are accepted. `host` must be a literal IP address or hostname; tools do not accept caller-provided hostnames, usernames, credentials, or ports. `port` defaults to 22.
+- `identity` references the `identities` registry. Omitted identity or `"default"` uses the OpenSSH default agent/environment unless `identities.default` is explicitly configured. `"type":"file"` references an **absolute private key file path**, not inline private key contents; `"type":"agent"` uses identities offered by the existing OpenSSH authentication agent while explicitly disabling implicit `~/.ssh/id_*` identity files. V1 intentionally has no password provider.
+- `knownHostsFile` is an optional absolute path without whitespace; by default it is `$HOME/.ssh/known_hosts`. The file must exist before a remote operation. Host keys are checked with `StrictHostKeyChecking=yes`; unknown or changed host keys will fail instead of being enrolled automatically. Enroll known hosts in advance, verifying the fingerprint through an independent trusted channel. The server never runs `ssh-keyscan` to trust a new key automatically.
+- The server reads and validates the registry **at startup**. Invalid configuration fails startup, whereas absent/empty built-in configuration is valid. Restart the MCP server after changing targets.
+- All operations use OpenSSH with a blank user config (`-F /dev/null`) to avoid inheriting unreviewed ProxyCommand/forwarding rules, disable PTY and agent forwarding, disable interactive password prompting, and clear local forwarding. Connection setup is limited to 10 seconds; the per-call total `timeoutMs` defaults to 120,000, with a 1,000–600,000 ms range. Cancellation/timeout terminate the local client process group.
+- `ssh_exec` executes a **single non-interactive remote shell command string**, returning stdout/stderr, exit status, timeout/cancellation and bounded artifact metadata. The command can invoke remote programs with side effects; review remote privileges accordingly.
+- Transfers use OpenSSH `scp` (modern SFTP mode, no legacy `-O`). `localPath` must be absolute on the **Agent VM**. `remotePath` must be absolute and use conservative ASCII filename characters (no spaces, metacharacters, or `.`/`..` traversal). `ssh_upload` accepts only a local regular file. Upload/download may overwrite destination files or leave partial files on failure/cancellation; there is no implicit atomic rename or rollback.
+- Remote executions are request-scoped rather than durable operations. If a response is lost, a remote command may have executed despite an absent result; inspect the remote machine and audit entries before retrying a potentially side-effecting command.
+- Audited metadata is appended with private permissions to `${XDG_STATE_HOME:-$HOME/.local/state}/agent-vm-mcp/ssh-audit.jsonl`. Each remote attempt records target, operation, request ID, timestamps and outcome/exit status/signal; commands are represented by their SHA-256 digest, not plaintext. Neither credentials, command contents, stdout/stderr nor transfer file paths are written to the audit log. An audit write failure before execution prevents the remote call. Log retention and rotation are deployment responsibilities.
+  If the **completion** audit write fails after the remote operation has already run, the tool returns the actual SSH result with `auditStatus: "completion_write_failed"` and a short `auditErrorCode` rather than hiding potentially completed side effects behind a generic tool failure. Normal results have `auditStatus: "complete"`.
+
+Example MCP calls:
+
+```json
+{"tool":"ssh_targets","arguments":{}}
+{"tool":"ssh_exec","arguments":{"target":"nas","command":"uname -a","timeoutMs":15000}}
+{"tool":"ssh_upload","arguments":{"target":"nas","localPath":"/home/agent/export/archive.tar","remotePath":"/volume1/backups/archive.tar"}}
+{"tool":"ssh_download","arguments":{"target":"nas","remotePath":"/volume1/logs/status.txt","localPath":"/home/agent/status.txt"}}
+```
+
+For an unattended dedicated VM identity, generate or keep a locally protected Ed25519 key, configure an identity entry with `type: "file"` and its absolute path, then enroll only its `.pub` file on each target. The VM's dedicated `id_ed25519_agent_vm_mcp` key, when present, is not automatically picked up by OpenSSH; include its absolute path in each target's named identity. Key-based authentication does not imply host-key trust: separately verify and enroll the remote server's host fingerprint in the configured known-hosts file.
+
+A deterministic mock SSH/MCP smoke test is part of `pnpm test`. When an ephemeral local `sshd` and SFTP subsystem are available, run `pnpm test:ssh:real` for optional real OpenSSH loopback exec/upload/download and host-key rejection coverage, with disposable test keys; this does not contact homelab targets.
 
 ## MCP Skills (SEP-2640)
 

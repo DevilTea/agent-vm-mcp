@@ -69,6 +69,7 @@ The main configuration files are:
 | Purpose | XDG filename | Environment override |
 | --- | --- | --- |
 | MCP bridges | `bridges.json` | `MCP_BRIDGES_CONFIG` |
+| SSH targets | `ssh.json` | `AGENT_MCP_SSH_CONFIG` |
 | CLI capabilities | `capabilities.json` | `AGENT_MCP_CAPABILITIES_CONFIG` |
 | System audit | `system-audit.json` | `AGENT_MCP_SYSTEM_AUDIT_CONFIG` |
 | Shared Playwright stdio proxy | `playwright-shared-proxy.json` | `PLAYWRIGHT_SHARED_PROXY_CONFIG` |
@@ -76,6 +77,10 @@ The main configuration files are:
 `AGENT_MCP_HOST` selects connection/deployment-specific host behavior. Supported values are `generic` (default) and `chatgpt`. Host-specific extensions are kept out of ordinary tool inputs; for example, ChatGPT file-input metadata is attached to `import_file` only when `AGENT_MCP_HOST=chatgpt`. The ChatGPT profile also enables the structured interaction adapter, disables projected-skill protocol/tools, and forbids interactive terminal session launchers through `exec`/`process_start`.
 
 See [`config/README.md`](config/README.md) for bridge schema, fail-soft/fail-hard behavior, adapters, policies, capability discovery, system-audit configuration, and deployment examples.
+
+## First-class SSH capability
+
+The native `ssh_targets`, `ssh_exec`, `ssh_upload`, and `ssh_download` tools operate on named hosts configured in `ssh.json`. Private keys are referenced via local paths or the existing SSH agent; they are not embedded in the config or accepted as tool arguments. Non-interactive OpenSSH connections require verified host keys, with per-call timeout, bounded output capture, and private metadata-only SSH audit logging. No host or credential can be supplied directly in an MCP tool call. See [SSH configuration and security details](config/README.md#native-ssh-targets).
 
 ## Bridge behavior
 

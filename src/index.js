@@ -55,6 +55,7 @@ import {
 } from './server-info.js';
 import { applyUnifiedPatch, listDirectory, readTextFile, waitForFilesystemMutations } from './filesystem.js';
 import { resolveBashExecutable } from './shell.js';
+import { loadSshConfig, runSshOperation, sshTargets } from './ssh.js';
 import { workspaceCreate, workspaceDelete, workspaceList, waitForWorkspaceMutations } from './workspaces.js';
 import { collectWorkStatus } from './work-status.js';
 
@@ -423,6 +424,10 @@ const activeArtifactStores = new Set();
 const BASE_NATIVE_TOOL_NAMES = new Set([
   'exec',
   'read_file',
+  'ssh_targets',
+  'ssh_exec',
+  'ssh_upload',
+  'ssh_download',
   'list_directory',
   'apply_patch',
   'workspace_create',
@@ -475,6 +480,7 @@ for (const signal of ['SIGTERM', 'SIGINT']) {
 
 async function createServer() {
   const hostProfile = resolveHostProfile();
+  const sshConfig = await loadSshConfig();
   const nativeToolNames = new Set([
     ...BASE_NATIVE_TOOL_NAMES,
     ...(hostProfile.exposeProjectedSkills ? SKILL_NATIVE_TOOL_NAMES : []),
@@ -525,6 +531,63 @@ async function createServer() {
       }),
     },
     async (args, ctx) => execResult(await executeCommand(args, ctx.mcpReq.signal, artifactStore, hostProfile)),
+  );
+
+  server.registerTool(
+    'ssh_targets',
+    {
+      description: 'List configured SSH target names and supported operations without exposing credentials. Targets are read from ssh.json at server startup.',
+      inputSchema: z.object({}),
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    },
+    async () => jsonResult({ targets: sshTargets(sshConfig) }),
+  );
+
+  const sshTargetInput = z.string().min(1).describe('Configured target name from ssh_targets (not an arbitrary hostname).');
+  const sshTimeoutInput = z.number().int().min(1_000).max(600_000).default(120_000)
+    .describe('Maximum execution time in milliseconds, including connection setup.');
+  const sshHandler = (operation) => async (args, ctx) =>
+    jsonResult(await runSshOperation(sshConfig, { ...args, operation }, {
+      signal: ctx.mcpReq.signal,
+      artifactStore,
+    }));
+  server.registerTool(
+    'ssh_exec',
+    {
+      description: 'Run one bounded non-interactive SSH command on a configured target (no PTY, forwarding, or interactive shell). Returns stdout/stderr, exit code, timeout/cancellation and capture metadata. Execution metadata is audited without recording plaintext commands.',
+      inputSchema: z.object({
+        target: sshTargetInput,
+        command: z.string().min(1).describe('Remote shell command to run as one non-interactive SSH request. Treat arguments and remote secrets carefully.'),
+        timeoutMs: sshTimeoutInput,
+      }),
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
+    },
+    sshHandler('exec'),
+  );
+
+  const sshTransferInput = {
+    target: sshTargetInput,
+    localPath: z.string().min(1).describe('Absolute local filesystem path on the Agent VM.'),
+    remotePath: z.string().min(1).describe('Absolute remote path with conservative ASCII filename characters (no spaces, wildcards or traversal).'),
+    timeoutMs: sshTimeoutInput,
+  };
+  server.registerTool(
+    'ssh_upload',
+    {
+      description: 'Copy a regular file from the Agent VM to a configured SSH target using non-interactive SCP/SFTP. Transfers can leave partial files if interrupted.',
+      inputSchema: z.object(sshTransferInput),
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
+    },
+    sshHandler('upload'),
+  );
+  server.registerTool(
+    'ssh_download',
+    {
+      description: 'Copy a remote file from a configured SSH target to an absolute local Agent VM path using non-interactive SCP/SFTP. Existing local files may be overwritten; interrupted transfers can leave partial files.',
+      inputSchema: z.object(sshTransferInput),
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
+    },
+    sshHandler('download'),
   );
 
   server.registerTool(
